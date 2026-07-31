@@ -54,7 +54,16 @@ export function serializeReviewComposer(root) {
     }
     const children = serializeChildren(node);
     if (!children.ok) return children;
-    return { ok: true, text: children.text, block: blockTags.has(tag) };
+    const childNodes = Array.from(node.childNodes || []);
+    const emptyBlockPlaceholder = blockTags.has(tag) &&
+      childNodes.length === 1 &&
+      Number(childNodes[0]?.nodeType) === 1 &&
+      String(childNodes[0]?.tagName || '').toUpperCase() === 'BR';
+    return {
+      ok: true,
+      text: emptyBlockPlaceholder ? '' : children.text,
+      block: blockTags.has(tag)
+    };
   };
 
   const serializeChildren = (parent) => {
@@ -66,8 +75,7 @@ export function serializeReviewComposer(root) {
       text += current.text;
       if (
         current.block &&
-        index + 1 < children.length &&
-        !text.endsWith('\n')
+        index + 1 < children.length
       ) {
         text += '\n';
       }

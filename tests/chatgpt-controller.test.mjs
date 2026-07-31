@@ -28,6 +28,29 @@ test('chatgpt-controller: structural composer serialization preserves exact mult
   });
 });
 
+test('chatgpt-controller: fenced-block shape preserves blank lines and one trailing LF', () => {
+  const prompt = [
+    '# Synthetic compatibility fixture',
+    '',
+    '```text',
+    'block=one',
+    '```',
+    '',
+    '```text',
+    'block=two',
+    '```',
+    ''
+  ].join('\n');
+  const composer = elementNode(
+    'DIV',
+    ...prompt.split('\n').map((line) =>
+      elementNode('P', line ? textNode(line) : elementNode('BR'))
+    )
+  );
+  assert.equal(serializeReviewComposer(composer).text, prompt);
+  assert.equal(prompt.endsWith('\n'), true);
+});
+
 test('chatgpt-controller: structural composer serialization rejects unsupported or altered content', () => {
   const unsupported = elementNode('DIV', elementNode('IMG'));
   assert.deepEqual(serializeReviewComposer(unsupported), {
