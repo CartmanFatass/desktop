@@ -53,7 +53,8 @@ export function sanitizeReviewErrorData(value) {
   }
   for (const field of [
     'serializedLength', 'expectedLength', 'candidateCount', 'elementCount',
-    'textNodeCount', 'otherNodeCount', 'maxDepth'
+    'textNodeCount', 'otherNodeCount', 'maxDepth', 'exactMatchCount',
+    'readableCandidateCount'
   ]) {
     if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
       output[field] = data[field];
@@ -421,6 +422,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       return { ...op };
     });
   } catch (error) {
+    if (request.diagnoseExisting) throw error;
     let safeErrorData = sanitizeReviewErrorData(error?.data);
     if (
       String(error?.message || error) === 'review_composer_identity_mismatch' &&

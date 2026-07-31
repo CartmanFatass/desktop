@@ -1191,6 +1191,35 @@ export class ChatGPTController {
     throw new Error('review_user_message_identity_unreadable');
   }
 
+  async #waitForReviewBaseline({ deadline, identity, stableMs = 3_000 }) {
+    let firstStable = null;
+    while (Date.now() < deadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
+      this.#assertReviewIdentity(snapshot, identity);
+      if (snapshot.controls?.stop || snapshot.controls?.continue || snapshot.controls?.retry) {
+        firstStable = null;
+        await sleep(250);
+        continue;
+      }
+      const signature = JSON.stringify((snapshot.messages || []).map((message) => [
+        message.role,
+        message.id,
+        message.textIdentityReadable === true,
+        message.textIdentityError || null,
+        message.textIdentityTag || null
+      ]));
+      const now = Date.now();
+      if (!firstStable || firstStable.signature !== signature) {
+        firstStable = { signature, observedAt: now, snapshot };
+      } else if (now - firstStable.observedAt >= stableMs) {
+        return snapshot;
+      }
+      await sleep(250);
+    }
+    throw new Error('review_baseline_identity_unstable');
+  }
+
   async #waitForReviewAssistant({ userMessageId, deadline, identity }) {
     let firstStable = null;
     while (Date.now() < deadline) {
@@ -1259,8 +1288,7 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
-      const before = await this.#reviewSnapshot(expectedModel);
-      this.#assertReviewIdentity(before, identity);
+      const before = await this.#waitForReviewBaseline({ deadline, identity });
       const baselineIds = new Set((before.messages || []).map((message) => message.id));
       await onPrepared?.({
         baselineMessageIds: [...baselineIds],
@@ -1306,7 +1334,8 @@ export class ChatGPTController {
       (message) => message.role === 'user' && !baselineIds.has(message.id)
     );
     const exactMatches = newUserMessages.filter((message) => message.text === prompt);
-    const message = newUserMessages.length === 1 ? newUserMessages[0] : null;
+    const readableCandidateCount = newUserMessages.filter((message) => message.textIdentityReadable === true).length;
+    const message = newUserMessages.length ? newUserMessages[newUserMessages.length - 1] : null;
     return {
       ok: exactMatches.length === 1 && newUserMessages.length === 1,
       serializerOk: message?.textIdentityReadable === true,
@@ -1319,6 +1348,8 @@ export class ChatGPTController {
       observedLengths: Number.isInteger(message?.textLength) ? [message.textLength] : [],
       expectedLength: prompt.length,
       candidateCount: newUserMessages.length,
+      exactMatchCount: exactMatches.length,
+      readableCandidateCount,
       ...(message?.textIdentityDiagnostic || {})
     };
   }
