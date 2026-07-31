@@ -432,6 +432,7 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
     },
     async evaluate(js) {
       assert.equal(js.includes('.click()'), false);
+      assert.equal(js.includes('serializeReviewComposer'), true);
       return {
         messages: [
           { order: 0, role: 'user', id: 'historical-user', text: prompt },

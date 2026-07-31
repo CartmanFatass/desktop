@@ -860,6 +860,7 @@ export class ChatGPTController {
     );
     const dom = await this.#eval(`(() => {
       const reviewSnapshotMarker = true;
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -871,12 +872,21 @@ export class ChatGPTController {
         return String(host?.getAttribute?.('data-message-id') || '').trim();
       };
       const messages = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}))
-        .map((node, order) => ({
-          order,
-          role: String(node.getAttribute('data-message-author-role') || '').trim(),
-          id: identity(node),
-          text: String(node.innerText || '')
-        }));
+        .map((node, order) => {
+          const role = String(node.getAttribute('data-message-author-role') || '').trim();
+          const serialized = role === 'user'
+            ? serializeReviewComposer(node)
+            : { ok: true, text: String(node.innerText || '') };
+          return {
+            order,
+            role,
+            id: identity(node),
+            text: serialized.ok === true ? serialized.text : null,
+            textIdentityReadable: serialized.ok === true,
+            textIdentityError: serialized.error || null,
+            textIdentityTag: serialized.tag || null
+          };
+        });
       const controls = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
       const controlText = controls.flatMap((node) => [
         node.getAttribute('aria-label') || '',
