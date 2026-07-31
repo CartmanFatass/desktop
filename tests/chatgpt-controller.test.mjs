@@ -126,6 +126,54 @@ test('chatgpt-controller: composer diagnosis is observe-only and returns metadat
   assert.equal(actionCalls, 0);
 });
 
+test('chatgpt-controller: submission diagnosis injects the structure summarizer dependency', async () => {
+  const url = 'https://chatgpt.com/c/conversation-diagnostic';
+  const prompt = 'exact';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      assert.equal(js.includes('reviewSnapshotMarker'), true);
+      assert.equal(js.includes('const summarizeReviewComposerStructure ='), true);
+      return {
+        messages: [{
+          order: 0,
+          role: 'user',
+          id: 'user-diagnostic',
+          text: prompt,
+          textLength: prompt.length,
+          textIdentityReadable: true,
+          textIdentityError: null,
+          textIdentityTag: null,
+          textIdentityDiagnostic: {
+            candidateCount: 1,
+            rootTag: 'DIV',
+            elementCount: 1,
+            textNodeCount: 1,
+            otherNodeCount: 0,
+            maxDepth: 1,
+            tagHistogram: { DIV: 1 }
+          }
+        }],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.inspectReviewSubmissionIdentity({
+    prompt,
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'conversation-diagnostic',
+    expectedModel: 'GPT-5.6 Pro'
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.serializedLength, prompt.length);
+});
+
 test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
   const content = elementNode('DIV', textNode('alpha\n\nbeta'));
   content.querySelectorAll = () => [];

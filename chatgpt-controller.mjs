@@ -992,6 +992,7 @@ export class ChatGPTController {
     const dom = await this.#eval(`(() => {
       const reviewSnapshotMarker = true;
       const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
       const serializeReviewUserMessage = ${serializeReviewUserMessage.toString()};
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
       const visible = (node) => {
