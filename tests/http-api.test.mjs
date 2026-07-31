@@ -28,6 +28,7 @@ test('http-api: health is public and returns serverId', async (t) => {
     tabs,
     defaultTabId: 't0',
     serverId: 'sid-test',
+    sourceIdentity: { commit: 'a'.repeat(40), dirty: false },
     stateDir: '/tmp',
     getStatus: async () => ({ ok: true })
   });
@@ -38,6 +39,8 @@ test('http-api: health is public and returns serverId', async (t) => {
   assert.equal(res.status, 200);
   assert.equal(data.ok, true);
   assert.equal(data.serverId, 'sid-test');
+  assert.equal(data.sourceCommit, 'a'.repeat(40));
+  assert.equal(data.sourceDirty, false);
 });
 
 test('http-api: rejects unauthorized', async (t) => {

@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
 import {
   createBrowserBackend,
@@ -26,6 +26,24 @@ import { cleanupRuntimeResources, createGracefulShutdown, registerShutdownSignal
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function readSourceIdentity() {
+  try {
+    const commit = execFileSync('git', ['-C', __dirname, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+      windowsHide: true
+    }).trim();
+    const status = execFileSync(
+      'git',
+      ['-C', __dirname, 'status', '--porcelain', '--untracked-files=no'],
+      { encoding: 'utf8', windowsHide: true }
+    ).trim();
+    if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('invalid_source_commit');
+    return { commit, dirty: status.length > 0 };
+  } catch {
+    return { commit: null, dirty: null };
+  }
+}
 
 function argFlag(name) {
   return process.argv.includes(name);
@@ -130,6 +148,7 @@ async function main() {
   const chromeProfileMode = resolveChromeProfileMode({ settings });
   const chromeProfileName = resolveChromeProfileName({ settings });
   const serverId = crypto.randomUUID();
+  const sourceIdentity = readSourceIdentity();
 
   const notify = (body) => {
     try {
@@ -581,6 +600,7 @@ async function main() {
         defaultTabId,
         vendors,
         serverId,
+        sourceIdentity,
         stateDir,
         getSettings: async () => settings,
         onShow: async ({ tabId }) => {
@@ -646,7 +666,15 @@ async function main() {
   }
   if (!server) throw new Error('http_api_start_failed');
 
-  await writeState({ ok: true, port, pid: process.pid, serverId, startedAt: new Date().toISOString() }, stateDir);
+  await writeState({
+    ok: true,
+    port,
+    pid: process.pid,
+    serverId,
+    sourceCommit: sourceIdentity.commit,
+    sourceDirty: sourceIdentity.dirty,
+    startedAt: new Date().toISOString()
+  }, stateDir);
 
   const shutdown = createGracefulShutdown({
     closeServer: (done) => {

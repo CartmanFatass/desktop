@@ -453,6 +453,7 @@ export function startHttpApi({
   defaultTabId,
   vendors = [],
   serverId,
+  sourceIdentity = null,
   stateDir,
   onShow,
   onHide,
@@ -721,7 +722,14 @@ export function startHttpApi({
       if (req.method === 'OPTIONS') return sendJson(res, 200, { ok: true });
 
       const url = new URL(req.url || '/', `http://${host}`);
-      if (url.pathname === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true, serverId: serverId || null });
+      if (url.pathname === '/health' && req.method === 'GET') {
+        return sendJson(res, 200, {
+          ok: true,
+          serverId: serverId || null,
+          sourceCommit: sourceIdentity?.commit || null,
+          sourceDirty: sourceIdentity?.dirty ?? null
+        });
+      }
 
       if (!authOk(req, tokenRef.current)) return sendJson(res, 401, { error: 'unauthorized' });
 
