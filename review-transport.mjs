@@ -37,6 +37,44 @@ function normalizedToken(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+export function sanitizeReviewErrorData(value) {
+  const data = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!data) return null;
+  const output = {};
+  for (const field of ['ok', 'serializerOk']) {
+    if (typeof data[field] === 'boolean') output[field] = data[field];
+  }
+  for (const field of ['serializerMethod', 'serializerError', 'serializerTag', 'rootTag']) {
+    if (data[field] === null) {
+      output[field] = null;
+    } else if (typeof data[field] === 'string' && data[field].length <= 128) {
+      output[field] = data[field];
+    }
+  }
+  for (const field of [
+    'serializedLength', 'expectedLength', 'candidateCount', 'elementCount',
+    'textNodeCount', 'otherNodeCount', 'maxDepth'
+  ]) {
+    if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
+      output[field] = data[field];
+    }
+  }
+  if (
+    Array.isArray(data.observedLengths) &&
+    data.observedLengths.length <= 8 &&
+    data.observedLengths.every((item) => Number.isInteger(item) && item >= 0 && item <= 10_000_000)
+  ) {
+    output.observedLengths = [...data.observedLengths];
+  }
+  if (data.tagHistogram && typeof data.tagHistogram === 'object' && !Array.isArray(data.tagHistogram)) {
+    const entries = Object.entries(data.tagHistogram)
+      .filter(([tag, count]) => /^[A-Z0-9_-]{1,32}$/.test(tag) && Number.isInteger(count) && count >= 0 && count <= 1_000_000)
+      .sort(([a], [b]) => a.localeCompare(b));
+    if (entries.length <= 64) output.tagHistogram = Object.fromEntries(entries);
+  }
+  return Object.keys(output).length ? output : null;
+}
+
 function conversationIdFromUrl(value) {
   let parsed;
   try {
@@ -338,12 +376,28 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       return { ...op };
     });
   } catch (error) {
+    let safeErrorData = sanitizeReviewErrorData(error?.data);
+    if (
+      String(error?.message || error) === 'review_composer_identity_mismatch' &&
+      typeof controller?.inspectReviewComposerIdentity === 'function'
+    ) {
+      try {
+        const observed = await runControllerExclusive(async () =>
+          await controller.inspectReviewComposerIdentity({ expectedPrompt: request.prompt })
+        );
+        safeErrorData = sanitizeReviewErrorData({ ...(error?.data || {}), ...(observed || {}) });
+      } catch {
+        // The diagnostic is observe-only and best-effort. The original fail-closed
+        // transport error remains authoritative if metadata cannot be read.
+      }
+    }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.status === 'COMPLETE') return;
       op.status = 'BLOCKED';
       op.terminalState = op.userMessageId ? 'REVIEW_RESPONSE_BLOCKED' : 'IDENTITY_UNREADABLE';
       op.error = String(error?.message || error);
+      if (safeErrorData) op.errorData = safeErrorData;
       op.updatedAt = Date.now();
     }).catch(() => {});
     throw error;

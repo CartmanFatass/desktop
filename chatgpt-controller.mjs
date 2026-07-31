@@ -85,6 +85,39 @@ export function serializeReviewComposer(root) {
   return serializeChildren(root);
 }
 
+export function summarizeReviewComposerStructure(root) {
+  const tagHistogram = {};
+  let elementCount = 0;
+  let textNodeCount = 0;
+  let otherNodeCount = 0;
+  let maxDepth = 0;
+
+  const visit = (node, depth) => {
+    if (!node || typeof node !== 'object') return;
+    maxDepth = Math.max(maxDepth, depth);
+    if (Number(node.nodeType) === 1) {
+      elementCount += 1;
+      const tag = String(node.tagName || '').toUpperCase() || 'UNKNOWN';
+      tagHistogram[tag] = (tagHistogram[tag] || 0) + 1;
+    } else if (Number(node.nodeType) === 3) {
+      textNodeCount += 1;
+    } else {
+      otherNodeCount += 1;
+    }
+    for (const child of Array.from(node.childNodes || [])) visit(child, depth + 1);
+  };
+
+  visit(root, 0);
+  return {
+    rootTag: String(root?.tagName || '').toUpperCase() || null,
+    elementCount,
+    textNodeCount,
+    otherNodeCount,
+    maxDepth,
+    tagHistogram: Object.fromEntries(Object.entries(tagHistogram).sort(([a], [b]) => a.localeCompare(b)))
+  };
+}
+
 export function serializeReviewUserMessage(root) {
   if (!root || typeof root !== 'object' || Number(root.nodeType) !== 1) {
     return { ok: false, error: 'review_user_message_root_unreadable' };
@@ -545,10 +578,24 @@ export class ChatGPTController {
     }
 
     if (verifyExact) {
-      const expected = JSON.stringify(prompt);
-      const verification = await this.#eval(`(() => {
+      const verification = await this.inspectReviewComposerIdentity({ expectedPrompt: prompt });
+      if (!verification?.ok) {
+        const error = new Error('review_composer_identity_mismatch');
+        error.data = verification || null;
+        throw error;
+      }
+    }
+  }
+
+  async inspectReviewComposerIdentity({ expectedPrompt = '' } = {}) {
+    if (typeof expectedPrompt !== 'string') throw new Error('review_composer_expected_prompt_invalid');
+    const sel = JSON.stringify(this.selectors.promptTextarea);
+    const expected = JSON.stringify(expectedPrompt);
+    return await this.#eval(`(() => {
+        const reviewComposerDiagnosticMarker = true;
         const expected = ${expected};
         const serializeReviewComposer = ${serializeReviewComposer.toString()};
+        const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
         const visible = (n) => {
           const r = n.getBoundingClientRect();
           const style = window.getComputedStyle(n);
@@ -590,30 +637,43 @@ export class ChatGPTController {
         }
         candidates.sort((a, b) => score(b) - score(a));
         const el = candidates[0] || null;
-        if (!el) return { ok: false, error: 'missing_prompt_textarea' };
+        if (!el) {
+          return {
+            ok: false,
+            error: 'missing_prompt_textarea',
+            candidateCount: candidates.length,
+            expectedLength: expected.length
+          };
+        }
         const serialized = el.matches('textarea, input')
           ? { ok: true, text: String(el.value || ''), method: 'value' }
           : { ...serializeReviewComposer(el), method: 'contenteditable_structural' };
+        const structure = el.matches('textarea, input')
+          ? {
+              rootTag: String(el.tagName || '').toUpperCase() || null,
+              elementCount: 1,
+              textNodeCount: 0,
+              otherNodeCount: 0,
+              maxDepth: 0,
+              tagHistogram: { [String(el.tagName || '').toUpperCase() || 'UNKNOWN']: 1 }
+            }
+          : summarizeReviewComposerStructure(el);
         const observed = el.matches('textarea, input')
           ? [String(el.value || '')]
           : [String(el.innerText || ''), String(el.textContent || '')];
         return {
           ok: serialized.ok === true && serialized.text === expected,
+          candidateCount: candidates.length,
           serializerOk: serialized.ok === true,
           serializerMethod: serialized.method,
           serializerError: serialized.error || null,
           serializerTag: serialized.tag || null,
           serializedLength: String(serialized.text || '').length,
           observedLengths: observed.map(value => value.length),
-          expectedLength: expected.length
+          expectedLength: expected.length,
+          ...structure
         };
       })()`);
-      if (!verification?.ok) {
-        const error = new Error('review_composer_identity_mismatch');
-        error.data = verification || null;
-        throw error;
-      }
-    }
   }
 
   async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120 } = {}) {

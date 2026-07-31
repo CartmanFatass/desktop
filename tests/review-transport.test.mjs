@@ -5,14 +5,17 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { runReviewQuery } from '../review-transport.mjs';
+import { runReviewQuery, sanitizeReviewErrorData } from '../review-transport.mjs';
+import { readReviewTransportState } from '../state.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, observe: 0, recover: 0, ensure: [] };
+  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, ensure: [] };
   let failBeforeSubmittedReceipt = false;
+  let reviewFailure = null;
+  let diagnosticResult = null;
   let exclusiveTail = Promise.resolve();
   const controller = {
     async runExclusive(fn) {
@@ -37,6 +40,7 @@ async function fixture() {
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
       });
+      if (reviewFailure) throw reviewFailure;
       if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
       await args.onSubmitted({
         userMessageId: 'user-1',
@@ -98,6 +102,10 @@ async function fixture() {
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
       };
+    },
+    async inspectReviewComposerIdentity() {
+      calls.inspect += 1;
+      return diagnosticResult;
     }
   };
   const tabs = {
@@ -128,9 +136,85 @@ async function fixture() {
     request,
     setFailBeforeSubmittedReceipt(value) {
       failBeforeSubmittedReceipt = !!value;
+    },
+    setReviewFailure(error, diagnostic) {
+      reviewFailure = error;
+      diagnosticResult = diagnostic;
     }
   };
 }
+
+test('review transport: mismatch diagnostics retain only non-content structural metadata', () => {
+  assert.deepEqual(sanitizeReviewErrorData({
+    ok: false,
+    serializerOk: false,
+    serializerMethod: 'contenteditable_structural',
+    serializerError: 'review_composer_element_unsupported',
+    serializerTag: 'PRE',
+    serializedLength: 0,
+    observedLengths: [2889, 2743],
+    expectedLength: 2810,
+    rootTag: 'DIV',
+    elementCount: 21,
+    textNodeCount: 12,
+    otherNodeCount: 0,
+    maxDepth: 4,
+    tagHistogram: { DIV: 2, PRE: 8, 'bad tag': 99 },
+    prompt: 'must-not-persist',
+    text: 'must-not-persist',
+    arbitrary: { nested: 'must-not-persist' }
+  }), {
+    ok: false,
+    serializerOk: false,
+    serializerMethod: 'contenteditable_structural',
+    serializerError: 'review_composer_element_unsupported',
+    serializerTag: 'PRE',
+    rootTag: 'DIV',
+    serializedLength: 0,
+    expectedLength: 2810,
+    elementCount: 21,
+    textNodeCount: 12,
+    otherNodeCount: 0,
+    maxDepth: 4,
+    observedLengths: [2889, 2743],
+    tagHistogram: { DIV: 2, PRE: 8 }
+  });
+});
+
+test('review transport: composer mismatch persists observe-only sanitized diagnostics', async () => {
+  const f = await fixture();
+  const error = new Error('review_composer_identity_mismatch');
+  error.data = { serializerOk: false, serializerTag: 'PRE', prompt: 'must-not-persist' };
+  f.setReviewFailure(error, {
+    ok: false,
+    serializerOk: false,
+    serializerMethod: 'contenteditable_structural',
+    serializerError: 'review_composer_element_unsupported',
+    serializerTag: 'PRE',
+    serializedLength: 0,
+    observedLengths: [2889, 2743],
+    expectedLength: 2810,
+    rootTag: 'DIV',
+    elementCount: 40,
+    textNodeCount: 24,
+    otherNodeCount: 0,
+    maxDepth: 4,
+    tagHistogram: { CODE: 8, DIV: 2, PRE: 8 },
+    prompt: 'must-not-persist'
+  });
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_composer_identity_mismatch/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  assert.equal(operation.status, 'BLOCKED');
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.errorData.serializerTag, 'PRE');
+  assert.deepEqual(operation.errorData.tagHistogram, { CODE: 8, DIV: 2, PRE: 8 });
+  assert.equal(JSON.stringify(operation.errorData).includes('must-not-persist'), false);
+  assert.equal(f.calls.inspect, 1);
+});
 
 test('review transport: one exact send persists a complete receipt and duplicate returns it', async () => {
   const f = await fixture();

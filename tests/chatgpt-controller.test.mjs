@@ -8,7 +8,8 @@ import {
   classifyReviewControls,
   deduplicateReviewModelEvidence,
   serializeReviewComposer,
-  serializeReviewUserMessage
+  serializeReviewUserMessage,
+  summarizeReviewComposerStructure
 } from '../chatgpt-controller.mjs';
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
@@ -43,6 +44,63 @@ test('chatgpt-controller: structural composer serialization rejects unsupported 
     error: 'review_composer_element_unsupported',
     tag: 'BUTTON'
   });
+});
+
+test('chatgpt-controller: composer structure summary exposes no text content', () => {
+  const composer = elementNode(
+    'DIV',
+    elementNode('P', textNode('secret-before')),
+    elementNode('PRE', elementNode('CODE', textNode('secret-fence'))),
+    elementNode('P', elementNode('BR'))
+  );
+  assert.deepEqual(summarizeReviewComposerStructure(composer), {
+    rootTag: 'DIV',
+    elementCount: 6,
+    textNodeCount: 2,
+    otherNodeCount: 0,
+    maxDepth: 3,
+    tagHistogram: { BR: 1, CODE: 1, DIV: 1, P: 2, PRE: 1 }
+  });
+  assert.equal(JSON.stringify(summarizeReviewComposerStructure(composer)).includes('secret'), false);
+});
+
+test('chatgpt-controller: composer diagnosis is observe-only and returns metadata only', async () => {
+  let evaluateCalls = 0;
+  let actionCalls = 0;
+  const page = {
+    async evaluate(js) {
+      evaluateCalls += 1;
+      assert.equal(js.includes('reviewComposerDiagnosticMarker'), true);
+      return {
+        ok: false,
+        candidateCount: 1,
+        serializerOk: false,
+        serializerMethod: 'contenteditable_structural',
+        serializerError: 'review_composer_element_unsupported',
+        serializerTag: 'PRE',
+        serializedLength: 0,
+        observedLengths: [22, 20],
+        expectedLength: 21,
+        rootTag: 'DIV',
+        elementCount: 6,
+        textNodeCount: 2,
+        otherNodeCount: 0,
+        maxDepth: 3,
+        tagHistogram: { BR: 1, CODE: 1, DIV: 1, P: 2, PRE: 1 }
+      };
+    },
+    async sendKey() { actionCalls += 1; },
+    async insertText() { actionCalls += 1; },
+    async moveMouse() { actionCalls += 1; },
+    async mouseDown() { actionCalls += 1; },
+    async mouseUp() { actionCalls += 1; }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea' } });
+  const result = await controller.inspectReviewComposerIdentity({ expectedPrompt: 'not returned' });
+  assert.equal(result.serializerTag, 'PRE');
+  assert.equal(JSON.stringify(result).includes('not returned'), false);
+  assert.equal(evaluateCalls, 1);
+  assert.equal(actionCalls, 0);
 });
 
 test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
