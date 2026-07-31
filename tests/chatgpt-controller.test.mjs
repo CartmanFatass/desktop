@@ -1,8 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import { ChatGPTController, classifyReviewControls } from '../chatgpt-controller.mjs';
+
+test('chatgpt-controller: review model evidence is not restricted to semantic header or nav containers', () => {
+  const selectors = JSON.parse(readFileSync(new URL('../selectors.json', import.meta.url), 'utf8'));
+  assert.match(selectors.reviewModelEvidence, /^button\[data-testid/);
+  assert.doesNotMatch(selectors.reviewModelEvidence, /(?:header|nav) /);
+});
 
 function readyState() {
   return {
@@ -285,7 +292,7 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
   assert.equal(sendEvaluationReached, true);
 });
 
-test('chatgpt-controller: strict review rejects ambiguous model controls before send', async () => {
+test('chatgpt-controller: strict review rejects duplicate same-label model controls before send', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let inserted = false;
   const page = {
@@ -299,7 +306,7 @@ test('chatgpt-controller: strict review rejects ambiguous model controls before 
         return {
           messages: [],
           modelEvidence: null,
-          modelEvidenceCandidates: ['GPT-5.6 Pro', 'Upgrade to Pro'],
+          modelEvidenceCandidates: ['GPT-5.6 Pro', 'GPT-5.6 Pro'],
           controlText: [],
           selectorStop: false,
           sendVisible: true

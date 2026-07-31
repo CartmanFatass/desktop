@@ -787,14 +787,16 @@ export class ChatGPTController {
     await this.page.setFileInputFiles(absFiles);
   }
 
-  async #reviewSnapshot() {
+  async #reviewSnapshot(expectedModel = '') {
     const url = await this.page.getUrl();
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const expectedModelLiteral = JSON.stringify(String(expectedModel || ''));
     const reviewUserSel = JSON.stringify(this.selectors.reviewUserMessage || '[data-message-author-role="user"]');
     const reviewAssistantSel = JSON.stringify(this.selectors.reviewAssistantMessage || '[data-message-author-role="assistant"]');
     const reviewModelSel = JSON.stringify(
-      this.selectors.reviewModelEvidence || 'header button[data-testid*="model" i], header button[aria-label*="model" i], nav button[data-testid*="model" i], nav button[aria-label*="model" i]'
+      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]'
     );
     const dom = await this.#eval(`(() => {
       const reviewSnapshotMarker = true;
@@ -822,10 +824,22 @@ export class ChatGPTController {
         node.textContent || ''
       ]).map(value => String(value).replace(/\s+/g, ' ').trim()).filter(Boolean);
       const selectorStop = Array.from(document.querySelectorAll(${stopSel})).some(visible);
-      const modelEvidenceCandidates = Array.from(document.querySelectorAll(${reviewModelSel}))
-        .filter(visible)
-        .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
-        .filter(Boolean);
+      const semanticModelNodes = Array.from(document.querySelectorAll(${reviewModelSel}))
+        .filter((node) => visible(node) && String(node.textContent || '').trim());
+      const normalizeModel = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const expectedModel = ${expectedModelLiteral};
+      const promptNode = document.querySelector(${promptSel});
+      const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
+      const composerModelNodes = expectedModel && composerRoot
+        ? Array.from(composerRoot.querySelectorAll('button, [role="button"]'))
+          .filter(visible)
+          .filter((node) => {
+            const value = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+            return value && normalizeModel(value) === normalizeModel(expectedModel);
+          })
+        : [];
+      const modelEvidenceCandidates = [...new Set([...semanticModelNodes, ...composerModelNodes])]
+        .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim());
       const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);
       return {
         messages,
@@ -931,7 +945,7 @@ export class ChatGPTController {
   async #waitForReviewUserMessage({ prompt, baselineIds, deadline, identity }) {
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
-      const snapshot = await this.#reviewSnapshot();
+      const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
       this.#assertReviewIdentity(snapshot, identity);
       const matches = (snapshot.messages || []).filter(
         (message) => message.role === 'user' && message.text === prompt && !baselineIds.has(message.id)
@@ -947,7 +961,7 @@ export class ChatGPTController {
     let firstStable = null;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
-      const snapshot = await this.#reviewSnapshot();
+      const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
       this.#assertReviewIdentity(snapshot, identity);
       const userIndex = (snapshot.messages || []).findIndex((message) => message.role === 'user' && message.id === userMessageId);
       if (userIndex < 0) throw new Error('review_user_message_identity_unreadable');
@@ -1011,7 +1025,7 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
-      const before = await this.#reviewSnapshot();
+      const before = await this.#reviewSnapshot(expectedModel);
       this.#assertReviewIdentity(before, identity);
       const baselineIds = new Set((before.messages || []).map((message) => message.id));
       await onPrepared?.({
@@ -1051,7 +1065,7 @@ export class ChatGPTController {
   async recoverReviewSubmission({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onRecovered }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
     const identity = { expectedUrl, expectedConversationId, expectedModel };
-    const snapshot = await this.#reviewSnapshot();
+    const snapshot = await this.#reviewSnapshot(expectedModel);
     this.#assertReviewIdentity(snapshot, identity);
     if (!Array.isArray(baselineMessageIds)) throw new Error('review_submission_baseline_missing');
     const baselineIds = new Set(baselineMessageIds);
