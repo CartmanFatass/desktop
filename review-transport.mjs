@@ -298,6 +298,28 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
 
   const onSubmitted = async (submitted) => {
     const userMessageId = requiredText(submitted?.userMessageId, 'userMessageId', { max: 512 });
+    const identityMode = requiredText(submitted?.identityMode, 'identityMode', { max: 64 });
+    if (!['rendered_exact', 'exact_composer_causal_binding'].includes(identityMode)) {
+      fail('review_submission_identity_mode_invalid');
+    }
+    const composerPromptSha256 = requiredText(submitted?.composerPromptSha256, 'composerPromptSha256', { max: 64 });
+    if (composerPromptSha256 !== request.promptSha256 || Number(submitted?.clickCount) !== 1) {
+      fail('review_submission_identity_receipt_invalid');
+    }
+    const composerIdentity = sanitizeReviewErrorData(submitted?.composerIdentity);
+    if (
+      !composerIdentity ||
+      composerIdentity.ok !== true ||
+      composerIdentity.serializerOk !== true ||
+      composerIdentity.serializedLength !== request.prompt.length ||
+      composerIdentity.expectedLength !== request.prompt.length
+    ) {
+      fail('review_submission_identity_receipt_invalid');
+    }
+    const renderedIdentityDiagnostic = sanitizeReviewErrorData(submitted?.renderedIdentityDiagnostic);
+    if (!renderedIdentityDiagnostic || renderedIdentityDiagnostic.candidateCount !== 1) {
+      fail('review_submission_identity_receipt_invalid');
+    }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
@@ -308,6 +330,10 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
       op.modelEvidence = submitted?.modelEvidence || null;
+      op.submissionIdentityMode = identityMode;
+      op.composerPromptSha256 = composerPromptSha256;
+      op.composerIdentity = composerIdentity;
+      op.renderedIdentityDiagnostic = renderedIdentityDiagnostic;
       op.updatedAt = Date.now();
     });
   };

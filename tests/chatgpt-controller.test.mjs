@@ -335,6 +335,7 @@ test('chatgpt-controller: strict review submits with one send control and return
   const prompt = 'x';
   const keys = [];
   let strictClicks = 0;
+  let reviewSnapshotCalls = 0;
   let submitted = 0;
   let prepared = 0;
   let insertedPrompt = '';
@@ -355,12 +356,18 @@ test('chatgpt-controller: strict review submits with one send control and return
         return { ok: true, clickCount: 1, label: 'Send prompt' };
       }
       if (js.includes('reviewSnapshotMarker')) {
+        reviewSnapshotCalls += 1;
+        const historyReady = strictClicks > 0 || reviewSnapshotCalls > 1;
+        const historical = historyReady
+          ? [{ order: 0, role: 'user', id: 'historical-user-1', text: 'historical' }]
+          : [];
         const messages = strictClicks
           ? [
-              { order: 0, role: 'user', id: 'user-1', text: prompt },
-              { order: 1, role: 'assistant', id: 'assistant-1', text: response }
+              ...historical,
+              { order: 1, role: 'user', id: 'user-1', text: prompt },
+              { order: 2, role: 'assistant', id: 'assistant-1', text: response }
             ]
-          : [];
+          : historical;
         return {
           messages,
           modelEvidence: 'GPT-5.6 Pro',
@@ -400,7 +407,7 @@ test('chatgpt-controller: strict review submits with one send control and return
     timeoutMs: 8_000,
     onPrepared: async ({ baselineMessageIds }) => {
       prepared += 1;
-      assert.deepEqual(baselineMessageIds, []);
+      assert.deepEqual(baselineMessageIds, ['historical-user-1']);
     },
     onSubmitted: async () => {
       submitted += 1;
@@ -589,10 +596,11 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
   assert.equal(sendEvaluationReached, true);
 });
 
-test('chatgpt-controller: strict review fails immediately on one new unreadable rendered user message', async () => {
+test('chatgpt-controller: strict review binds one rendered Markdown message to the exact composer receipt', async () => {
   const url = 'https://chatgpt.com/c/conversation-rendered';
   const prompt = '```text\nsynthetic\n```\n';
   let strictClicks = 0;
+  let submittedReceipt = null;
   const page = {
     async navigate() {},
     async getUrl() { return url; },
@@ -633,6 +641,11 @@ test('chatgpt-controller: strict review fails immediately on one new unreadable 
               maxDepth: 2,
               tagHistogram: { CODE: 1, PRE: 1 }
             }
+          }, {
+            order: 1,
+            role: 'assistant',
+            id: 'assistant-rendered',
+            text: 'SMOKE_OK'
           }] : [],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
@@ -650,22 +663,20 @@ test('chatgpt-controller: strict review fails immediately on one new unreadable 
     async mouseUp() {}
   };
   const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
-  await assert.rejects(
-    controller.reviewQuery({
-      prompt,
-      expectedUrl: url,
-      expectedConversationId: 'conversation-rendered',
-      expectedModel: 'GPT-5.6 Pro',
-      timeoutMs: 5_000
-    }),
-    (error) => {
-      assert.equal(error.message, 'review_user_message_identity_unreadable');
-      assert.equal(error.data.serializerTag, 'PRE');
-      assert.equal(error.data.expectedLength, prompt.length);
-      return true;
-    }
-  );
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: url,
+    expectedConversationId: 'conversation-rendered',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000,
+    onSubmitted: async (receipt) => { submittedReceipt = receipt; }
+  });
   assert.equal(strictClicks, 1);
+  assert.equal(result.userMessageId, 'user-rendered');
+  assert.equal(submittedReceipt.identityMode, 'exact_composer_causal_binding');
+  assert.equal(submittedReceipt.clickCount, 1);
+  assert.equal(submittedReceipt.renderedIdentityDiagnostic.serializerTag, 'PRE');
+  assert.equal(submittedReceipt.composerPromptSha256, crypto.createHash('sha256').update(prompt).digest('hex'));
 });
 
 test('chatgpt-controller: strict review rejects conflicting model controls before send', async () => {

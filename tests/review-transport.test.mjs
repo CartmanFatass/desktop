@@ -17,6 +17,47 @@ async function fixture() {
   let reviewFailure = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
+  let fixturePrompt = '';
+  const exactIdentityFields = () => ({
+    identityMode: 'rendered_exact',
+    composerPromptSha256: sha256(fixturePrompt),
+    clickCount: 1,
+    composerIdentity: {
+      ok: true,
+      serializerOk: true,
+      serializerMethod: 'contenteditable_structural',
+      serializerError: null,
+      serializerTag: null,
+      serializedLength: fixturePrompt.length,
+      observedLengths: [fixturePrompt.length],
+      expectedLength: fixturePrompt.length,
+      candidateCount: 1,
+      rootTag: 'DIV',
+      elementCount: 1,
+      textNodeCount: 1,
+      otherNodeCount: 0,
+      maxDepth: 1,
+      tagHistogram: { DIV: 1 }
+    },
+    renderedIdentityDiagnostic: {
+      serializerOk: true,
+      serializerMethod: 'rendered_user_message_structural',
+      serializerError: null,
+      serializerTag: null,
+      serializedLength: fixturePrompt.length,
+      observedLengths: [fixturePrompt.length],
+      expectedLength: fixturePrompt.length,
+      candidateCount: 1,
+      exactMatchCount: 1,
+      readableCandidateCount: 1,
+      rootTag: 'DIV',
+      elementCount: 1,
+      textNodeCount: 1,
+      otherNodeCount: 0,
+      maxDepth: 1,
+      tagHistogram: { DIV: 1 }
+    }
+  });
   let exclusiveTail = Promise.resolve();
   const controller = {
     async runExclusive(fn) {
@@ -48,7 +89,45 @@ async function fixture() {
         submittedAt: 100,
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
+        modelEvidence: 'GPT-5.6 Pro',
+        identityMode: 'rendered_exact',
+        composerPromptSha256: sha256(fixturePrompt),
+        clickCount: 1,
+        composerIdentity: {
+          ok: true,
+          serializerOk: true,
+          serializerMethod: 'contenteditable_structural',
+          serializerError: null,
+          serializerTag: null,
+          serializedLength: fixturePrompt.length,
+          observedLengths: [fixturePrompt.length],
+          expectedLength: fixturePrompt.length,
+          candidateCount: 1,
+          rootTag: 'DIV',
+          elementCount: 1,
+          textNodeCount: 1,
+          otherNodeCount: 0,
+          maxDepth: 1,
+          tagHistogram: { DIV: 1 }
+        },
+        renderedIdentityDiagnostic: {
+          serializerOk: true,
+          serializerMethod: 'rendered_user_message_structural',
+          serializerError: null,
+          serializerTag: null,
+          serializedLength: fixturePrompt.length,
+          observedLengths: [fixturePrompt.length],
+          expectedLength: fixturePrompt.length,
+          candidateCount: 1,
+          exactMatchCount: 1,
+          readableCandidateCount: 1,
+          rootTag: 'DIV',
+          elementCount: 1,
+          textNodeCount: 1,
+          otherNodeCount: 0,
+          maxDepth: 1,
+          tagHistogram: { DIV: 1 }
+        }
       });
       return {
         userMessageId: 'user-1',
@@ -88,7 +167,8 @@ async function fixture() {
         submittedAt: 100,
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
+        modelEvidence: 'GPT-5.6 Pro',
+        ...exactIdentityFields()
       });
       return {
         userMessageId: 'user-1',
@@ -123,6 +203,7 @@ async function fixture() {
     }
   };
   const prompt = 'Return exactly SMOKE_OK.';
+  fixturePrompt = prompt;
   const request = {
     stableKey: 'hmasd-agentify-transport-smoke',
     provider: 'chatgpt',
@@ -277,6 +358,10 @@ test('review transport: one exact send persists a complete receipt and duplicate
   assert.equal(first.responseSha256, sha256('SMOKE_OK'));
   assert.equal(first.userMessageId, 'user-1');
   assert.equal(first.assistantMessageId, 'assistant-1');
+  assert.equal(first.submissionIdentityMode, 'rendered_exact');
+  assert.equal(first.composerPromptSha256, f.request.promptSha256);
+  assert.equal(first.composerIdentity.ok, true);
+  assert.equal(first.renderedIdentityDiagnostic.candidateCount, 1);
   assert.equal(f.calls.review, 1);
 
   const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });

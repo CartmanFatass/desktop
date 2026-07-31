@@ -589,6 +589,7 @@ export class ChatGPTController {
       await this.page.insertText(prompt);
     }
 
+    let identityReceipt = null;
     if (verifyExact) {
       const verification = await this.inspectReviewComposerIdentity({ expectedPrompt: prompt });
       if (!verification?.ok) {
@@ -596,7 +597,9 @@ export class ChatGPTController {
         error.data = verification || null;
         throw error;
       }
+      identityReceipt = verification;
     }
+    return identityReceipt;
   }
 
   async inspectReviewComposerIdentity({ expectedPrompt = '' } = {}) {
@@ -1169,12 +1172,34 @@ export class ChatGPTController {
       );
       const matches = newUserMessages.filter((message) => message.text === prompt);
       if (matches.length > 1) throw new Error('review_user_message_ambiguous');
-      if (matches.length === 1) return { snapshot, message: matches[0] };
+      if (matches.length === 1) {
+        return {
+          snapshot,
+          message: matches[0],
+          identityMode: 'rendered_exact',
+          renderedIdentityDiagnostic: {
+            serializerOk: true,
+            serializerMethod: 'rendered_user_message_structural',
+            serializerError: null,
+            serializerTag: null,
+            serializedLength: prompt.length,
+            observedLengths: [prompt.length],
+            expectedLength: prompt.length,
+            candidateCount: 1,
+            exactMatchCount: 1,
+            readableCandidateCount: 1,
+            ...(matches[0].textIdentityDiagnostic || {})
+          }
+        };
+      }
       if (newUserMessages.length > 1) throw new Error('review_user_message_ambiguous');
       if (newUserMessages.length === 1) {
         const message = newUserMessages[0];
-        const error = new Error('review_user_message_identity_unreadable');
-        error.data = {
+        return {
+          snapshot,
+          message,
+          identityMode: 'exact_composer_causal_binding',
+          renderedIdentityDiagnostic: {
           serializerOk: message.textIdentityReadable === true,
           serializerMethod: 'rendered_user_message_structural',
           serializerError: message.textIdentityError || 'review_user_message_content_mismatch',
@@ -1182,9 +1207,12 @@ export class ChatGPTController {
           serializedLength: Number.isInteger(message.textLength) ? message.textLength : 0,
           observedLengths: Number.isInteger(message.textLength) ? [message.textLength] : [],
           expectedLength: prompt.length,
+          candidateCount: 1,
+          exactMatchCount: 0,
+          readableCandidateCount: message.textIdentityReadable === true ? 1 : 0,
           ...(message.textIdentityDiagnostic || {})
+          }
         };
-        throw error;
       }
       await sleep(400);
     }
@@ -1299,15 +1327,20 @@ export class ChatGPTController {
       });
       // Strict review transport avoids clipboard/paste conversion. Prove the
       // active composer contains the complete prompt before the sole send.
-      await this.#typePrompt(prompt, { human: false, verifyExact: true });
-      await this.#clickReviewSendOnce(prompt);
+      const composerIdentity = await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      const clickReceipt = await this.#clickReviewSendOnce(prompt);
       const submitted = await this.#waitForReviewUserMessage({ prompt, baselineIds, deadline, identity });
       await onSubmitted?.({
         userMessageId: submitted.message.id,
         submittedAt: Date.now(),
         conversationUrl: submitted.snapshot.url,
         conversationId: submitted.snapshot.conversationId,
-        modelEvidence: submitted.snapshot.modelEvidence
+        modelEvidence: submitted.snapshot.modelEvidence,
+        identityMode: submitted.identityMode,
+        composerPromptSha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+        composerIdentity,
+        clickCount: clickReceipt?.clickCount || 0,
+        renderedIdentityDiagnostic: submitted.renderedIdentityDiagnostic
       });
       return await this.#waitForReviewAssistant({ userMessageId: submitted.message.id, deadline, identity });
     } finally {
