@@ -37,6 +37,12 @@ test('chatgpt-controller: structural composer serialization rejects unsupported 
 
   const altered = elementNode('DIV', elementNode('P', textNode('exact')), textNode('!'));
   assert.notEqual(serializeReviewComposer(altered).text, 'exact');
+
+  assert.deepEqual(serializeReviewComposer(elementNode('BUTTON', textNode('exact'))), {
+    ok: false,
+    error: 'review_composer_element_unsupported',
+    tag: 'BUTTON'
+  });
 });
 
 test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
@@ -64,6 +70,18 @@ test('chatgpt-controller: user-message identity fails closed on distinct content
     error: 'review_user_message_content_ambiguous',
     candidateCount: 2,
     distinctTextCount: 2
+  });
+});
+
+test('chatgpt-controller: user-message identity rejects selector-matching control content', () => {
+  const control = elementNode('BUTTON', textNode('exact prompt'));
+  control.querySelectorAll = () => [];
+  control.getAttribute = () => null;
+  const outer = elementNode('DIV', control);
+  outer.querySelectorAll = () => [control];
+  assert.deepEqual(serializeReviewUserMessage(outer), {
+    ok: false,
+    error: 'review_user_message_content_missing'
   });
 });
 

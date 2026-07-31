@@ -78,6 +78,10 @@ export function serializeReviewComposer(root) {
   if (!root || typeof root !== 'object' || Number(root.nodeType) !== 1) {
     return { ok: false, error: 'review_composer_root_unreadable' };
   }
+  const rootTag = String(root.tagName || '').toUpperCase();
+  if (!inlineTags.has(rootTag) && !blockTags.has(rootTag)) {
+    return { ok: false, error: 'review_composer_element_unsupported', tag: rootTag };
+  }
   return serializeChildren(root);
 }
 
@@ -89,12 +93,18 @@ export function serializeReviewUserMessage(root) {
   const discovered = typeof root.querySelectorAll === 'function'
     ? Array.from(root.querySelectorAll(selector))
     : [];
+  const isControl = (node) => {
+    const tag = String(node?.tagName || '').toUpperCase();
+    const role = String(node?.getAttribute?.('role') || '').toLowerCase();
+    return tag === 'BUTTON' || tag === 'A' || role === 'button' || !!node?.closest?.('button, [role="button"], a');
+  };
   const candidates = discovered.length
     ? discovered.filter((node) => {
+      if (isControl(node)) return false;
       if (typeof node?.querySelectorAll !== 'function') return true;
       return Array.from(node.querySelectorAll(selector)).length === 0;
     })
-    : [root];
+    : isControl(root) ? [] : [root];
   if (candidates.length === 0) {
     return { ok: false, error: 'review_user_message_content_missing' };
   }
