@@ -20,6 +20,16 @@ export function classifyReviewControls(labels, { selectorStop = false, sendVisib
   };
 }
 
+export function deduplicateReviewModelEvidence(values) {
+  const unique = new Map();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const value = String(raw || '').replace(/\s+/g, ' ').trim();
+    const token = value.toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (value && token && !unique.has(token)) unique.set(token, value);
+  }
+  return [...unique.values()];
+}
+
 export function serializeReviewComposer(root) {
   const inlineTags = new Set([
     'A', 'B', 'CODE', 'EM', 'I', 'MARK', 'S', 'SMALL', 'SPAN', 'STRONG',
@@ -861,6 +871,7 @@ export class ChatGPTController {
     const dom = await this.#eval(`(() => {
       const reviewSnapshotMarker = true;
       const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -908,8 +919,10 @@ export class ChatGPTController {
             return value && normalizeModel(value) === normalizeModel(expectedModel);
           })
         : [];
-      const modelEvidenceCandidates = [...new Set([...semanticModelNodes, ...composerModelNodes])]
-        .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim());
+      const modelEvidenceCandidates = deduplicateReviewModelEvidence(
+        [...semanticModelNodes, ...composerModelNodes]
+          .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+      );
       const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);
       return {
         messages,

@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import {
   ChatGPTController,
   classifyReviewControls,
+  deduplicateReviewModelEvidence,
   serializeReviewComposer
 } from '../chatgpt-controller.mjs';
 
@@ -35,6 +36,17 @@ test('chatgpt-controller: structural composer serialization rejects unsupported 
 
   const altered = elementNode('DIV', elementNode('P', textNode('exact')), textNode('!'));
   assert.notEqual(serializeReviewComposer(altered).text, 'exact');
+});
+
+test('chatgpt-controller: duplicate identical model evidence collapses while conflicting evidence remains', () => {
+  assert.deepEqual(
+    deduplicateReviewModelEvidence([' Pro ', 'Pro', 'PRO']),
+    ['Pro']
+  );
+  assert.deepEqual(
+    deduplicateReviewModelEvidence(['Pro', 'Thinking']),
+    ['Pro', 'Thinking']
+  );
 });
 
 test('chatgpt-controller: review model evidence is not restricted to semantic header or nav containers', () => {
@@ -382,7 +394,7 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
   assert.equal(sendEvaluationReached, true);
 });
 
-test('chatgpt-controller: strict review rejects duplicate same-label model controls before send', async () => {
+test('chatgpt-controller: strict review rejects conflicting model controls before send', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let inserted = false;
   const page = {
@@ -396,7 +408,7 @@ test('chatgpt-controller: strict review rejects duplicate same-label model contr
         return {
           messages: [],
           modelEvidence: null,
-          modelEvidenceCandidates: ['GPT-5.6 Pro', 'GPT-5.6 Pro'],
+          modelEvidenceCandidates: ['GPT-5.6 Pro', 'GPT-5.6 Thinking'],
           controlText: [],
           selectorStop: false,
           sendVisible: true
