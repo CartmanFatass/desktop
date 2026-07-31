@@ -7,7 +7,8 @@ import {
   ChatGPTController,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
-  serializeReviewComposer
+  serializeReviewComposer,
+  serializeReviewUserMessage
 } from '../chatgpt-controller.mjs';
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
@@ -36,6 +37,34 @@ test('chatgpt-controller: structural composer serialization rejects unsupported 
 
   const altered = elementNode('DIV', elementNode('P', textNode('exact')), textNode('!'));
   assert.notEqual(serializeReviewComposer(altered).text, 'exact');
+});
+
+test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
+  const content = elementNode('DIV', textNode('alpha\n\nbeta'));
+  content.querySelectorAll = () => [];
+  const editControl = elementNode('BUTTON', textNode('Edit'));
+  const outer = elementNode('DIV', content, editControl);
+  outer.querySelectorAll = () => [content];
+  assert.deepEqual(serializeReviewUserMessage(outer), {
+    ok: true,
+    text: 'alpha\n\nbeta',
+    candidateCount: 1
+  });
+});
+
+test('chatgpt-controller: user-message identity fails closed on distinct content leaves', () => {
+  const first = elementNode('DIV', textNode('alpha'));
+  const second = elementNode('DIV', textNode('beta'));
+  first.querySelectorAll = () => [];
+  second.querySelectorAll = () => [];
+  const outer = elementNode('DIV', first, second);
+  outer.querySelectorAll = () => [first, second];
+  assert.deepEqual(serializeReviewUserMessage(outer), {
+    ok: false,
+    error: 'review_user_message_content_ambiguous',
+    candidateCount: 2,
+    distinctTextCount: 2
+  });
 });
 
 test('chatgpt-controller: duplicate identical model evidence collapses while conflicting evidence remains', () => {

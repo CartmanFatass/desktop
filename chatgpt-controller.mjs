@@ -81,6 +81,45 @@ export function serializeReviewComposer(root) {
   return serializeChildren(root);
 }
 
+export function serializeReviewUserMessage(root) {
+  if (!root || typeof root !== 'object' || Number(root.nodeType) !== 1) {
+    return { ok: false, error: 'review_user_message_root_unreadable' };
+  }
+  const selector = '[data-message-content], .whitespace-pre-wrap, [class~="whitespace-pre-wrap"]';
+  const discovered = typeof root.querySelectorAll === 'function'
+    ? Array.from(root.querySelectorAll(selector))
+    : [];
+  const candidates = discovered.length
+    ? discovered.filter((node) => {
+      if (typeof node?.querySelectorAll !== 'function') return true;
+      return Array.from(node.querySelectorAll(selector)).length === 0;
+    })
+    : [root];
+  if (candidates.length === 0) {
+    return { ok: false, error: 'review_user_message_content_missing' };
+  }
+  const serialized = candidates.map((node) => serializeReviewComposer(node));
+  const unreadable = serialized.find((entry) => entry.ok !== true);
+  if (unreadable) {
+    return {
+      ok: false,
+      error: unreadable.error || 'review_user_message_content_unreadable',
+      tag: unreadable.tag || null,
+      candidateCount: candidates.length
+    };
+  }
+  const exactTexts = [...new Set(serialized.map((entry) => entry.text))];
+  if (exactTexts.length !== 1) {
+    return {
+      ok: false,
+      error: 'review_user_message_content_ambiguous',
+      candidateCount: candidates.length,
+      distinctTextCount: exactTexts.length
+    };
+  }
+  return { ok: true, text: exactTexts[0], candidateCount: candidates.length };
+}
+
 function jitter(minMs, maxMs) {
   const min = Math.max(0, Number(minMs) || 0);
   const max = Math.max(min, Number(maxMs) || 0);
@@ -871,6 +910,7 @@ export class ChatGPTController {
     const dom = await this.#eval(`(() => {
       const reviewSnapshotMarker = true;
       const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const serializeReviewUserMessage = ${serializeReviewUserMessage.toString()};
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
       const visible = (node) => {
         if (!node) return false;
@@ -886,7 +926,7 @@ export class ChatGPTController {
         .map((node, order) => {
           const role = String(node.getAttribute('data-message-author-role') || '').trim();
           const serialized = role === 'user'
-            ? serializeReviewComposer(node)
+            ? serializeReviewUserMessage(node)
             : { ok: true, text: String(node.innerText || '') };
           return {
             order,
