@@ -139,6 +139,19 @@ test('chatgpt-controller: user-message identity reads the unique content leaf an
   });
 });
 
+test('chatgpt-controller: unreadable rendered user message returns structure without content', () => {
+  const content = elementNode('PRE', elementNode('CODE', textNode('secret-code')));
+  content.querySelectorAll = () => [];
+  const outer = elementNode('DIV', content);
+  outer.querySelectorAll = () => [content];
+  const result = serializeReviewUserMessage(outer);
+  assert.equal(result.ok, false);
+  assert.equal(result.tag, 'PRE');
+  assert.equal(result.rootTag, 'PRE');
+  assert.deepEqual(result.tagHistogram, { CODE: 1, PRE: 1 });
+  assert.equal(JSON.stringify(result).includes('secret-code'), false);
+});
+
 test('chatgpt-controller: user-message identity fails closed on distinct content leaves', () => {
   const first = elementNode('DIV', textNode('alpha'));
   const second = elementNode('DIV', textNode('beta'));
@@ -520,6 +533,85 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
     /review_composer_identity_mismatch/
   );
   assert.equal(sendEvaluationReached, true);
+});
+
+test('chatgpt-controller: strict review fails immediately on one new unreadable rendered user message', async () => {
+  const url = 'https://chatgpt.com/c/conversation-rendered';
+  const prompt = '```text\nsynthetic\n```\n';
+  let strictClicks = 0;
+  const page = {
+    async navigate() {},
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return {
+          ok: true,
+          serializerOk: true,
+          serializerMethod: 'contenteditable_structural',
+          serializedLength: prompt.length,
+          observedLengths: [prompt.length],
+          expectedLength: prompt.length
+        };
+      }
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: strictClicks ? [{
+            order: 0,
+            role: 'user',
+            id: 'user-rendered',
+            text: null,
+            textLength: null,
+            textIdentityReadable: false,
+            textIdentityError: 'review_composer_element_unsupported',
+            textIdentityTag: 'PRE',
+            textIdentityDiagnostic: {
+              candidateCount: 1,
+              rootTag: 'PRE',
+              elementCount: 2,
+              textNodeCount: 1,
+              otherNodeCount: 0,
+              maxDepth: 2,
+              tagHistogram: { CODE: 1, PRE: 1 }
+            }
+          }] : [],
+          modelEvidence: 'GPT-5.6 Pro',
+          modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async sendKey() {},
+    async insertText() {},
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt,
+      expectedUrl: url,
+      expectedConversationId: 'conversation-rendered',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 5_000
+    }),
+    (error) => {
+      assert.equal(error.message, 'review_user_message_identity_unreadable');
+      assert.equal(error.data.serializerTag, 'PRE');
+      assert.equal(error.data.expectedLength, prompt.length);
+      return true;
+    }
+  );
+  assert.equal(strictClicks, 1);
 });
 
 test('chatgpt-controller: strict review rejects conflicting model controls before send', async () => {

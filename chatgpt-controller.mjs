@@ -150,13 +150,16 @@ export function serializeReviewUserMessage(root) {
     return { ok: false, error: 'review_user_message_content_missing' };
   }
   const serialized = candidates.map((node) => serializeReviewComposer(node));
-  const unreadable = serialized.find((entry) => entry.ok !== true);
+  const unreadableIndex = serialized.findIndex((entry) => entry.ok !== true);
+  const unreadable = unreadableIndex >= 0 ? serialized[unreadableIndex] : null;
   if (unreadable) {
+    const structure = summarizeReviewComposerStructure(candidates[unreadableIndex]);
     return {
       ok: false,
       error: unreadable.error || 'review_user_message_content_unreadable',
       tag: unreadable.tag || null,
-      candidateCount: candidates.length
+      candidateCount: candidates.length,
+      ...structure
     };
   }
   const exactTexts = [...new Set(serialized.map((entry) => entry.text))];
@@ -1011,9 +1014,19 @@ export class ChatGPTController {
             role,
             id: identity(node),
             text: serialized.ok === true ? serialized.text : null,
+            textLength: serialized.ok === true ? serialized.text.length : null,
             textIdentityReadable: serialized.ok === true,
             textIdentityError: serialized.error || null,
-            textIdentityTag: serialized.tag || null
+            textIdentityTag: serialized.tag || null,
+            textIdentityDiagnostic: {
+              candidateCount: serialized.candidateCount ?? null,
+              rootTag: serialized.rootTag || null,
+              elementCount: serialized.elementCount ?? null,
+              textNodeCount: serialized.textNodeCount ?? null,
+              otherNodeCount: serialized.otherNodeCount ?? null,
+              maxDepth: serialized.maxDepth ?? null,
+              tagHistogram: serialized.tagHistogram || null
+            }
           };
         });
       const controls = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
@@ -1149,11 +1162,28 @@ export class ChatGPTController {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
       this.#assertReviewIdentity(snapshot, identity);
-      const matches = (snapshot.messages || []).filter(
-        (message) => message.role === 'user' && message.text === prompt && !baselineIds.has(message.id)
+      const newUserMessages = (snapshot.messages || []).filter(
+        (message) => message.role === 'user' && !baselineIds.has(message.id)
       );
+      const matches = newUserMessages.filter((message) => message.text === prompt);
       if (matches.length > 1) throw new Error('review_user_message_ambiguous');
       if (matches.length === 1) return { snapshot, message: matches[0] };
+      if (newUserMessages.length > 1) throw new Error('review_user_message_ambiguous');
+      if (newUserMessages.length === 1) {
+        const message = newUserMessages[0];
+        const error = new Error('review_user_message_identity_unreadable');
+        error.data = {
+          serializerOk: message.textIdentityReadable === true,
+          serializerMethod: 'rendered_user_message_structural',
+          serializerError: message.textIdentityError || 'review_user_message_content_mismatch',
+          serializerTag: message.textIdentityTag || null,
+          serializedLength: Number.isInteger(message.textLength) ? message.textLength : 0,
+          observedLengths: Number.isInteger(message.textLength) ? [message.textLength] : [],
+          expectedLength: prompt.length,
+          ...(message.textIdentityDiagnostic || {})
+        };
+        throw error;
+      }
       await sleep(400);
     }
     throw new Error('review_user_message_identity_unreadable');
@@ -1271,10 +1301,25 @@ export class ChatGPTController {
     this.#assertReviewIdentity(snapshot, identity);
     if (!Array.isArray(baselineMessageIds)) throw new Error('review_submission_baseline_missing');
     const baselineIds = new Set(baselineMessageIds);
-    const matches = (snapshot.messages || []).filter(
-      (message) => message.role === 'user' && message.text === prompt && !baselineIds.has(message.id)
+    const newUserMessages = (snapshot.messages || []).filter(
+      (message) => message.role === 'user' && !baselineIds.has(message.id)
     );
-    if (matches.length !== 1) throw new Error('review_user_message_identity_unreadable');
+    const matches = newUserMessages.filter((message) => message.text === prompt);
+    if (matches.length !== 1) {
+      const message = newUserMessages.length === 1 ? newUserMessages[0] : null;
+      const error = new Error('review_user_message_identity_unreadable');
+      error.data = message ? {
+        serializerOk: message.textIdentityReadable === true,
+        serializerMethod: 'rendered_user_message_structural',
+        serializerError: message.textIdentityError || 'review_user_message_content_mismatch',
+        serializerTag: message.textIdentityTag || null,
+        serializedLength: Number.isInteger(message.textLength) ? message.textLength : 0,
+        observedLengths: Number.isInteger(message.textLength) ? [message.textLength] : [],
+        expectedLength: prompt.length,
+        ...(message.textIdentityDiagnostic || {})
+      } : { candidateCount: newUserMessages.length, expectedLength: prompt.length };
+      throw error;
+    }
     await onRecovered?.({
       userMessageId: matches[0].id,
       submittedAt: Date.now(),
