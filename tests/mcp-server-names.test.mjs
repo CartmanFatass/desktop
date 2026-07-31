@@ -11,6 +11,11 @@ test('mcp-server registers agentify_* tools only', async () => {
   const src = await fs.readFile(path.join(__dirname, '..', 'mcp-server.mjs'), 'utf8');
 
   assert.ok(src.includes("'agentify_query'"), 'expected agentify_query tool');
+  assert.ok(src.includes("'agentify_review_query'"), 'expected strict agentify_review_query tool');
+  assert.ok(src.includes("path: '/review-query'"), 'expected strict review-query endpoint forwarding');
+  for (const field of ['stableKey', 'provider', 'model', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'verifyExisting']) {
+    assert.ok(src.includes(`${field}:`), `expected ${field} review field`);
+  }
   assert.ok(src.includes("'agentify_download_images'"), 'expected agentify_download_images tool');
   assert.ok(src.includes("'agentify_list_watch_folders'"), 'expected agentify_list_watch_folders tool');
   assert.ok(src.includes("'agentify_add_watch_folder'"), 'expected agentify_add_watch_folder tool');

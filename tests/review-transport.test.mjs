@@ -1,0 +1,260 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+import { runReviewQuery } from '../review-transport.mjs';
+
+const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+
+async function fixture() {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
+  const calls = { review: 0, observe: 0, recover: 0, ensure: [] };
+  let failBeforeSubmittedReceipt = false;
+  let exclusiveTail = Promise.resolve();
+  const controller = {
+    async runExclusive(fn) {
+      const previous = exclusiveTail;
+      let release;
+      exclusiveTail = new Promise((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+    async reviewQuery(args) {
+      calls.review += 1;
+      await args.onPrepared({
+        baselineMessageIds: ['historical-user-1'],
+        preparedAt: 50,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
+      await args.onSubmitted({
+        userMessageId: 'user-1',
+        submittedAt: 100,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      return {
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        text: 'SMOKE_OK',
+        snapshots: [
+          { observedAt: 1000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
+          { observedAt: 4100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
+        ],
+        controls: { stop: false, continue: false, retry: false, answerNow: false },
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      };
+    },
+    async observeReviewResponse(args) {
+      calls.observe += 1;
+      return {
+        userMessageId: args.userMessageId,
+        assistantMessageId: 'assistant-1',
+        text: 'SMOKE_OK',
+        snapshots: [
+          { observedAt: 5000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
+          { observedAt: 8100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
+        ],
+        controls: { stop: false, continue: false, retry: false, answerNow: false },
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      };
+    },
+    async recoverReviewSubmission(args) {
+      calls.recover += 1;
+      assert.deepEqual(args.baselineMessageIds, ['historical-user-1']);
+      await args.onRecovered({
+        userMessageId: 'user-1',
+        submittedAt: 100,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      return {
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        text: 'SMOKE_OK',
+        snapshots: [
+          { observedAt: 9000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
+          { observedAt: 12100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
+        ],
+        controls: { stop: false, continue: false, retry: false, answerNow: false },
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      };
+    }
+  };
+  const tabs = {
+    async ensureTab(args) {
+      calls.ensure.push(args);
+      return 'tab-1';
+    },
+    getControllerById() {
+      return controller;
+    }
+  };
+  const prompt = 'Return exactly SMOKE_OK.';
+  const request = {
+    stableKey: 'hmasd-agentify-transport-smoke',
+    provider: 'chatgpt',
+    model: 'GPT-5.6 Pro',
+    conversationUrl: 'https://chatgpt.com/c/conversation-1',
+    conversationId: 'conversation-1',
+    idempotencyKey: 'hmasd-agentify-transport-smoke',
+    prompt,
+    promptSha256: sha256(prompt),
+    timeoutMs: 45 * 60_000
+  };
+  return {
+    stateDir,
+    calls,
+    tabs,
+    request,
+    setFailBeforeSubmittedReceipt(value) {
+      failBeforeSubmittedReceipt = !!value;
+    }
+  };
+}
+
+test('review transport: one exact send persists a complete receipt and duplicate returns it', async () => {
+  const f = await fixture();
+  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(first.status, 'COMPLETE');
+  assert.equal(first.sendCount, 1);
+  assert.equal(first.promptSha256, f.request.promptSha256);
+  assert.equal(first.responseSha256, sha256('SMOKE_OK'));
+  assert.equal(first.userMessageId, 'user-1');
+  assert.equal(first.assistantMessageId, 'assistant-1');
+  assert.equal(f.calls.review, 1);
+
+  const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(duplicate.status, 'COMPLETE');
+  assert.equal(duplicate.operationId, first.operationId);
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: conflicting idempotency payload is rejected without another send', async () => {
+  const f = await fixture();
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  const prompt = 'different';
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, prompt, promptSha256: sha256(prompt) }
+    }),
+    /review_idempotency_conflict/
+  );
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: restart verification is observe-only and bound to the same operation', async () => {
+  const f = await fixture();
+  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  const verified = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(verified.operationId, first.operationId);
+  assert.equal(verified.responseSha256, first.responseSha256);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+});
+
+test('review transport: stable-key binding mismatch and invalid prompt hash fail closed', async () => {
+  const f = await fixture();
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: {
+        ...f.request,
+        idempotencyKey: 'other-op',
+        conversationUrl: 'https://chatgpt.com/c/conversation-2',
+        conversationId: 'conversation-2'
+      }
+    }),
+    /review_binding_mismatch/
+  );
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, idempotencyKey: 'bad-hash', promptSha256: '0'.repeat(64) }
+    }),
+    /review_prompt_hash_mismatch/
+  );
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: timeout above 45 minutes is rejected before tab or send', async () => {
+  const f = await fixture();
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, timeoutMs: 45 * 60_000 + 1 }
+    }),
+    /review_timeout_out_of_range/
+  );
+  assert.equal(f.calls.review, 0);
+  assert.equal(f.calls.ensure.length, 0);
+});
+
+test('review transport: crash after durable send intent recovers observe-only without a second send', async () => {
+  const f = await fixture();
+  f.setFailBeforeSubmittedReceipt(true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /simulated_crash_after_send_intent/
+  );
+  f.setFailBeforeSubmittedReceipt(false);
+  const recovered = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(recovered.status, 'COMPLETE');
+  assert.equal(recovered.sendCount, 1);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.recover, 1);
+});
+
+test('review transport: concurrent identical calls re-read terminal state and send once', async () => {
+  const f = await fixture();
+  const [first, second] = await Promise.all([
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request })
+  ]);
+  assert.equal(first.operationId, second.operationId);
+  assert.equal(first.status, 'COMPLETE');
+  assert.equal(second.status, 'COMPLETE');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.recover, 0);
+});
+
+test('review transport: recovery cannot extend the persisted operation deadline', async () => {
+  const f = await fixture();
+  f.setFailBeforeSubmittedReceipt(true);
+  const request = { ...f.request, idempotencyKey: 'deadline-test', timeoutMs: 1_000 };
+  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /simulated_crash_after_send_intent/);
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  f.setFailBeforeSubmittedReceipt(false);
+  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /review_operation_deadline_exceeded/);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.recover, 0);
+});

@@ -59,6 +59,74 @@ test('http-api: rejects unauthorized', async (t) => {
   assert.equal(data.error, 'unauthorized');
 });
 
+test('http-api: strict review query returns a durable receipt and does not duplicate the send', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-'));
+  let sends = 0;
+  const response = 'REVIEW_SMOKE_OK';
+  const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
+  const prompt = 'Return REVIEW_SMOKE_OK.';
+  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  const controller = {
+    async reviewQuery(args) {
+      sends += 1;
+      await args.onSubmitted({
+        userMessageId: 'user-http-1',
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      return {
+        userMessageId: 'user-http-1',
+        assistantMessageId: 'assistant-http-1',
+        text: response,
+        snapshots: [
+          { observedAt: 1000, assistantMessageId: 'assistant-http-1', textSha256: responseSha256 },
+          { observedAt: 4100, assistantMessageId: 'assistant-http-1', textSha256: responseSha256 }
+        ],
+        controls: { stop: false, continue: false, retry: false, answerNow: false },
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      };
+    }
+  };
+  const tabs = {
+    ensureTab: async () => 'review-tab',
+    getControllerById: () => controller,
+    listTabs: () => []
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-review',
+    stateDir,
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const body = {
+    stableKey: 'hmasd-agentify-transport-smoke',
+    provider: 'chatgpt',
+    model: 'GPT-5.6 Pro',
+    conversationUrl: 'https://chatgpt.com/c/conversation-http',
+    conversationId: 'conversation-http',
+    idempotencyKey: 'hmasd-agentify-transport-smoke',
+    prompt,
+    promptSha256,
+    timeoutMs: 45 * 60_000
+  };
+  const first = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
+  assert.equal(first.res.status, 200);
+  assert.equal(first.data.receipt.status, 'COMPLETE');
+  assert.equal(first.data.receipt.responseSha256, responseSha256);
+  const duplicate = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
+  assert.equal(duplicate.res.status, 200);
+  assert.equal(duplicate.data.receipt.operationId, first.data.receipt.operationId);
+  assert.equal(sends, 1);
+});
+
 test('http-api: status returns getStatus output', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
   const server = await startHttpApi({
@@ -577,6 +645,7 @@ test('http-api: show creates missing key tab (and hide does not)', async (t) => 
 });
 
 test('http-api: operations run through controller.runExclusive when available', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-exclusive-'));
   let inExclusive = false;
   const calls = [];
   const controller = {
@@ -629,7 +698,7 @@ test('http-api: operations run through controller.runExclusive when available', 
     tabs,
     defaultTabId: 't0',
     serverId: 'sid-test',
-    stateDir: '/tmp',
+    stateDir,
     getStatus: async () => ({ ok: true })
   });
   t.after(() => server.close());

@@ -6,8 +6,13 @@ import crypto from 'node:crypto';
 async function atomicWriteFile(filePath, data, { mode } = {}) {
   const dir = path.dirname(filePath);
   const tmp = path.join(dir, `.${path.basename(filePath)}.${crypto.randomBytes(8).toString('hex')}.tmp`);
-  await fs.writeFile(tmp, data, mode ? { encoding: 'utf8', mode } : { encoding: 'utf8' });
-  await fs.rename(tmp, filePath);
+  try {
+    await fs.writeFile(tmp, data, mode ? { encoding: 'utf8', mode } : { encoding: 'utf8' });
+    await fs.rename(tmp, filePath);
+  } catch (error) {
+    await fs.unlink(tmp).catch(() => {});
+    throw error;
+  }
 }
 
 export function defaultStateDir() {
@@ -24,6 +29,130 @@ export function statePath(stateDir = defaultStateDir()) {
 
 export function settingsPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, 'settings.json');
+}
+
+export function reviewTransportPath(stateDir = defaultStateDir()) {
+  return path.join(stateDir, 'review-transport.json');
+}
+
+export function defaultReviewTransportState() {
+  return { schemaVersion: 1, bindings: {}, operations: {} };
+}
+
+function normalizeReviewTransportState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review_transport_state_invalid');
+  if (value.schemaVersion !== 1) throw new Error('review_transport_state_invalid');
+  if (!value.bindings || typeof value.bindings !== 'object' || Array.isArray(value.bindings)) {
+    throw new Error('review_transport_state_invalid');
+  }
+  if (!value.operations || typeof value.operations !== 'object' || Array.isArray(value.operations)) {
+    throw new Error('review_transport_state_invalid');
+  }
+  const nonEmptyString = (entry) => typeof entry === 'string' && entry.length > 0;
+  for (const [key, binding] of Object.entries(value.bindings)) {
+    if (
+      !nonEmptyString(key) ||
+      !binding ||
+      typeof binding !== 'object' ||
+      Array.isArray(binding) ||
+      binding.stableKey !== key ||
+      !nonEmptyString(binding.provider) ||
+      !nonEmptyString(binding.model) ||
+      !nonEmptyString(binding.conversationUrl) ||
+      !nonEmptyString(binding.conversationId) ||
+      !Number.isFinite(binding.createdAt) ||
+      !Number.isFinite(binding.updatedAt)
+    ) {
+      throw new Error('review_transport_state_invalid');
+    }
+  }
+  const statuses = new Set(['SEND_INTENT', 'PREPARED', 'SUBMITTED', 'BLOCKED', 'COMPLETE']);
+  for (const [key, operation] of Object.entries(value.operations)) {
+    if (
+      !nonEmptyString(key) ||
+      !operation ||
+      typeof operation !== 'object' ||
+      Array.isArray(operation) ||
+      operation.idempotencyKey !== key ||
+      !nonEmptyString(operation.operationId) ||
+      !nonEmptyString(operation.requestFingerprint) ||
+      !nonEmptyString(operation.stableKey) ||
+      !nonEmptyString(operation.provider) ||
+      !nonEmptyString(operation.model) ||
+      !nonEmptyString(operation.conversationUrl) ||
+      !nonEmptyString(operation.conversationId) ||
+      !/^[0-9a-f]{64}$/.test(String(operation.promptSha256 || '')) ||
+      !statuses.has(operation.status) ||
+      !Number.isInteger(operation.sendCount) ||
+      operation.sendCount < 0 ||
+      operation.sendCount > 1 ||
+      !Number.isFinite(operation.createdAt) ||
+      !Number.isFinite(operation.updatedAt) ||
+      !Number.isFinite(operation.deadlineAt) ||
+      operation.deadlineAt <= operation.createdAt
+    ) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.baselineMessageIds !== undefined) {
+      if (
+        !Array.isArray(operation.baselineMessageIds) ||
+        operation.baselineMessageIds.some((id) => !nonEmptyString(id)) ||
+        new Set(operation.baselineMessageIds).size !== operation.baselineMessageIds.length
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
+    }
+    if (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId)) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.status === 'PREPARED' && (!operation.baselineMessageIds || operation.sendCount !== 0 || operation.userMessageId)) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.status === 'SUBMITTED' && (operation.sendCount !== 1 || !operation.userMessageId)) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.status === 'COMPLETE') {
+      const responseText = operation.responseText;
+      const responseSha256 = typeof responseText === 'string'
+        ? crypto.createHash('sha256').update(responseText, 'utf8').digest('hex')
+        : null;
+      const snapshots = operation.snapshots;
+      const controls = operation.controls;
+      if (
+        operation.sendCount !== 1 ||
+        !operation.userMessageId ||
+        !operation.assistantMessageId ||
+        operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
+        !nonEmptyString(responseText) ||
+        operation.responseSha256 !== responseSha256 ||
+        !Array.isArray(snapshots) ||
+        snapshots.length !== 2 ||
+        snapshots.some((snapshot) =>
+          !snapshot ||
+          snapshot.assistantMessageId !== operation.assistantMessageId ||
+          snapshot.textSha256 !== responseSha256 ||
+          !Number.isFinite(snapshot.observedAt)
+        ) ||
+        snapshots[1].observedAt - snapshots[0].observedAt < 3_000 ||
+        !controls ||
+        typeof controls !== 'object' ||
+        controls.stop !== false ||
+        controls.continue !== false ||
+        controls.retry !== false ||
+        typeof controls.answerNow !== 'boolean' ||
+        !Array.isArray(operation.clickedControls) ||
+        operation.clickedControls.length !== 0 ||
+        !nonEmptyString(operation.modelEvidence) ||
+        !Number.isFinite(operation.completedAt)
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
+    }
+  }
+  return value;
 }
 
 export function defaultSettings() {
@@ -123,6 +252,24 @@ export async function readState(stateDir = defaultStateDir()) {
 export async function writeState(state, stateDir = defaultStateDir()) {
   await ensureStateDir(stateDir);
   await atomicWriteFile(statePath(stateDir), `${JSON.stringify(state, null, 2)}\n`);
+}
+
+export async function readReviewTransportState(stateDir = defaultStateDir()) {
+  try {
+    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
+    return normalizeReviewTransportState(JSON.parse(raw));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return defaultReviewTransportState();
+    if (String(error?.message || '') === 'review_transport_state_invalid') throw error;
+    throw new Error('review_transport_state_invalid', { cause: error });
+  }
+}
+
+export async function writeReviewTransportState(state, stateDir = defaultStateDir()) {
+  await ensureStateDir(stateDir);
+  const normalized = normalizeReviewTransportState(state);
+  await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
+  return normalized;
 }
 
 export async function readSettings(stateDir = defaultStateDir()) {

@@ -4,7 +4,17 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ensureToken, readToken, writeToken, defaultSettings, normalizeSettings, readSettings, writeSettings } from '../state.mjs';
+import {
+  ensureToken,
+  readToken,
+  writeToken,
+  defaultSettings,
+  normalizeSettings,
+  readSettings,
+  writeSettings,
+  readReviewTransportState,
+  writeReviewTransportState
+} from '../state.mjs';
 
 async function tempDir() {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-desktop-test-'));
@@ -64,4 +74,107 @@ test('state: normalizeSettings clamps backend fields', () => {
   assert.equal(s.chromeExecutablePath, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
   assert.equal(s.chromeProfileMode, 'existing');
   assert.equal(s.chromeProfileName, 'Profile 2');
+});
+
+test('state: review transport ledger is atomically persisted and defaults cleanly', async () => {
+  const dir = await tempDir();
+  assert.deepEqual(await readReviewTransportState(dir), { schemaVersion: 1, bindings: {}, operations: {} });
+  const now = Date.now();
+  const responseText = 'complete';
+  const responseSha256 = (await import('node:crypto')).createHash('sha256').update(responseText, 'utf8').digest('hex');
+  const value = {
+    schemaVersion: 1,
+    bindings: {
+      'hmasd-formal-pro': {
+        stableKey: 'hmasd-formal-pro',
+        provider: 'chatgpt',
+        model: 'GPT-5.6 Pro',
+        conversationUrl: 'https://chatgpt.com/c/c-1',
+        conversationId: 'c-1',
+        createdAt: now,
+        updatedAt: now
+      }
+    },
+    operations: {
+      smoke: {
+        operationId: 'operation-1',
+        idempotencyKey: 'smoke',
+        requestFingerprint: 'f'.repeat(64),
+        stableKey: 'hmasd-formal-pro',
+        provider: 'chatgpt',
+        model: 'GPT-5.6 Pro',
+        conversationUrl: 'https://chatgpt.com/c/c-1',
+        conversationId: 'c-1',
+        promptSha256: 'a'.repeat(64),
+        status: 'COMPLETE',
+        terminalState: 'NATURAL_COMPLETION_VERIFIED',
+        sendCount: 1,
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        responseText,
+        responseSha256,
+        snapshots: [
+          { observedAt: now, assistantMessageId: 'assistant-1', textSha256: responseSha256 },
+          { observedAt: now + 3_100, assistantMessageId: 'assistant-1', textSha256: responseSha256 }
+        ],
+        controls: { stop: false, continue: false, retry: false, answerNow: true },
+        clickedControls: [],
+        modelEvidence: 'GPT-5.6 Pro',
+        createdAt: now,
+        updatedAt: now,
+        deadlineAt: now + 10_000,
+        completedAt: now + 3_100
+      }
+    }
+  };
+  await writeReviewTransportState(value, dir);
+  assert.deepEqual(await readReviewTransportState(dir), value);
+});
+
+test('state: corrupt review transport ledger fails closed', async () => {
+  const dir = await tempDir();
+  await fs.writeFile(path.join(dir, 'review-transport.json'), '{not-json', 'utf8');
+  await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
+});
+
+test('state: parseable null or malformed nested review records fail closed', async () => {
+  const dir = await tempDir();
+  await fs.writeFile(
+    path.join(dir, 'review-transport.json'),
+    JSON.stringify({ schemaVersion: 1, bindings: { key: null }, operations: { op: null } }),
+    'utf8'
+  );
+  await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
+});
+
+test('state: incomplete parseable COMPLETE review receipt fails closed', async () => {
+  const dir = await tempDir();
+  const now = Date.now();
+  const incomplete = {
+    schemaVersion: 1,
+    bindings: {},
+    operations: {
+      op: {
+        operationId: 'operation-1',
+        idempotencyKey: 'op',
+        requestFingerprint: 'f'.repeat(64),
+        stableKey: 'key',
+        provider: 'chatgpt',
+        model: 'GPT-5.6 Pro',
+        conversationUrl: 'https://chatgpt.com/c/c-1',
+        conversationId: 'c-1',
+        promptSha256: 'a'.repeat(64),
+        status: 'COMPLETE',
+        terminalState: 'NATURAL_COMPLETION_VERIFIED',
+        sendCount: 1,
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        createdAt: now,
+        updatedAt: now,
+        deadlineAt: now + 10_000
+      }
+    }
+  };
+  await fs.writeFile(path.join(dir, 'review-transport.json'), JSON.stringify(incomplete), 'utf8');
+  await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
 });

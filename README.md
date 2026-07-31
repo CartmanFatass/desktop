@@ -148,6 +148,7 @@ The core loop is:
 The MCP server registers `agentify_*` tools, including:
 
 - `agentify_query`: send a prompt to a stable tab and return the assistant response.
+- `agentify_review_query`: submit one exact ChatGPT Pro review request with a persistent conversation binding, idempotency key, exact message identities, two-snapshot natural-completion proof, and a durable receipt. It never activates Continue, Retry, ResponseRetry, or Answer now.
 - `agentify_read_page`: read visible page text from a tab.
 - `agentify_navigate`: navigate a tab to a URL.
 - `agentify_ensure_ready`: wait for login, CAPTCHA, or UI readiness.
@@ -157,6 +158,31 @@ The MCP server registers `agentify_*` tools, including:
 - `agentify_save_artifacts`, `agentify_list_artifacts`, `agentify_open_artifacts_folder`: manage generated files/images.
 - `agentify_save_bundle`, `agentify_list_bundles`: save and reuse context bundles.
 - `agentify_add_watch_folder`, `agentify_list_watch_folders`, `agentify_remove_watch_folder`: manage watched folders.
+
+### Strict review transport
+
+`agentify_review_query` is intentionally narrower than `agentify_query`. It requires
+an exact ChatGPT conversation URL and identity, an expected visible model label, a
+stable key, an idempotency key, and the lowercase SHA-256 of the exact UTF-8 prompt.
+The first call records durable send intent before one send-button action. Reusing the
+same idempotency key returns or observe-only verifies the existing operation; a
+different payload is rejected.
+
+The strict path inserts the complete prompt without using clipboard paste, then
+verifies the active composer contains the exact text before it can activate Send.
+If ChatGPT cannot expose the full text as one exact user message, identity remains
+unreadable and the durable intent prevents an automatic duplicate submission.
+
+Completion requires the same assistant message identity and response hash in two
+snapshots at least three seconds apart, with no active Stop, Continue, or Retry
+control. The maximum operation deadline is 45 minutes. Ambiguous identity or a crash
+around submission never triggers an automatic second send.
+
+The 2026-07-31 production dependency audit reports 11 advisories (6 moderate,
+5 high, 0 critical). The direct `@modelcontextprotocol/sdk` dependency is
+reported high through transitive packages and currently has no upstream fix.
+See `SECURITY.md`; the desktop/API boundary remains local and bearer-token
+authenticated.
 
 ## Artifact Workflow
 

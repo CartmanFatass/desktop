@@ -111,7 +111,7 @@ export class TabManager {
     });
   }
 
-  async ensureTab({ key, name, url, vendorId, vendorName, show } = {}) {
+  async ensureTab({ key, name, url, vendorId, vendorName, show, exactUrl = false } = {}) {
     if (!key) throw new Error('missing_key');
     const existing = this.keyToId.get(key);
     if (existing) {
@@ -121,6 +121,7 @@ export class TabManager {
         return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
       }
       if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('key_vendor_mismatch');
+      if (exactUrl && String(tab.url || '') !== String(url || '')) throw new Error('key_url_mismatch');
       return existing;
     }
     return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });

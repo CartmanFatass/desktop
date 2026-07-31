@@ -1,8 +1,23 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+export function classifyReviewControls(labels, { selectorStop = false, sendVisible = false } = {}) {
+  const values = Array.isArray(labels)
+    ? labels.map((value) => String(value || '').replace(/\s+/g, ' ').trim()).filter(Boolean)
+    : [];
+  const has = (pattern) => values.some((value) => pattern.test(value));
+  return {
+    stop: !!selectorStop || has(/^(stop|stop generating|stop response)$/i),
+    continue: has(/^(continue|continue generating|continue response)$/i),
+    retry: has(/^(retry|response retry|try again|retry response)$/i),
+    answerNow: has(/^answer now$/i),
+    sendVisible: !!sendVisible
+  };
 }
 
 function jitter(minMs, maxMs) {
@@ -335,7 +350,7 @@ export class ChatGPTController {
     await this.page.mouseUp(x, y, { button: 'left', clickCount: 1 });
   }
 
-  async #typePrompt(prompt) {
+  async #typePrompt(prompt, { human = true, verifyExact = false } = {}) {
     await this.#emitProgress({ phase: 'typing_prompt' });
     const sel = JSON.stringify(this.selectors.promptTextarea);
     const ok = await this.#eval(`(() => {
@@ -413,7 +428,73 @@ export class ChatGPTController {
     await sleep(jitter(15, 50));
     await this.#sendKey('Backspace');
     await sleep(jitter(25, 80));
-    await this.#typeHuman(prompt);
+    if (human) {
+      await this.#typeHuman(prompt);
+    } else {
+      await this.page.insertText(prompt);
+    }
+
+    if (verifyExact) {
+      const expected = JSON.stringify(prompt);
+      const verification = await this.#eval(`(() => {
+        const expected = ${expected};
+        const visible = (n) => {
+          const r = n.getBoundingClientRect();
+          const style = window.getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const editable = (n) => {
+          if (!n || !visible(n)) return false;
+          if (n.matches('textarea')) return !n.disabled && !n.readOnly;
+          if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
+          return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
+        };
+        const score = (n) => {
+          const r = n.getBoundingClientRect();
+          const label = [
+            n.getAttribute('aria-label') || '',
+            n.getAttribute('placeholder') || '',
+            n.getAttribute('name') || '',
+            n.getAttribute('id') || '',
+            n.getAttribute('data-testid') || ''
+          ].join(' ').toLowerCase();
+          let s = 0;
+          if (/prompt|message|ask|chat|query|input/.test(label)) s += 80;
+          if (n.matches('textarea')) s += 50;
+          if (n.isContentEditable || n.getAttribute('contenteditable') === 'true') s += 35;
+          if (n.getAttribute('role') === 'textbox') s += 25;
+          if (r.width >= 260 && r.height >= 26) s += 20;
+          s += Math.min(180, Math.max(0, (r.width * r.height) / 2500));
+          s += Math.max(0, r.y / 8);
+          return s;
+        };
+        const base = Array.from(document.querySelectorAll(${sel}));
+        const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
+        const candidates = [];
+        const seen = new Set();
+        for (const n of [...base, ...fallback]) {
+          if (!n || seen.has(n)) continue;
+          seen.add(n);
+          if (editable(n)) candidates.push(n);
+        }
+        candidates.sort((a, b) => score(b) - score(a));
+        const el = candidates[0] || null;
+        if (!el) return { ok: false, error: 'missing_prompt_textarea' };
+        const observed = el.matches('textarea, input')
+          ? [String(el.value || '')]
+          : [String(el.innerText || ''), String(el.textContent || '')];
+        return {
+          ok: observed.some(value => value === expected),
+          observedLengths: observed.map(value => value.length),
+          expectedLength: expected.length
+        };
+      })()`);
+      if (!verification?.ok) {
+        const error = new Error('review_composer_identity_mismatch');
+        error.data = verification || null;
+        throw error;
+      }
+    }
   }
 
   async #waitForSendSignal({ timeoutMs = 1800, pollMs = 120 } = {}) {
@@ -704,6 +785,288 @@ export class ChatGPTController {
     })()`);
 
     await this.page.setFileInputFiles(absFiles);
+  }
+
+  async #reviewSnapshot() {
+    const url = await this.page.getUrl();
+    const stopSel = JSON.stringify(this.selectors.stopButton);
+    const sendSel = JSON.stringify(this.selectors.sendButton);
+    const reviewUserSel = JSON.stringify(this.selectors.reviewUserMessage || '[data-message-author-role="user"]');
+    const reviewAssistantSel = JSON.stringify(this.selectors.reviewAssistantMessage || '[data-message-author-role="assistant"]');
+    const reviewModelSel = JSON.stringify(
+      this.selectors.reviewModelEvidence || 'header button[data-testid*="model" i], header button[aria-label*="model" i], nav button[data-testid*="model" i], nav button[aria-label*="model" i]'
+    );
+    const dom = await this.#eval(`(() => {
+      const reviewSnapshotMarker = true;
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const identity = (node) => {
+        const host = node?.closest?.('[data-message-id]') || null;
+        return String(host?.getAttribute?.('data-message-id') || '').trim();
+      };
+      const messages = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}))
+        .map((node, order) => ({
+          order,
+          role: String(node.getAttribute('data-message-author-role') || '').trim(),
+          id: identity(node),
+          text: String(node.innerText || '')
+        }));
+      const controls = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
+      const controlText = controls.flatMap((node) => [
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('data-testid') || '',
+        node.textContent || ''
+      ]).map(value => String(value).replace(/\s+/g, ' ').trim()).filter(Boolean);
+      const selectorStop = Array.from(document.querySelectorAll(${stopSel})).some(visible);
+      const modelEvidenceCandidates = Array.from(document.querySelectorAll(${reviewModelSel}))
+        .filter(visible)
+        .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);
+      return {
+        messages,
+        modelEvidence: modelEvidenceCandidates.length === 1 ? modelEvidenceCandidates[0] : null,
+        modelEvidenceCandidates,
+        controlText,
+        selectorStop,
+        sendVisible: sendCandidates.length > 0
+      };
+    })()`);
+    let conversationId = null;
+    try {
+      const parts = new URL(url).pathname.split('/').filter(Boolean);
+      const marker = parts.lastIndexOf('c');
+      if (marker >= 0 && marker + 1 < parts.length) conversationId = parts[marker + 1];
+    } catch {}
+    const controls = classifyReviewControls(dom?.controlText, {
+      selectorStop: !!dom?.selectorStop,
+      sendVisible: !!dom?.sendVisible
+    });
+    return { url, conversationId, ...(dom || {}), controls };
+  }
+
+  #assertReviewIdentity(snapshot, { expectedUrl, expectedConversationId, expectedModel }) {
+    if (snapshot?.url !== expectedUrl || snapshot?.conversationId !== expectedConversationId) {
+      const error = new Error('review_conversation_identity_mismatch');
+      error.data = { url: snapshot?.url || null, conversationId: snapshot?.conversationId || null };
+      throw error;
+    }
+    const normalize = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    if (
+      !Array.isArray(snapshot?.modelEvidenceCandidates) ||
+      snapshot.modelEvidenceCandidates.length !== 1 ||
+      normalize(snapshot.modelEvidenceCandidates[0]) !== normalize(expectedModel)
+    ) {
+      const error = new Error('review_model_identity_mismatch');
+      error.data = { modelEvidenceCandidates: snapshot?.modelEvidenceCandidates || [] };
+      throw error;
+    }
+    for (const message of snapshot?.messages || []) {
+      if (!message?.id || !['user', 'assistant'].includes(message?.role)) {
+        const error = new Error('review_message_identity_unreadable');
+        error.data = { role: message?.role || null };
+        throw error;
+      }
+    }
+  }
+
+  async #clickReviewSendOnce(expectedPrompt) {
+    const sendSel = JSON.stringify(this.selectors.sendButton);
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const expected = JSON.stringify(expectedPrompt);
+    const result = await this.#eval(`(() => {
+      const reviewSendOnceMarker = true;
+      const expected = ${expected};
+      const visible = (node) => {
+        if (!node) return false;
+        const rect = node.getBoundingClientRect();
+        const style = window.getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const label = (node) => [
+        node.getAttribute('aria-label') || '',
+        node.getAttribute('data-testid') || '',
+        node.textContent || ''
+      ].join(' ').trim();
+      const prohibited = /continue|retry|try again|response retry|answer now|regenerate|stop/i;
+      const editable = (node) => {
+        if (!node || !visible(node)) return false;
+        if (node.matches('textarea')) return !node.disabled && !node.readOnly;
+        if (node.matches('input')) return !node.disabled && !node.readOnly && !/password|search|email|url|number|tel/i.test(String(node.type || 'text'));
+        return !!node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox';
+      };
+      const promptCandidates = Array.from(document.querySelectorAll(${promptSel})).filter(editable);
+      const exactPromptCandidates = promptCandidates.filter((promptNode) => {
+        const promptValues = promptNode.matches('textarea, input')
+          ? [String(promptNode.value || '')]
+          : [String(promptNode.innerText || ''), String(promptNode.textContent || '')];
+        return promptValues.some((value) => value === expected);
+      });
+      if (exactPromptCandidates.length !== 1) {
+        return {
+          ok: false,
+          error: exactPromptCandidates.length ? 'review_composer_identity_ambiguous' : 'review_composer_identity_mismatch',
+          composerCount: promptCandidates.length,
+          exactComposerCount: exactPromptCandidates.length
+        };
+      }
+      const candidates = Array.from(document.querySelectorAll(${sendSel}))
+        .filter((node) => visible(node) && !node.disabled && !prohibited.test(label(node)));
+      if (candidates.length !== 1) return { ok: false, error: 'review_send_control_ambiguous', count: candidates.length };
+      candidates[0].click();
+      return { ok: true, clickCount: 1, label: label(candidates[0]) };
+    })()`);
+    if (!result?.ok || result?.clickCount !== 1) {
+      const error = new Error(result?.error || 'review_send_control_ambiguous');
+      error.data = result || null;
+      throw error;
+    }
+    return result;
+  }
+
+  async #waitForReviewUserMessage({ prompt, baselineIds, deadline, identity }) {
+    while (Date.now() < deadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot();
+      this.#assertReviewIdentity(snapshot, identity);
+      const matches = (snapshot.messages || []).filter(
+        (message) => message.role === 'user' && message.text === prompt && !baselineIds.has(message.id)
+      );
+      if (matches.length > 1) throw new Error('review_user_message_ambiguous');
+      if (matches.length === 1) return { snapshot, message: matches[0] };
+      await sleep(400);
+    }
+    throw new Error('review_user_message_identity_unreadable');
+  }
+
+  async #waitForReviewAssistant({ userMessageId, deadline, identity }) {
+    let firstStable = null;
+    while (Date.now() < deadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot();
+      this.#assertReviewIdentity(snapshot, identity);
+      const userIndex = (snapshot.messages || []).findIndex((message) => message.role === 'user' && message.id === userMessageId);
+      if (userIndex < 0) throw new Error('review_user_message_identity_unreadable');
+      const following = snapshot.messages.slice(userIndex + 1);
+      const nextUserOffset = following.findIndex((message) => message.role === 'user');
+      const targetTurn = nextUserOffset >= 0 ? following.slice(0, nextUserOffset) : following;
+      const assistants = targetTurn.filter((message) => message.role === 'assistant');
+      if (assistants.length > 1) throw new Error('review_assistant_message_ambiguous');
+      const assistant = assistants[0] || null;
+      const active = !!snapshot.controls?.stop || !!snapshot.controls?.continue || !!snapshot.controls?.retry;
+      if (assistant?.id && assistant.text && !active) {
+        const textSha256 = crypto.createHash('sha256').update(assistant.text, 'utf8').digest('hex');
+        const observation = {
+          observedAt: Date.now(),
+          assistantMessageId: assistant.id,
+          textSha256
+        };
+        if (
+          firstStable &&
+          firstStable.assistantMessageId === observation.assistantMessageId &&
+          firstStable.textSha256 === observation.textSha256 &&
+          observation.observedAt - firstStable.observedAt >= 3_000
+        ) {
+          return {
+            userMessageId,
+            assistantMessageId: assistant.id,
+            text: assistant.text,
+            snapshots: [firstStable, observation],
+            controls: {
+              stop: !!snapshot.controls?.stop,
+              continue: !!snapshot.controls?.continue,
+              retry: !!snapshot.controls?.retry,
+              answerNow: !!snapshot.controls?.answerNow
+            },
+            clickedControls: [],
+            conversationUrl: snapshot.url,
+            conversationId: snapshot.conversationId,
+            modelEvidence: snapshot.modelEvidence
+          };
+        }
+        if (
+          !firstStable ||
+          firstStable.assistantMessageId !== observation.assistantMessageId ||
+          firstStable.textSha256 !== observation.textSha256
+        ) {
+          firstStable = observation;
+        }
+      } else {
+        firstStable = null;
+      }
+      await sleep(500);
+    }
+    throw new Error('timeout_waiting_for_response');
+  }
+
+  async reviewQuery({ prompt, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onPrepared, onSubmitted }) {
+    if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
+    const deadline = Date.now() + Number(timeoutMs || 0);
+    const identity = { expectedUrl, expectedConversationId, expectedModel };
+    const run = { kind: 'review_query', requested: false, requestedAt: null, reason: null, onProgress: null };
+    this.currentRun = run;
+    try {
+      await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+      const before = await this.#reviewSnapshot();
+      this.#assertReviewIdentity(before, identity);
+      const baselineIds = new Set((before.messages || []).map((message) => message.id));
+      await onPrepared?.({
+        baselineMessageIds: [...baselineIds],
+        preparedAt: Date.now(),
+        conversationUrl: before.url,
+        conversationId: before.conversationId,
+        modelEvidence: before.modelEvidence
+      });
+      // Strict review transport avoids clipboard/paste conversion. Prove the
+      // active composer contains the complete prompt before the sole send.
+      await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      await this.#clickReviewSendOnce(prompt);
+      const submitted = await this.#waitForReviewUserMessage({ prompt, baselineIds, deadline, identity });
+      await onSubmitted?.({
+        userMessageId: submitted.message.id,
+        submittedAt: Date.now(),
+        conversationUrl: submitted.snapshot.url,
+        conversationId: submitted.snapshot.conversationId,
+        modelEvidence: submitted.snapshot.modelEvidence
+      });
+      return await this.#waitForReviewAssistant({ userMessageId: submitted.message.id, deadline, identity });
+    } finally {
+      if (this.currentRun === run) this.currentRun = null;
+    }
+  }
+
+  async observeReviewResponse({ expectedUrl, expectedConversationId, expectedModel, userMessageId, timeoutMs }) {
+    const deadline = Date.now() + Number(timeoutMs || 0);
+    return await this.#waitForReviewAssistant({
+      userMessageId,
+      deadline,
+      identity: { expectedUrl, expectedConversationId, expectedModel }
+    });
+  }
+
+  async recoverReviewSubmission({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onRecovered }) {
+    const deadline = Date.now() + Number(timeoutMs || 0);
+    const identity = { expectedUrl, expectedConversationId, expectedModel };
+    const snapshot = await this.#reviewSnapshot();
+    this.#assertReviewIdentity(snapshot, identity);
+    if (!Array.isArray(baselineMessageIds)) throw new Error('review_submission_baseline_missing');
+    const baselineIds = new Set(baselineMessageIds);
+    const matches = (snapshot.messages || []).filter(
+      (message) => message.role === 'user' && message.text === prompt && !baselineIds.has(message.id)
+    );
+    if (matches.length !== 1) throw new Error('review_user_message_identity_unreadable');
+    await onRecovered?.({
+      userMessageId: matches[0].id,
+      submittedAt: Date.now(),
+      conversationUrl: snapshot.url,
+      conversationId: snapshot.conversationId,
+      modelEvidence: snapshot.modelEvidence
+    });
+    return await this.#waitForReviewAssistant({ userMessageId: matches[0].id, deadline, identity });
   }
 
   async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400 } = {}) {

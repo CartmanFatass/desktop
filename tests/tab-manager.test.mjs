@@ -66,3 +66,22 @@ test('tab-manager: createTab closes session if controller creation fails', async
   assert.equal(closeCalls, 1);
   assert.deepEqual(manager.listTabs(), []);
 });
+
+test('tab-manager: exact stable binding rejects another conversation URL for the same key', async () => {
+  const browserBackend = {
+    async createSession() {
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  await manager.createTab({ key: 'hmasd-formal-pro', vendorId: 'chatgpt', url: 'https://chatgpt.com/c/conversation-a' });
+  await assert.rejects(
+    manager.ensureTab({
+      key: 'hmasd-formal-pro',
+      vendorId: 'chatgpt',
+      url: 'https://chatgpt.com/c/conversation-b',
+      exactUrl: true
+    }),
+    /key_url_mismatch/
+  );
+});

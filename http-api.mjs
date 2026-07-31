@@ -8,6 +8,7 @@ import { ensureArtifactsDir, listArtifacts, registerArtifact, artifactsRoot } fr
 import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store.mjs';
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
+import { runReviewQuery } from './review-transport.mjs';
 
 function isLoopback(remoteAddress) {
   const a = String(remoteAddress || '');
@@ -82,6 +83,29 @@ function mapErrorToHttp(error) {
   if (msg === 'query_aborted') return { code: 409, body: { error: 'query_aborted', data: error?.data || null } };
   if (msg === 'timeout_waiting_for_prompt') return { code: 408, body: { error: 'timeout_waiting_for_prompt', data: error?.data || null } };
   if (msg === 'timeout_waiting_for_response') return { code: 408, body: { error: 'timeout_waiting_for_response', data: error?.data || null } };
+  if (['review_invalid_request', 'review_prompt_hash_mismatch', 'review_timeout_out_of_range'].includes(msg)) {
+    return { code: 400, body: { error: msg, data: error?.data || null } };
+  }
+  if (
+    [
+      'review_binding_mismatch',
+      'review_idempotency_conflict',
+      'review_conversation_identity_mismatch',
+      'review_model_identity_mismatch',
+      'review_identity_unreadable',
+      'review_message_identity_unreadable',
+      'review_user_message_identity_unreadable',
+      'review_user_message_ambiguous',
+      'review_assistant_message_ambiguous',
+      'review_completion_unstable',
+      'review_completion_controls_active',
+      'review_control_activation_forbidden',
+      'review_send_control_ambiguous',
+      'key_url_mismatch'
+    ].includes(msg)
+  ) {
+    return { code: 409, body: { error: msg, data: error?.data || null } };
+  }
   if (msg === 'artifacts_folder_open_failed') return { code: 500, body: { error: 'artifacts_folder_open_failed', data: error?.data || null } };
   if (msg === 'artifact_save_failed') return { code: 500, body: { error: 'artifact_save_failed', data: error?.data || null } };
   return null;
@@ -816,6 +840,12 @@ export function startHttpApi({
         const controller = tabs.getControllerById(tabId);
         const st = await runExclusive(controller, async () => controller.ensureReady({ timeoutMs }));
         return sendJson(res, 200, { ok: true, tabId, state: st });
+      }
+
+      if (url.pathname === '/review-query' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 2_000_000 });
+        const receipt = await runReviewQuery({ stateDir, tabs, request: body });
+        return sendJson(res, 200, { ok: true, receipt });
       }
 
       if (url.pathname === '/query' && req.method === 'POST') {

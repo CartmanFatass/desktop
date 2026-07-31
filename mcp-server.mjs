@@ -112,6 +112,62 @@ registerTool(
 );
 
 registerTool(
+  'agentify_review_query',
+  {
+    description:
+      'Strict receipt-bearing ChatGPT Pro review transport. Binds one stable key to one exact conversation/model, submits at most once per idempotency key, never activates Continue/Retry/Answer now, and verifies natural completion from exact message identities.',
+    inputSchema: {
+      stableKey: z.string().describe('Persistent stable binding key.'),
+      provider: z.literal('chatgpt').describe('Exact provider identity.'),
+      model: z.string().describe('Exact visible Pro model label expected in the conversation UI.'),
+      conversationUrl: z.string().describe('Exact registered ChatGPT conversation URL.'),
+      conversationId: z.string().describe('Exact conversation identity contained in conversationUrl.'),
+      idempotencyKey: z.string().describe('Immutable operation idempotency key.'),
+      prompt: z.string().describe('Exact prompt bytes to submit once.'),
+      promptSha256: z.string().describe('Lowercase SHA-256 of the exact UTF-8 prompt.'),
+      timeoutMs: z.number().optional().describe('Single absolute operation deadline, maximum 45 minutes.'),
+      verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.')
+    }
+  },
+  async ({
+    stableKey,
+    provider,
+    model,
+    conversationUrl,
+    conversationId,
+    idempotencyKey,
+    prompt,
+    promptSha256,
+    timeoutMs,
+    verifyExisting
+  }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-query',
+      body: {
+        stableKey,
+        provider,
+        model,
+        conversationUrl,
+        conversationId,
+        idempotencyKey,
+        prompt,
+        promptSha256,
+        timeoutMs: timeoutMs ?? 45 * 60_000,
+        verifyExisting: verifyExisting === true
+      }
+    });
+    const receipt = data.receipt || null;
+    return {
+      content: [{ type: 'text', text: receipt?.responseText || JSON.stringify(receipt || {}, null, 2) }],
+      structuredContent: { receipt }
+    };
+  }
+);
+
+registerTool(
   'agentify_read_page',
   {
     description: 'Read text content from the active tab in the local Agentify Desktop window.',
