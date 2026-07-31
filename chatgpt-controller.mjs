@@ -20,6 +20,57 @@ export function classifyReviewControls(labels, { selectorStop = false, sendVisib
   };
 }
 
+export function serializeReviewComposer(root) {
+  const inlineTags = new Set([
+    'A', 'B', 'CODE', 'EM', 'I', 'MARK', 'S', 'SMALL', 'SPAN', 'STRONG',
+    'SUB', 'SUP', 'U'
+  ]);
+  const blockTags = new Set(['DIV', 'P']);
+
+  const serializeNode = (node) => {
+    if (!node || typeof node !== 'object') {
+      return { ok: false, error: 'review_composer_node_unreadable' };
+    }
+    if (Number(node.nodeType) === 3) {
+      return { ok: true, text: String(node.nodeValue ?? ''), block: false };
+    }
+    if (Number(node.nodeType) !== 1) {
+      return { ok: false, error: 'review_composer_node_type_unsupported' };
+    }
+    const tag = String(node.tagName || '').toUpperCase();
+    if (tag === 'BR') return { ok: true, text: '\n', block: false };
+    if (!inlineTags.has(tag) && !blockTags.has(tag)) {
+      return { ok: false, error: 'review_composer_element_unsupported', tag };
+    }
+    const children = serializeChildren(node);
+    if (!children.ok) return children;
+    return { ok: true, text: children.text, block: blockTags.has(tag) };
+  };
+
+  const serializeChildren = (parent) => {
+    const children = Array.from(parent?.childNodes || []);
+    let text = '';
+    for (let index = 0; index < children.length; index += 1) {
+      const current = serializeNode(children[index]);
+      if (!current.ok) return current;
+      text += current.text;
+      if (
+        current.block &&
+        index + 1 < children.length &&
+        !text.endsWith('\n')
+      ) {
+        text += '\n';
+      }
+    }
+    return { ok: true, text };
+  };
+
+  if (!root || typeof root !== 'object' || Number(root.nodeType) !== 1) {
+    return { ok: false, error: 'review_composer_root_unreadable' };
+  }
+  return serializeChildren(root);
+}
+
 function jitter(minMs, maxMs) {
   const min = Math.max(0, Number(minMs) || 0);
   const max = Math.max(min, Number(maxMs) || 0);
@@ -438,6 +489,7 @@ export class ChatGPTController {
       const expected = JSON.stringify(prompt);
       const verification = await this.#eval(`(() => {
         const expected = ${expected};
+        const serializeReviewComposer = ${serializeReviewComposer.toString()};
         const visible = (n) => {
           const r = n.getBoundingClientRect();
           const style = window.getComputedStyle(n);
@@ -480,11 +532,19 @@ export class ChatGPTController {
         candidates.sort((a, b) => score(b) - score(a));
         const el = candidates[0] || null;
         if (!el) return { ok: false, error: 'missing_prompt_textarea' };
+        const serialized = el.matches('textarea, input')
+          ? { ok: true, text: String(el.value || ''), method: 'value' }
+          : { ...serializeReviewComposer(el), method: 'contenteditable_structural' };
         const observed = el.matches('textarea, input')
           ? [String(el.value || '')]
           : [String(el.innerText || ''), String(el.textContent || '')];
         return {
-          ok: observed.some(value => value === expected),
+          ok: serialized.ok === true && serialized.text === expected,
+          serializerOk: serialized.ok === true,
+          serializerMethod: serialized.method,
+          serializerError: serialized.error || null,
+          serializerTag: serialized.tag || null,
+          serializedLength: String(serialized.text || '').length,
           observedLengths: observed.map(value => value.length),
           expectedLength: expected.length
         };
@@ -895,6 +955,7 @@ export class ChatGPTController {
     const result = await this.#eval(`(() => {
       const reviewSendOnceMarker = true;
       const expected = ${expected};
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -915,10 +976,10 @@ export class ChatGPTController {
       };
       const promptCandidates = Array.from(document.querySelectorAll(${promptSel})).filter(editable);
       const exactPromptCandidates = promptCandidates.filter((promptNode) => {
-        const promptValues = promptNode.matches('textarea, input')
-          ? [String(promptNode.value || '')]
-          : [String(promptNode.innerText || ''), String(promptNode.textContent || '')];
-        return promptValues.some((value) => value === expected);
+        const serialized = promptNode.matches('textarea, input')
+          ? { ok: true, text: String(promptNode.value || '') }
+          : serializeReviewComposer(promptNode);
+        return serialized.ok === true && serialized.text === expected;
       });
       if (exactPromptCandidates.length !== 1) {
         return {

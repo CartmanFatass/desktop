@@ -3,7 +3,39 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-import { ChatGPTController, classifyReviewControls } from '../chatgpt-controller.mjs';
+import {
+  ChatGPTController,
+  classifyReviewControls,
+  serializeReviewComposer
+} from '../chatgpt-controller.mjs';
+
+const textNode = (value) => ({ nodeType: 3, nodeValue: value });
+const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
+
+test('chatgpt-controller: structural composer serialization preserves exact multiline plain text', () => {
+  const composer = elementNode(
+    'DIV',
+    elementNode('P', textNode('alpha'), elementNode('SPAN', textNode(' beta'))),
+    elementNode('P', elementNode('BR')),
+    elementNode('P', textNode('gamma'), elementNode('BR'), textNode('delta'))
+  );
+  assert.deepEqual(serializeReviewComposer(composer), {
+    ok: true,
+    text: 'alpha beta\n\ngamma\ndelta'
+  });
+});
+
+test('chatgpt-controller: structural composer serialization rejects unsupported or altered content', () => {
+  const unsupported = elementNode('DIV', elementNode('IMG'));
+  assert.deepEqual(serializeReviewComposer(unsupported), {
+    ok: false,
+    error: 'review_composer_element_unsupported',
+    tag: 'IMG'
+  });
+
+  const altered = elementNode('DIV', elementNode('P', textNode('exact')), textNode('!'));
+  assert.notEqual(serializeReviewComposer(altered).text, 'exact');
+});
 
 test('chatgpt-controller: review model evidence is not restricted to semantic header or nav containers', () => {
   const selectors = JSON.parse(readFileSync(new URL('../selectors.json', import.meta.url), 'utf8'));
@@ -180,6 +212,64 @@ test('chatgpt-controller: strict review submits with one send control and return
   assert.equal(result.snapshots[0].textSha256, crypto.createHash('sha256').update(response).digest('hex'));
   assert.deepEqual(result.clickedControls, []);
   assert.equal(result.controls.answerNow, true);
+});
+
+test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
+  const url = 'https://chatgpt.com/c/conversation-structural';
+  const prompt = 'alpha\n\nbeta';
+  let strictClicks = 0;
+  const page = {
+    async navigate() {},
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('observedLengths')) {
+        return {
+          ok: true,
+          serializerOk: true,
+          serializerMethod: 'contenteditable_structural',
+          serializedLength: prompt.length,
+          observedLengths: [prompt.length + 1, prompt.length - 1],
+          expectedLength: prompt.length
+        };
+      }
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: strictClicks ? [
+            { order: 0, role: 'user', id: 'user-structural', text: prompt },
+            { order: 1, role: 'assistant', id: 'assistant-structural', text: 'OK' }
+          ] : [],
+          modelEvidence: 'GPT-5.6 Pro',
+          modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async sendKey() {},
+    async insertText() {},
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {},
+    async setFileInputFiles() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: url,
+    expectedConversationId: 'conversation-structural',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000
+  });
+  assert.equal(strictClicks, 1);
+  assert.equal(result.userMessageId, 'user-structural');
 });
 
 test('chatgpt-controller: strict review fails before send when the composer is not exact', async () => {
