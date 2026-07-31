@@ -111,6 +111,9 @@ function normalizeRequest(input) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_REVIEW_TIMEOUT_MS || timeoutMs > MAX_REVIEW_TIMEOUT_MS) {
     fail('review_timeout_out_of_range');
   }
+  const verifyExisting = request.verifyExisting === true;
+  const diagnoseExisting = request.diagnoseExisting === true;
+  if (verifyExisting && diagnoseExisting) fail('review_invalid_request', { field: 'operationMode' });
   return {
     stableKey,
     provider,
@@ -121,7 +124,8 @@ function normalizeRequest(input) {
     prompt,
     promptSha256,
     timeoutMs,
-    verifyExisting: request.verifyExisting === true
+    verifyExisting,
+    diagnoseExisting
   };
 }
 
@@ -248,6 +252,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (!binding) state.bindings[request.stableKey] = { ...expectedBinding, createdAt: now, updatedAt: now };
     const existing = state.operations[request.idempotencyKey];
     if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+    if (request.diagnoseExisting && !existing) fail('review_diagnostic_operation_missing');
     if (existing) return { existing: true, operation: { ...existing } };
     const operation = {
       operationId: crypto.randomUUID(),
@@ -271,7 +276,12 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     return { existing: false, operation: { ...operation } };
   });
 
-  if (intake.existing && intake.operation.status === 'COMPLETE' && !request.verifyExisting) return intake.operation;
+  if (
+    intake.existing &&
+    intake.operation.status === 'COMPLETE' &&
+    !request.verifyExisting &&
+    !request.diagnoseExisting
+  ) return intake.operation;
   const tabId = await tabs.ensureTab({
     key: request.stableKey,
     name: request.stableKey,
@@ -326,6 +336,27 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       if (!currentOperation || currentOperation.operationId !== intake.operation.operationId) {
         fail('review_operation_identity_mismatch');
       }
+      if (request.diagnoseExisting) {
+        if (
+          currentOperation.status !== 'BLOCKED' ||
+          currentOperation.sendCount !== 0 ||
+          currentOperation.userMessageId ||
+          !Array.isArray(currentOperation.baselineMessageIds)
+        ) {
+          fail('review_diagnostic_operation_ineligible');
+        }
+        if (typeof controller?.inspectReviewSubmissionIdentity !== 'function') {
+          fail('review_diagnostic_unavailable');
+        }
+        const diagnostic = await controller.inspectReviewSubmissionIdentity({
+          prompt: request.prompt,
+          baselineMessageIds: currentOperation.baselineMessageIds,
+          expectedUrl: request.conversationUrl,
+          expectedConversationId: request.conversationId,
+          expectedModel: request.model
+        });
+        return { diagnosticOnly: true, diagnostic };
+      }
       if (currentOperation.status === 'COMPLETE' && !request.verifyExisting) {
         return { completedOperation: { ...currentOperation } };
       }
@@ -360,6 +391,20 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         });
       return { result, expectedUserMessageId: currentOperation.userMessageId || null };
     });
+    if (execution.diagnosticOnly) {
+      const safeDiagnostic = sanitizeReviewErrorData(execution.diagnostic);
+      return await mutateState(stateDir, async (state) => {
+        const op = state.operations[request.idempotencyKey];
+        if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+        if (op.status !== 'BLOCKED' || op.sendCount !== 0 || op.userMessageId) {
+          fail('review_diagnostic_operation_ineligible');
+        }
+        if (safeDiagnostic) op.errorData = safeDiagnostic;
+        op.diagnosticObservedAt = Date.now();
+        op.updatedAt = Date.now();
+        return { ...op, diagnosticOnly: true };
+      });
+    }
     if (execution.completedOperation) return execution.completedOperation;
     const validated = validateResult(execution.result, request, execution.expectedUserMessageId);
     return await mutateState(stateDir, async (state) => {

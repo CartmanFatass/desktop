@@ -171,7 +171,8 @@ export function serializeReviewUserMessage(root) {
       distinctTextCount: exactTexts.length
     };
   }
-  return { ok: true, text: exactTexts[0], candidateCount: candidates.length };
+  const structure = candidates.length === 1 ? summarizeReviewComposerStructure(candidates[0]) : {};
+  return { ok: true, text: exactTexts[0], candidateCount: candidates.length, ...structure };
 }
 
 function jitter(minMs, maxMs) {
@@ -1292,6 +1293,33 @@ export class ChatGPTController {
       deadline,
       identity: { expectedUrl, expectedConversationId, expectedModel }
     });
+  }
+
+  async inspectReviewSubmissionIdentity({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel }) {
+    if (typeof prompt !== 'string') throw new Error('review_composer_expected_prompt_invalid');
+    if (!Array.isArray(baselineMessageIds)) throw new Error('review_submission_baseline_missing');
+    const baselineIds = new Set(baselineMessageIds);
+    const snapshot = await this.#reviewSnapshot(expectedModel);
+    this.#assertReviewIdentity(snapshot, { expectedUrl, expectedConversationId, expectedModel });
+    const newUserMessages = (snapshot.messages || []).filter(
+      (message) => message.role === 'user' && !baselineIds.has(message.id)
+    );
+    const exactMatches = newUserMessages.filter((message) => message.text === prompt);
+    const message = newUserMessages.length === 1 ? newUserMessages[0] : null;
+    return {
+      ok: exactMatches.length === 1 && newUserMessages.length === 1,
+      serializerOk: message?.textIdentityReadable === true,
+      serializerMethod: 'rendered_user_message_structural',
+      serializerError: message
+        ? message.textIdentityError || (message.text === prompt ? null : 'review_user_message_content_mismatch')
+        : 'review_user_message_count_mismatch',
+      serializerTag: message?.textIdentityTag || null,
+      serializedLength: Number.isInteger(message?.textLength) ? message.textLength : 0,
+      observedLengths: Number.isInteger(message?.textLength) ? [message.textLength] : [],
+      expectedLength: prompt.length,
+      candidateCount: newUserMessages.length,
+      ...(message?.textIdentityDiagnostic || {})
+    };
   }
 
   async recoverReviewSubmission({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onRecovered }) {

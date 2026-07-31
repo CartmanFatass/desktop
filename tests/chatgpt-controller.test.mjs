@@ -135,7 +135,13 @@ test('chatgpt-controller: user-message identity reads the unique content leaf an
   assert.deepEqual(serializeReviewUserMessage(outer), {
     ok: true,
     text: 'alpha\n\nbeta',
-    candidateCount: 1
+    candidateCount: 1,
+    rootTag: 'DIV',
+    elementCount: 1,
+    textNodeCount: 1,
+    otherNodeCount: 0,
+    maxDepth: 1,
+    tagHistogram: { DIV: 1 }
   });
 });
 

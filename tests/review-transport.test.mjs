@@ -6,16 +6,17 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { runReviewQuery, sanitizeReviewErrorData } from '../review-transport.mjs';
-import { readReviewTransportState } from '../state.mjs';
+import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, ensure: [] };
+  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, ensure: [] };
   let failBeforeSubmittedReceipt = false;
   let reviewFailure = null;
   let diagnosticResult = null;
+  let submissionDiagnosticResult = null;
   let exclusiveTail = Promise.resolve();
   const controller = {
     async runExclusive(fn) {
@@ -106,6 +107,10 @@ async function fixture() {
     async inspectReviewComposerIdentity() {
       calls.inspect += 1;
       return diagnosticResult;
+    },
+    async inspectReviewSubmissionIdentity() {
+      calls.inspectSubmission += 1;
+      return submissionDiagnosticResult;
     }
   };
   const tabs = {
@@ -140,6 +145,9 @@ async function fixture() {
     setReviewFailure(error, diagnostic) {
       reviewFailure = error;
       diagnosticResult = diagnostic;
+    },
+    setSubmissionDiagnostic(diagnostic) {
+      submissionDiagnosticResult = diagnostic;
     }
   };
 }
@@ -214,6 +222,50 @@ test('review transport: composer mismatch persists observe-only sanitized diagno
   assert.deepEqual(operation.errorData.tagHistogram, { CODE: 8, DIV: 2, PRE: 8 });
   assert.equal(JSON.stringify(operation.errorData).includes('must-not-persist'), false);
   assert.equal(f.calls.inspect, 1);
+});
+
+test('review transport: expired blocked operation permits one metadata-only submission diagnosis', async () => {
+  const f = await fixture();
+  const error = new Error('review_user_message_identity_unreadable');
+  f.setReviewFailure(error, null);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_identity_unreadable/
+  );
+  const expired = await readReviewTransportState(f.stateDir);
+  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
+  await writeReviewTransportState(expired, f.stateDir);
+  f.setSubmissionDiagnostic({
+    ok: false,
+    serializerOk: false,
+    serializerMethod: 'rendered_user_message_structural',
+    serializerError: 'review_composer_element_unsupported',
+    serializerTag: 'PRE',
+    serializedLength: 0,
+    observedLengths: [],
+    expectedLength: f.request.prompt.length,
+    candidateCount: 1,
+    rootTag: 'DIV',
+    elementCount: 9,
+    textNodeCount: 4,
+    otherNodeCount: 0,
+    maxDepth: 3,
+    tagHistogram: { CODE: 4, DIV: 1, PRE: 4 },
+    prompt: 'must-not-persist'
+  });
+  const diagnosed = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, diagnoseExisting: true }
+  });
+  assert.equal(diagnosed.status, 'BLOCKED');
+  assert.equal(diagnosed.sendCount, 0);
+  assert.equal(diagnosed.diagnosticOnly, true);
+  assert.equal(diagnosed.errorData.serializerTag, 'PRE');
+  assert.deepEqual(diagnosed.errorData.tagHistogram, { CODE: 4, DIV: 1, PRE: 4 });
+  assert.equal(JSON.stringify(diagnosed.errorData).includes('must-not-persist'), false);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.inspectSubmission, 1);
 });
 
 test('review transport: one exact send persists a complete receipt and duplicate returns it', async () => {
