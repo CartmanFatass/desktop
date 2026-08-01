@@ -6,6 +6,12 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const BLOCKED_PAGE_TEXT_PATTERN = /\b403\b|access denied|forbidden|unusual traffic|verify you are human|human verification/i;
+
+export function looksLikeBlockedPage(bodyText) {
+  return BLOCKED_PAGE_TEXT_PATTERN.test(String(bodyText || ''));
+}
+
 export function classifyReviewControls(labels, { selectorStop = false, sendVisible = false } = {}) {
   const values = Array.isArray(labels)
     ? labels.map((value) => String(value || '').replace(/\s+/g, ' ').trim()).filter(Boolean)
@@ -286,7 +292,7 @@ export class ChatGPTController {
       const hasVerifyButton = Array.from(document.querySelectorAll('button, a'))
         .some(b => /verify you are human|human verification|i am human/i.test((b.textContent || '').trim()));
 
-      const looks403 = /\\b403\\b|access denied|forbidden|unusual traffic|verify/i.test(bodyText) && !/prompt/i.test(bodyText);
+      const looks403 = new RegExp(${JSON.stringify(BLOCKED_PAGE_TEXT_PATTERN.source)}, 'i').test(bodyText);
       const loginLike = !!document.querySelector('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]')
         || /log in|sign in|continue with/i.test(bodyText);
 

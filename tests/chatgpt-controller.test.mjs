@@ -7,6 +7,7 @@ import {
   ChatGPTController,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
+  looksLikeBlockedPage,
   serializeReviewComposer,
   serializeReviewUserMessage,
   summarizeReviewComposerStructure
@@ -14,6 +15,12 @@ import {
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
+
+test('chatgpt-controller: ordinary verify wording is not an access block', () => {
+  assert.equal(looksLikeBlockedPage('Please verify the estimator before reporting. Prompt visible.'), false);
+  assert.equal(looksLikeBlockedPage('403 Forbidden'), true);
+  assert.equal(looksLikeBlockedPage('Verify you are human'), true);
+});
 
 test('chatgpt-controller: structural composer serialization preserves exact multiline plain text', () => {
   const composer = elementNode(
