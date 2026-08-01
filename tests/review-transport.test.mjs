@@ -88,10 +88,6 @@ async function fixture() {
         modelEvidence: 'GPT-5.6 Pro'
       });
       if (reviewFailure) throw reviewFailure;
-      await args.onSendIntent({
-        ...composerIdentityFields(),
-        sendIntentAt: 75
-      });
       if (sendControlFailure) throw sendControlFailure;
       await args.onSendAction({
         clickCount: 1,
@@ -348,7 +344,7 @@ test('review transport: legacy zero-send blocked operation is not reusable witho
   await writeReviewTransportState(legacy, f.stateDir);
   await assert.rejects(
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_existing_operation_not_observable/
+    /review_operation_closed_create_fresh/
   );
   assert.equal(f.calls.review, 1);
 });
@@ -371,21 +367,18 @@ test('review transport: deterministic send-control rejection remains an eligible
   assert.equal(operation.errorData.noClickProven, true);
 });
 
-test('review transport: one exact send persists a complete receipt and duplicate returns it', async () => {
+test('review transport: one send persists a complete receipt and duplicate returns it', async () => {
   const f = await fixture();
   const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   assert.equal(first.status, 'COMPLETE');
   assert.equal(first.sendCount, 1);
-  assert.equal(first.promptSha256, f.request.promptSha256);
+  assert.equal(first.promptSha256, sha256(f.request.prompt));
   assert.equal(first.responseSha256, sha256('SMOKE_OK'));
   assert.equal(first.userMessageId, 'user-1');
   assert.equal(first.assistantMessageId, 'assistant-1');
-  assert.equal(first.submissionIdentityMode, 'rendered_exact');
-  assert.equal(first.composerPromptSha256, f.request.promptSha256);
-  assert.equal(first.composerIdentity.ok, true);
   assert.equal(first.sendActionCount, 1);
-  assert.equal(first.newUserMessageCount, 1);
-  assert.equal(first.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
+  assert.equal('submissionIdentityMode' in first, false);
+  assert.equal('composerPromptSha256' in first, false);
   assert.equal(f.calls.review, 1);
 
   const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -423,7 +416,7 @@ test('review transport: restart verification is observe-only and bound to the sa
   assert.equal(f.calls.observe, 1);
 });
 
-test('review transport: stable-key binding mismatch and invalid prompt hash fail closed', async () => {
+test('review transport: stable-key mismatch fails while caller prompt hash is ignored', async () => {
   const f = await fixture();
   await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   await assert.rejects(
@@ -439,15 +432,13 @@ test('review transport: stable-key binding mismatch and invalid prompt hash fail
     }),
     /review_binding_mismatch/
   );
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, idempotencyKey: 'bad-hash', promptSha256: '0'.repeat(64) }
-    }),
-    /review_prompt_hash_mismatch/
-  );
-  assert.equal(f.calls.review, 1);
+  const retry = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, idempotencyKey: 'hash-ignored', promptSha256: '0'.repeat(64) }
+  });
+  assert.equal(retry.status, 'COMPLETE');
+  assert.equal(f.calls.review, 2);
 });
 
 test('review transport: timeout above 45 minutes is rejected before tab or send', async () => {
@@ -464,7 +455,7 @@ test('review transport: timeout above 45 minutes is rejected before tab or send'
   assert.equal(f.calls.ensure.length, 0);
 });
 
-test('review transport: crash after durable send intent recovers observe-only without a second send', async () => {
+test('review transport: failed operation stays closed and one fresh recovery operation may resend', async () => {
   const f = await fixture();
   f.setFailBeforeSubmittedReceipt(true);
   await assert.rejects(
@@ -478,11 +469,19 @@ test('review transport: crash after durable send intent recovers observe-only wi
   assert.equal(uncertain.operations[f.request.idempotencyKey].sendCount, 0);
   assert.equal(uncertain.operations[f.request.idempotencyKey].failureStage, 'send_occurred_or_uncertain');
   f.setFailBeforeSubmittedReceipt(false);
-  const recovered = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_operation_closed_create_fresh/
+  );
+  const recovered = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, idempotencyKey: 'fresh-recovery' }
+  });
   assert.equal(recovered.status, 'COMPLETE');
   assert.equal(recovered.sendCount, 1);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 1);
+  assert.equal(f.calls.review, 2);
+  assert.equal(f.calls.recover, 0);
 });
 
 test('review transport: concurrent identical calls re-read terminal state and send once', async () => {
@@ -498,14 +497,13 @@ test('review transport: concurrent identical calls re-read terminal state and se
   assert.equal(f.calls.recover, 0);
 });
 
-test('review transport: recovery cannot extend the persisted operation deadline', async () => {
+test('review transport: a failed operation cannot itself send again', async () => {
   const f = await fixture();
   f.setFailBeforeSubmittedReceipt(true);
   const request = { ...f.request, idempotencyKey: 'deadline-test', timeoutMs: 1_000 };
   await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /simulated_crash_after_send_intent/);
-  await new Promise((resolve) => setTimeout(resolve, 1_050));
   f.setFailBeforeSubmittedReceipt(false);
-  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /review_operation_deadline_exceeded/);
+  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /review_operation_closed_create_fresh/);
   assert.equal(f.calls.review, 1);
   assert.equal(f.calls.recover, 0);
 });

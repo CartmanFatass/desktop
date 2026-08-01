@@ -78,26 +78,12 @@ test('http-api: strict review query returns a durable receipt and does not dupli
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
       });
-      const composerIdentity = {
-        ok: true,
-        serializerOk: true,
-        serializedLength: prompt.length,
-        expectedLength: prompt.length
-      };
-      await args.onSendIntent({ composerPromptSha256: promptSha256, composerIdentity });
       await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
       await args.onSubmitted({
         userMessageId: 'user-http-1',
-        newUserMessageCount: 1,
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro',
-        identityMode: 'exact_composer_causal_binding',
-        composerPromptSha256: promptSha256,
-        renderedIdentityDiagnostic: {
-          newUserMessageCount: 1,
-          renderedContentCandidateCount: 3
-        }
+        modelEvidence: 'GPT-5.6 Pro'
       });
       return {
         userMessageId: 'user-http-1',

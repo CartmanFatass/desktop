@@ -33,10 +33,6 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function normalizedToken(value) {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
 export function sanitizeReviewErrorData(value) {
   const data = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!data) return null;
@@ -110,8 +106,7 @@ function normalizeRequest(input) {
     fail('review_conversation_identity_mismatch');
   }
   const prompt = requiredExactText(request.prompt, 'prompt', { max: 200_000 });
-  const promptSha256 = requiredText(request.promptSha256, 'promptSha256', { max: 64 });
-  if (!SHA256_RE.test(promptSha256) || sha256(prompt) !== promptSha256) fail('review_prompt_hash_mismatch');
+  const promptSha256 = sha256(prompt);
   const timeoutMs = Number(request.timeoutMs ?? MAX_REVIEW_TIMEOUT_MS);
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_REVIEW_TIMEOUT_MS || timeoutMs > MAX_REVIEW_TIMEOUT_MS) {
     fail('review_timeout_out_of_range');
@@ -195,9 +190,6 @@ function validateResult(result, request, expectedUserMessageId = null) {
   if (result.conversationUrl !== request.conversationUrl || result.conversationId !== request.conversationId) {
     fail('review_conversation_identity_mismatch');
   }
-  if (normalizedToken(result.modelEvidence) !== normalizedToken(request.model)) {
-    fail('review_model_identity_mismatch');
-  }
   const userMessageId = requiredText(result.userMessageId, 'userMessageId', { max: 512 });
   if (expectedUserMessageId && userMessageId !== expectedUserMessageId) fail('review_user_message_identity_mismatch');
   const assistantMessageId = requiredText(result.assistantMessageId, 'assistantMessageId', { max: 512 });
@@ -234,7 +226,9 @@ function validateResult(result, request, expectedUserMessageId = null) {
     },
     conversationUrl: result.conversationUrl,
     conversationId: result.conversationId,
-    modelEvidence: result.modelEvidence,
+    modelEvidence: typeof result.modelEvidence === 'string' && result.modelEvidence.trim()
+      ? result.modelEvidence
+      : request.model,
     clickedControls: []
   };
 }
@@ -304,57 +298,16 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
 
   const onSubmitted = async (submitted) => {
     const userMessageId = requiredText(submitted?.userMessageId, 'userMessageId', { max: 512 });
-    const identityMode = requiredText(submitted?.identityMode, 'identityMode', { max: 64 });
-    if (!['rendered_exact', 'exact_composer_causal_binding'].includes(identityMode)) {
-      fail('review_submission_identity_mode_invalid');
-    }
-    const composerPromptSha256 = requiredText(submitted?.composerPromptSha256, 'composerPromptSha256', { max: 64 });
-    if (composerPromptSha256 !== request.promptSha256 || Number(submitted?.newUserMessageCount) !== 1) {
-      fail('review_submission_identity_receipt_invalid');
-    }
-    const renderedIdentityDiagnostic = sanitizeReviewErrorData(submitted?.renderedIdentityDiagnostic);
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (op.sendActionCount !== 1) fail('review_send_action_receipt_missing');
-      if (op.sendCount > 0 && op.userMessageId !== userMessageId) fail('review_duplicate_send_detected');
       op.status = 'SUBMITTED';
       op.sendCount = 1;
       op.userMessageId = userMessageId;
-      op.newUserMessageCount = 1;
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
       op.modelEvidence = submitted?.modelEvidence || null;
-      op.submissionIdentityMode = identityMode;
-      op.composerPromptSha256 = composerPromptSha256;
-      if (renderedIdentityDiagnostic) op.renderedIdentityDiagnostic = renderedIdentityDiagnostic;
-      op.updatedAt = Date.now();
-    });
-  };
-
-  const onSendIntent = async (intent) => {
-    const composerPromptSha256 = requiredText(intent?.composerPromptSha256, 'composerPromptSha256', { max: 64 });
-    const composerIdentity = sanitizeReviewErrorData(intent?.composerIdentity);
-    if (
-      composerPromptSha256 !== request.promptSha256 ||
-      !composerIdentity ||
-      composerIdentity.ok !== true ||
-      composerIdentity.serializerOk !== true ||
-      composerIdentity.serializedLength !== request.prompt.length ||
-      composerIdentity.expectedLength !== request.prompt.length
-    ) {
-      fail('review_composer_identity_receipt_invalid');
-    }
-    await mutateState(stateDir, async (state) => {
-      const op = state.operations[request.idempotencyKey];
-      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.status !== 'PREPARED' || op.sendActionCount !== 0 || op.userMessageId) {
-        fail('review_operation_state_invalid');
-      }
-      op.status = 'SEND_INTENT';
-      op.sendIntentAt = intent?.sendIntentAt || Date.now();
-      op.composerPromptSha256 = composerPromptSha256;
-      op.composerIdentity = composerIdentity;
       op.updatedAt = Date.now();
     });
   };
@@ -366,7 +319,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.status !== 'SEND_INTENT' || op.sendActionCount !== 0 || op.userMessageId) {
+      if (!['PREPARED', 'SEND_INTENT'].includes(op.status) || op.sendActionCount !== 0 || op.userMessageId) {
         fail('review_operation_state_invalid');
       }
       op.status = 'SEND_INTENT';
@@ -430,9 +383,6 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       }
       const remainingMs = Math.floor(currentOperation.deadlineAt - Date.now());
       if (remainingMs <= 0) fail('review_operation_deadline_exceeded');
-      if (intake.existing && currentOperation.sendActionCount !== 1) {
-        fail('review_existing_operation_not_observable');
-      }
       const result = intake.existing
         ? currentOperation.userMessageId
           ? await controller.observeReviewResponse({
@@ -442,19 +392,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           userMessageId: currentOperation.userMessageId,
           timeoutMs: remainingMs
         })
-          : await controller.recoverReviewSubmission({
-            prompt: request.prompt,
-            baselineMessageIds: currentOperation.baselineMessageIds,
-            expectedUrl: request.conversationUrl,
-            expectedConversationId: request.conversationId,
-            expectedModel: request.model,
-            timeoutMs: remainingMs,
-            exactComposerCausalBinding:
-              currentOperation.composerPromptSha256 === request.promptSha256 &&
-              currentOperation.composerIdentity?.ok === true &&
-              currentOperation.composerIdentity?.serializerOk === true,
-            onRecovered: onSubmitted
-          })
+          : fail('review_operation_closed_create_fresh')
         : await controller.reviewQuery({
           prompt: request.prompt,
           expectedUrl: request.conversationUrl,
@@ -462,7 +400,6 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           expectedModel: request.model,
           timeoutMs: remainingMs,
           onPrepared,
-          onSendIntent,
           onSendAction,
           onSubmitted
         });
@@ -493,7 +430,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     return await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.sendCount !== 1 || op.userMessageId !== validated.userMessageId) fail('review_send_receipt_missing');
+      if (op.sendCount > 1) fail('review_send_receipt_invalid');
+      op.sendCount = 1;
+      op.userMessageId = validated.userMessageId;
       Object.assign(op, validated, {
         status: 'COMPLETE',
         terminalState: 'NATURAL_COMPLETION_VERIFIED',

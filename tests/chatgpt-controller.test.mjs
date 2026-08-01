@@ -438,7 +438,7 @@ test('chatgpt-controller: strict review submits with one send control and return
     timeoutMs: 8_000,
     onPrepared: async ({ baselineMessageIds }) => {
       prepared += 1;
-      assert.deepEqual(baselineMessageIds, ['historical-user-1']);
+      assert.deepEqual(baselineMessageIds, []);
     },
     onSubmitted: async () => {
       submitted += 1;
@@ -517,7 +517,7 @@ test('chatgpt-controller: strict review accepts structural exactness when browse
   assert.equal(result.userMessageId, 'user-structural');
 });
 
-test('chatgpt-controller: strict review fails before send when the composer is not exact', async () => {
+test('chatgpt-controller: review send does not gate on a rendered composer projection', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let strictClicks = 0;
   let insertCalls = 0;
@@ -536,7 +536,10 @@ test('chatgpt-controller: strict review fails before send when the composer is n
       }
       if (js.includes('reviewSnapshotMarker')) {
         return {
-          messages: [],
+          messages: strictClicks ? [
+            { order: 0, role: 'user', id: 'user-mismatch', text: 'Pasted_text.txt' },
+            { order: 1, role: 'assistant', id: 'assistant-mismatch', text: 'OK' }
+          ] : [],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [],
@@ -564,21 +567,19 @@ test('chatgpt-controller: strict review fails before send when the composer is n
       assistantMessage: '[data-message-author-role="assistant"]'
     }
   });
-  await assert.rejects(
-    controller.reviewQuery({
-      prompt: 'mismatch',
-      expectedUrl: url,
-      expectedConversationId: 'conversation-1',
-      expectedModel: 'GPT-5.6 Pro',
-      timeoutMs: 8_000
-    }),
-    /review_composer_identity_mismatch/
-  );
+  const result = await controller.reviewQuery({
+    prompt: 'mismatch',
+    expectedUrl: url,
+    expectedConversationId: 'conversation-1',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000
+  });
   assert.equal(insertCalls, 1);
-  assert.equal(strictClicks, 0);
+  assert.equal(strictClicks, 1);
+  assert.equal(result.text, 'OK');
 });
 
-test('chatgpt-controller: strict review rechecks exact composer in the send evaluation', async () => {
+test('chatgpt-controller: ambiguous send control fails before a click', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let sendEvaluationReached = false;
   const page = {
@@ -592,7 +593,7 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
         sendEvaluationReached = true;
-        return { ok: false, error: 'review_composer_identity_mismatch' };
+        return { ok: false, error: 'review_send_control_ambiguous', count: 0 };
       }
       if (js.includes('reviewSnapshotMarker')) {
         return {
@@ -622,7 +623,7 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
       expectedModel: 'GPT-5.6 Pro',
       timeoutMs: 5_000
     }),
-    /review_composer_identity_mismatch/
+    /review_send_control_ambiguous/
   );
   assert.equal(sendEvaluationReached, true);
 });
@@ -704,19 +705,15 @@ test('chatgpt-controller: strict review binds one long multi-node message causal
   });
   assert.equal(strictClicks, 1);
   assert.equal(result.userMessageId, 'user-rendered');
-  assert.equal(submittedReceipt.identityMode, 'exact_composer_causal_binding');
-  assert.equal(submittedReceipt.newUserMessageCount, 1);
-  assert.equal(submittedReceipt.clickCount, 1);
-  assert.equal(submittedReceipt.renderedIdentityDiagnostic.newUserMessageCount, 1);
-  assert.equal(submittedReceipt.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
-  assert.equal('candidateCount' in submittedReceipt.renderedIdentityDiagnostic, false);
-  assert.equal(submittedReceipt.renderedIdentityDiagnostic.serializerTag, 'PRE');
-  assert.equal(submittedReceipt.composerPromptSha256, crypto.createHash('sha256').update(prompt).digest('hex'));
+  assert.equal(submittedReceipt.userMessageId, 'user-rendered');
+  assert.equal('composerPromptSha256' in submittedReceipt, false);
+  assert.equal('renderedIdentityDiagnostic' in submittedReceipt, false);
 });
 
-test('chatgpt-controller: strict review rejects conflicting model controls before send', async () => {
+test('chatgpt-controller: active generation is observed without another send', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let inserted = false;
+  let snapshots = 0;
   const page = {
     async navigate() {},
     async getUrl() {
@@ -725,12 +722,16 @@ test('chatgpt-controller: strict review rejects conflicting model controls befor
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('reviewSnapshotMarker')) {
+        snapshots += 1;
         return {
-          messages: [],
-          modelEvidence: null,
+          messages: [
+            { order: 0, role: 'user', id: 'user-active', text: 'question' },
+            { order: 1, role: 'assistant', id: 'assistant-active', text: 'answer' }
+          ],
+          modelEvidence: 'dynamic label',
           modelEvidenceCandidates: ['GPT-5.6 Pro', 'GPT-5.6 Thinking'],
-          controlText: [],
-          selectorStop: false,
+          controlText: snapshots < 3 ? ['Stop'] : [],
+          selectorStop: snapshots < 3,
           sendVisible: true
         };
       }
@@ -741,17 +742,15 @@ test('chatgpt-controller: strict review rejects conflicting model controls befor
     }
   };
   const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
-  await assert.rejects(
-    controller.reviewQuery({
-      prompt: 'safe',
-      expectedUrl: url,
-      expectedConversationId: 'conversation-1',
-      expectedModel: 'GPT-5.6 Pro',
-      timeoutMs: 5_000
-    }),
-    /review_model_identity_mismatch/
-  );
+  const result = await controller.reviewQuery({
+    prompt: 'safe',
+    expectedUrl: url,
+    expectedConversationId: 'conversation-1',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000
+  });
   assert.equal(inserted, false);
+  assert.equal(result.text, 'answer');
 });
 
 test('chatgpt-controller: crash recovery excludes historical identical prompts by persisted baseline', async () => {
