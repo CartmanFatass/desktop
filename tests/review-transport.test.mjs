@@ -15,13 +15,12 @@ async function fixture() {
   const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, ensure: [] };
   let failBeforeSubmittedReceipt = false;
   let reviewFailure = null;
+  let sendControlFailure = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
   let fixturePrompt = '';
-  const exactIdentityFields = () => ({
-    identityMode: 'rendered_exact',
+  const composerIdentityFields = () => ({
     composerPromptSha256: sha256(fixturePrompt),
-    clickCount: 1,
     composerIdentity: {
       ok: true,
       serializerOk: true,
@@ -38,7 +37,12 @@ async function fixture() {
       otherNodeCount: 0,
       maxDepth: 1,
       tagHistogram: { DIV: 1 }
-    },
+    }
+  });
+  const exactIdentityFields = () => ({
+    identityMode: 'rendered_exact',
+    composerPromptSha256: sha256(fixturePrompt),
+    newUserMessageCount: 1,
     renderedIdentityDiagnostic: {
       serializerOk: true,
       serializerMethod: 'rendered_user_message_structural',
@@ -47,7 +51,8 @@ async function fixture() {
       serializedLength: fixturePrompt.length,
       observedLengths: [fixturePrompt.length],
       expectedLength: fixturePrompt.length,
-      candidateCount: 1,
+      newUserMessageCount: 1,
+      renderedContentCandidateCount: 4,
       exactMatchCount: 1,
       readableCandidateCount: 1,
       rootTag: 'DIV',
@@ -83,6 +88,16 @@ async function fixture() {
         modelEvidence: 'GPT-5.6 Pro'
       });
       if (reviewFailure) throw reviewFailure;
+      await args.onSendIntent({
+        ...composerIdentityFields(),
+        sendIntentAt: 75
+      });
+      if (sendControlFailure) throw sendControlFailure;
+      await args.onSendAction({
+        clickCount: 1,
+        sendActionCount: 1,
+        sendActionAt: 90
+      });
       if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
       await args.onSubmitted({
         userMessageId: 'user-1',
@@ -90,44 +105,7 @@ async function fixture() {
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro',
-        identityMode: 'rendered_exact',
-        composerPromptSha256: sha256(fixturePrompt),
-        clickCount: 1,
-        composerIdentity: {
-          ok: true,
-          serializerOk: true,
-          serializerMethod: 'contenteditable_structural',
-          serializerError: null,
-          serializerTag: null,
-          serializedLength: fixturePrompt.length,
-          observedLengths: [fixturePrompt.length],
-          expectedLength: fixturePrompt.length,
-          candidateCount: 1,
-          rootTag: 'DIV',
-          elementCount: 1,
-          textNodeCount: 1,
-          otherNodeCount: 0,
-          maxDepth: 1,
-          tagHistogram: { DIV: 1 }
-        },
-        renderedIdentityDiagnostic: {
-          serializerOk: true,
-          serializerMethod: 'rendered_user_message_structural',
-          serializerError: null,
-          serializerTag: null,
-          serializedLength: fixturePrompt.length,
-          observedLengths: [fixturePrompt.length],
-          expectedLength: fixturePrompt.length,
-          candidateCount: 1,
-          exactMatchCount: 1,
-          readableCandidateCount: 1,
-          rootTag: 'DIV',
-          elementCount: 1,
-          textNodeCount: 1,
-          otherNodeCount: 0,
-          maxDepth: 1,
-          tagHistogram: { DIV: 1 }
-        }
+        ...exactIdentityFields()
       });
       return {
         userMessageId: 'user-1',
@@ -162,6 +140,7 @@ async function fixture() {
     async recoverReviewSubmission(args) {
       calls.recover += 1;
       assert.deepEqual(args.baselineMessageIds, ['historical-user-1']);
+      assert.equal(args.exactComposerCausalBinding, true);
       await args.onRecovered({
         userMessageId: 'user-1',
         submittedAt: 100,
@@ -226,6 +205,9 @@ async function fixture() {
     setReviewFailure(error, diagnostic) {
       reviewFailure = error;
       diagnosticResult = diagnostic;
+    },
+    setSendControlFailure(error) {
+      sendControlFailure = error;
     },
     setSubmissionDiagnostic(diagnostic) {
       submissionDiagnosticResult = diagnostic;
@@ -299,6 +281,9 @@ test('review transport: composer mismatch persists observe-only sanitized diagno
   const operation = state.operations[f.request.idempotencyKey];
   assert.equal(operation.status, 'BLOCKED');
   assert.equal(operation.sendCount, 0);
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.failureStage, 'before_send_click');
+  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
   assert.equal(operation.errorData.serializerTag, 'PRE');
   assert.deepEqual(operation.errorData.tagHistogram, { CODE: 8, DIV: 2, PRE: 8 });
   assert.equal(JSON.stringify(operation.errorData).includes('must-not-persist'), false);
@@ -349,6 +334,43 @@ test('review transport: expired blocked operation permits one metadata-only subm
   assert.equal(f.calls.inspectSubmission, 1);
 });
 
+test('review transport: legacy zero-send blocked operation is not reusable without pre-click evidence', async () => {
+  const f = await fixture();
+  const error = new Error('review_composer_identity_mismatch');
+  f.setReviewFailure(error, { serializerOk: false, serializerTag: 'PRE' });
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_composer_identity_mismatch/
+  );
+  const legacy = await readReviewTransportState(f.stateDir);
+  delete legacy.operations[f.request.idempotencyKey].sendActionCount;
+  delete legacy.operations[f.request.idempotencyKey].failureStage;
+  await writeReviewTransportState(legacy, f.stateDir);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_existing_operation_not_observable/
+  );
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: deterministic send-control rejection remains an eligible pre-click failure', async () => {
+  const f = await fixture();
+  const error = new Error('review_send_control_ambiguous');
+  error.data = { ok: false, clickCount: 0, noClickProven: true };
+  f.setSendControlFailure(error);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_send_control_ambiguous/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.failureStage, 'before_send_click');
+  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
+  assert.equal(operation.errorData.noClickProven, true);
+});
+
 test('review transport: one exact send persists a complete receipt and duplicate returns it', async () => {
   const f = await fixture();
   const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -361,7 +383,9 @@ test('review transport: one exact send persists a complete receipt and duplicate
   assert.equal(first.submissionIdentityMode, 'rendered_exact');
   assert.equal(first.composerPromptSha256, f.request.promptSha256);
   assert.equal(first.composerIdentity.ok, true);
-  assert.equal(first.renderedIdentityDiagnostic.candidateCount, 1);
+  assert.equal(first.sendActionCount, 1);
+  assert.equal(first.newUserMessageCount, 1);
+  assert.equal(first.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
   assert.equal(f.calls.review, 1);
 
   const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -447,6 +471,12 @@ test('review transport: crash after durable send intent recovers observe-only wi
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
     /simulated_crash_after_send_intent/
   );
+  const uncertain = await readReviewTransportState(f.stateDir);
+  assert.equal(uncertain.operations[f.request.idempotencyKey].status, 'BLOCKED');
+  assert.equal(uncertain.operations[f.request.idempotencyKey].terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(uncertain.operations[f.request.idempotencyKey].sendActionCount, 1);
+  assert.equal(uncertain.operations[f.request.idempotencyKey].sendCount, 0);
+  assert.equal(uncertain.operations[f.request.idempotencyKey].failureStage, 'send_occurred_or_uncertain');
   f.setFailBeforeSubmittedReceipt(false);
   const recovered = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   assert.equal(recovered.status, 'COMPLETE');

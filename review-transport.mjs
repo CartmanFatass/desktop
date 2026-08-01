@@ -41,10 +41,13 @@ export function sanitizeReviewErrorData(value) {
   const data = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!data) return null;
   const output = {};
-  for (const field of ['ok', 'serializerOk']) {
+  for (const field of ['ok', 'serializerOk', 'noClickProven']) {
     if (typeof data[field] === 'boolean') output[field] = data[field];
   }
-  for (const field of ['serializerMethod', 'serializerError', 'serializerTag', 'rootTag']) {
+  for (const field of [
+    'serializerMethod', 'serializerError', 'serializerTag', 'rootTag',
+    'predicate', 'failureStage'
+  ]) {
     if (data[field] === null) {
       output[field] = null;
     } else if (typeof data[field] === 'string' && data[field].length <= 128) {
@@ -54,7 +57,8 @@ export function sanitizeReviewErrorData(value) {
   for (const field of [
     'serializedLength', 'expectedLength', 'candidateCount', 'elementCount',
     'textNodeCount', 'otherNodeCount', 'maxDepth', 'exactMatchCount',
-    'readableCandidateCount'
+    'readableCandidateCount', 'renderedContentCandidateCount',
+    'newUserMessageCount', 'sendActionCount'
   ]) {
     if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
       output[field] = data[field];
@@ -270,6 +274,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       status: 'SEND_INTENT',
       terminalState: null,
       sendCount: 0,
+      sendActionCount: 0,
+      failureStage: null,
       createdAt: now,
       updatedAt: now
     };
@@ -303,37 +309,70 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       fail('review_submission_identity_mode_invalid');
     }
     const composerPromptSha256 = requiredText(submitted?.composerPromptSha256, 'composerPromptSha256', { max: 64 });
-    if (composerPromptSha256 !== request.promptSha256 || Number(submitted?.clickCount) !== 1) {
+    if (composerPromptSha256 !== request.promptSha256 || Number(submitted?.newUserMessageCount) !== 1) {
       fail('review_submission_identity_receipt_invalid');
     }
-    const composerIdentity = sanitizeReviewErrorData(submitted?.composerIdentity);
+    const renderedIdentityDiagnostic = sanitizeReviewErrorData(submitted?.renderedIdentityDiagnostic);
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.sendActionCount !== 1) fail('review_send_action_receipt_missing');
+      if (op.sendCount > 0 && op.userMessageId !== userMessageId) fail('review_duplicate_send_detected');
+      op.status = 'SUBMITTED';
+      op.sendCount = 1;
+      op.userMessageId = userMessageId;
+      op.newUserMessageCount = 1;
+      op.tabId = tabId;
+      op.submittedAt = submitted?.submittedAt || Date.now();
+      op.modelEvidence = submitted?.modelEvidence || null;
+      op.submissionIdentityMode = identityMode;
+      op.composerPromptSha256 = composerPromptSha256;
+      if (renderedIdentityDiagnostic) op.renderedIdentityDiagnostic = renderedIdentityDiagnostic;
+      op.updatedAt = Date.now();
+    });
+  };
+
+  const onSendIntent = async (intent) => {
+    const composerPromptSha256 = requiredText(intent?.composerPromptSha256, 'composerPromptSha256', { max: 64 });
+    const composerIdentity = sanitizeReviewErrorData(intent?.composerIdentity);
     if (
+      composerPromptSha256 !== request.promptSha256 ||
       !composerIdentity ||
       composerIdentity.ok !== true ||
       composerIdentity.serializerOk !== true ||
       composerIdentity.serializedLength !== request.prompt.length ||
       composerIdentity.expectedLength !== request.prompt.length
     ) {
-      fail('review_submission_identity_receipt_invalid');
-    }
-    const renderedIdentityDiagnostic = sanitizeReviewErrorData(submitted?.renderedIdentityDiagnostic);
-    if (!renderedIdentityDiagnostic || renderedIdentityDiagnostic.candidateCount !== 1) {
-      fail('review_submission_identity_receipt_invalid');
+      fail('review_composer_identity_receipt_invalid');
     }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.sendCount > 0 && op.userMessageId !== userMessageId) fail('review_duplicate_send_detected');
-      op.status = 'SUBMITTED';
-      op.sendCount = 1;
-      op.userMessageId = userMessageId;
-      op.tabId = tabId;
-      op.submittedAt = submitted?.submittedAt || Date.now();
-      op.modelEvidence = submitted?.modelEvidence || null;
-      op.submissionIdentityMode = identityMode;
+      if (op.status !== 'PREPARED' || op.sendActionCount !== 0 || op.userMessageId) {
+        fail('review_operation_state_invalid');
+      }
+      op.status = 'SEND_INTENT';
+      op.sendIntentAt = intent?.sendIntentAt || Date.now();
       op.composerPromptSha256 = composerPromptSha256;
       op.composerIdentity = composerIdentity;
-      op.renderedIdentityDiagnostic = renderedIdentityDiagnostic;
+      op.updatedAt = Date.now();
+    });
+  };
+
+  const onSendAction = async (action) => {
+    if (Number(action?.clickCount) !== 1 || Number(action?.sendActionCount) !== 1) {
+      fail('review_send_action_receipt_invalid');
+    }
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.status !== 'SEND_INTENT' || op.sendActionCount !== 0 || op.userMessageId) {
+        fail('review_operation_state_invalid');
+      }
+      op.status = 'SEND_INTENT';
+      op.sendActionCount = 1;
+      op.clickCount = 1;
+      op.sendActionAt = action?.sendActionAt || Date.now();
       op.updatedAt = Date.now();
     });
   };
@@ -347,7 +386,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.sendCount !== 0 || op.userMessageId) fail('review_operation_state_invalid');
+      if (op.sendCount !== 0 || op.sendActionCount !== 0 || op.userMessageId) fail('review_operation_state_invalid');
       op.status = 'PREPARED';
       op.baselineMessageIds = baselineMessageIds;
       op.preparedAt = prepared?.preparedAt || Date.now();
@@ -367,7 +406,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         if (
           currentOperation.status !== 'BLOCKED' ||
           currentOperation.sendCount !== 0 ||
+          currentOperation.sendActionCount !== 0 ||
           currentOperation.userMessageId ||
+          currentOperation.failureStage !== 'before_send_click' ||
           !Array.isArray(currentOperation.baselineMessageIds)
         ) {
           fail('review_diagnostic_operation_ineligible');
@@ -389,6 +430,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       }
       const remainingMs = Math.floor(currentOperation.deadlineAt - Date.now());
       if (remainingMs <= 0) fail('review_operation_deadline_exceeded');
+      if (intake.existing && currentOperation.sendActionCount !== 1) {
+        fail('review_existing_operation_not_observable');
+      }
       const result = intake.existing
         ? currentOperation.userMessageId
           ? await controller.observeReviewResponse({
@@ -405,6 +449,10 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
             expectedConversationId: request.conversationId,
             expectedModel: request.model,
             timeoutMs: remainingMs,
+            exactComposerCausalBinding:
+              currentOperation.composerPromptSha256 === request.promptSha256 &&
+              currentOperation.composerIdentity?.ok === true &&
+              currentOperation.composerIdentity?.serializerOk === true,
             onRecovered: onSubmitted
           })
         : await controller.reviewQuery({
@@ -414,6 +462,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           expectedModel: request.model,
           timeoutMs: remainingMs,
           onPrepared,
+          onSendIntent,
+          onSendAction,
           onSubmitted
         });
       return { result, expectedUserMessageId: currentOperation.userMessageId || null };
@@ -423,7 +473,13 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       return await mutateState(stateDir, async (state) => {
         const op = state.operations[request.idempotencyKey];
         if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-        if (op.status !== 'BLOCKED' || op.sendCount !== 0 || op.userMessageId) {
+        if (
+          op.status !== 'BLOCKED' ||
+          op.sendCount !== 0 ||
+          op.sendActionCount !== 0 ||
+          op.userMessageId ||
+          op.failureStage !== 'before_send_click'
+        ) {
           fail('review_diagnostic_operation_ineligible');
         }
         if (safeDiagnostic) op.errorData = safeDiagnostic;
@@ -467,10 +523,22 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.status === 'COMPLETE') return;
+      const preSendFailure =
+        op.sendActionCount === 0 &&
+        !op.userMessageId &&
+        (op.status === 'PREPARED' || !op.sendIntentAt || safeErrorData?.noClickProven === true);
+      op.failureStage = preSendFailure ? 'before_send_click' : 'send_occurred_or_uncertain';
       op.status = 'BLOCKED';
-      op.terminalState = op.userMessageId ? 'REVIEW_RESPONSE_BLOCKED' : 'IDENTITY_UNREADABLE';
+      op.terminalState = preSendFailure ? 'IDENTITY_UNREADABLE' : 'SUBMITTED_UNVERIFIED';
       op.error = String(error?.message || error);
-      if (safeErrorData) op.errorData = safeErrorData;
+      const mechanicalErrorData = sanitizeReviewErrorData({
+        ...(safeErrorData || {}),
+        predicate: String(error?.message || error),
+        failureStage: op.failureStage,
+        sendActionCount: op.sendActionCount || 0,
+        newUserMessageCount: op.newUserMessageCount || 0
+      });
+      if (mechanicalErrorData) op.errorData = mechanicalErrorData;
       op.updatedAt = Date.now();
     }).catch(() => {});
     throw error;

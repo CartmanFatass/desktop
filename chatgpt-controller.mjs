@@ -1156,7 +1156,9 @@ export class ChatGPTController {
     })()`);
     if (!result?.ok || result?.clickCount !== 1) {
       const error = new Error(result?.error || 'review_send_control_ambiguous');
-      error.data = result || null;
+      error.data = result && result.ok === false
+        ? { ...result, noClickProven: true }
+        : result || null;
       throw error;
     }
     return result;
@@ -1170,12 +1172,18 @@ export class ChatGPTController {
       const newUserMessages = (snapshot.messages || []).filter(
         (message) => message.role === 'user' && !baselineIds.has(message.id)
       );
+      if (newUserMessages.length > 1) throw new Error('review_user_message_ambiguous');
       const matches = newUserMessages.filter((message) => message.text === prompt);
       if (matches.length > 1) throw new Error('review_user_message_ambiguous');
       if (matches.length === 1) {
+        const {
+          candidateCount: renderedContentCandidateCount = null,
+          ...renderedContentDiagnostic
+        } = matches[0].textIdentityDiagnostic || {};
         return {
           snapshot,
           message: matches[0],
+          newUserMessageCount: newUserMessages.length,
           identityMode: 'rendered_exact',
           renderedIdentityDiagnostic: {
             serializerOk: true,
@@ -1185,32 +1193,38 @@ export class ChatGPTController {
             serializedLength: prompt.length,
             observedLengths: [prompt.length],
             expectedLength: prompt.length,
-            candidateCount: 1,
+            newUserMessageCount: newUserMessages.length,
+            renderedContentCandidateCount,
             exactMatchCount: 1,
             readableCandidateCount: 1,
-            ...(matches[0].textIdentityDiagnostic || {})
+            ...renderedContentDiagnostic
           }
         };
       }
-      if (newUserMessages.length > 1) throw new Error('review_user_message_ambiguous');
       if (newUserMessages.length === 1) {
         const message = newUserMessages[0];
+        const {
+          candidateCount: renderedContentCandidateCount = null,
+          ...renderedContentDiagnostic
+        } = message.textIdentityDiagnostic || {};
         return {
           snapshot,
           message,
+          newUserMessageCount: newUserMessages.length,
           identityMode: 'exact_composer_causal_binding',
           renderedIdentityDiagnostic: {
-          serializerOk: message.textIdentityReadable === true,
-          serializerMethod: 'rendered_user_message_structural',
-          serializerError: message.textIdentityError || 'review_user_message_content_mismatch',
-          serializerTag: message.textIdentityTag || null,
-          serializedLength: Number.isInteger(message.textLength) ? message.textLength : 0,
-          observedLengths: Number.isInteger(message.textLength) ? [message.textLength] : [],
-          expectedLength: prompt.length,
-          candidateCount: 1,
-          exactMatchCount: 0,
-          readableCandidateCount: message.textIdentityReadable === true ? 1 : 0,
-          ...(message.textIdentityDiagnostic || {})
+            serializerOk: message.textIdentityReadable === true,
+            serializerMethod: 'rendered_user_message_structural',
+            serializerError: message.textIdentityError || 'review_user_message_content_mismatch',
+            serializerTag: message.textIdentityTag || null,
+            serializedLength: Number.isInteger(message.textLength) ? message.textLength : 0,
+            observedLengths: Number.isInteger(message.textLength) ? [message.textLength] : [],
+            expectedLength: prompt.length,
+            newUserMessageCount: newUserMessages.length,
+            renderedContentCandidateCount,
+            exactMatchCount: 0,
+            readableCandidateCount: message.textIdentityReadable === true ? 1 : 0,
+            ...renderedContentDiagnostic
           }
         };
       }
@@ -1308,7 +1322,17 @@ export class ChatGPTController {
     throw new Error('timeout_waiting_for_response');
   }
 
-  async reviewQuery({ prompt, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onPrepared, onSubmitted }) {
+  async reviewQuery({
+    prompt,
+    expectedUrl,
+    expectedConversationId,
+    expectedModel,
+    timeoutMs,
+    onPrepared,
+    onSendIntent,
+    onSendAction,
+    onSubmitted
+  }) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     const deadline = Date.now() + Number(timeoutMs || 0);
     const identity = { expectedUrl, expectedConversationId, expectedModel };
@@ -1328,16 +1352,28 @@ export class ChatGPTController {
       // Strict review transport avoids clipboard/paste conversion. Prove the
       // active composer contains the complete prompt before the sole send.
       const composerIdentity = await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      const composerPromptSha256 = crypto.createHash('sha256').update(prompt, 'utf8').digest('hex');
+      await onSendIntent?.({
+        composerPromptSha256,
+        composerIdentity,
+        sendIntentAt: Date.now()
+      });
       const clickReceipt = await this.#clickReviewSendOnce(prompt);
+      await onSendAction?.({
+        clickCount: clickReceipt?.clickCount || 0,
+        sendActionCount: 1,
+        sendActionAt: Date.now()
+      });
       const submitted = await this.#waitForReviewUserMessage({ prompt, baselineIds, deadline, identity });
       await onSubmitted?.({
         userMessageId: submitted.message.id,
+        newUserMessageCount: submitted.newUserMessageCount,
         submittedAt: Date.now(),
         conversationUrl: submitted.snapshot.url,
         conversationId: submitted.snapshot.conversationId,
         modelEvidence: submitted.snapshot.modelEvidence,
         identityMode: submitted.identityMode,
-        composerPromptSha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+        composerPromptSha256,
         composerIdentity,
         clickCount: clickReceipt?.clickCount || 0,
         renderedIdentityDiagnostic: submitted.renderedIdentityDiagnostic
@@ -1369,6 +1405,10 @@ export class ChatGPTController {
     const exactMatches = newUserMessages.filter((message) => message.text === prompt);
     const readableCandidateCount = newUserMessages.filter((message) => message.textIdentityReadable === true).length;
     const message = newUserMessages.length ? newUserMessages[newUserMessages.length - 1] : null;
+    const {
+      candidateCount: renderedContentCandidateCount = null,
+      ...renderedContentDiagnostic
+    } = message?.textIdentityDiagnostic || {};
     return {
       ok: exactMatches.length === 1 && newUserMessages.length === 1,
       serializerOk: message?.textIdentityReadable === true,
@@ -1380,14 +1420,24 @@ export class ChatGPTController {
       serializedLength: Number.isInteger(message?.textLength) ? message.textLength : 0,
       observedLengths: Number.isInteger(message?.textLength) ? [message.textLength] : [],
       expectedLength: prompt.length,
-      candidateCount: newUserMessages.length,
+      newUserMessageCount: newUserMessages.length,
+      renderedContentCandidateCount,
       exactMatchCount: exactMatches.length,
       readableCandidateCount,
-      ...(message?.textIdentityDiagnostic || {})
+      ...renderedContentDiagnostic
     };
   }
 
-  async recoverReviewSubmission({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel, timeoutMs, onRecovered }) {
+  async recoverReviewSubmission({
+    prompt,
+    baselineMessageIds,
+    expectedUrl,
+    expectedConversationId,
+    expectedModel,
+    timeoutMs,
+    exactComposerCausalBinding,
+    onRecovered
+  }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
     const identity = { expectedUrl, expectedConversationId, expectedModel };
     const snapshot = await this.#reviewSnapshot(expectedModel);
@@ -1397,8 +1447,8 @@ export class ChatGPTController {
     const newUserMessages = (snapshot.messages || []).filter(
       (message) => message.role === 'user' && !baselineIds.has(message.id)
     );
-    const matches = newUserMessages.filter((message) => message.text === prompt);
-    if (matches.length !== 1) {
+    if (exactComposerCausalBinding !== true) throw new Error('review_composer_causal_binding_missing');
+    if (newUserMessages.length !== 1) {
       const message = newUserMessages.length === 1 ? newUserMessages[0] : null;
       const error = new Error('review_user_message_identity_unreadable');
       error.data = message ? {
@@ -1413,14 +1463,30 @@ export class ChatGPTController {
       } : { candidateCount: newUserMessages.length, expectedLength: prompt.length };
       throw error;
     }
+    const message = newUserMessages[0];
+    const renderedExact = message.text === prompt;
+    const {
+      candidateCount: renderedContentCandidateCount = null,
+      ...renderedContentDiagnostic
+    } = message.textIdentityDiagnostic || {};
     await onRecovered?.({
-      userMessageId: matches[0].id,
+      userMessageId: message.id,
+      newUserMessageCount: newUserMessages.length,
       submittedAt: Date.now(),
       conversationUrl: snapshot.url,
       conversationId: snapshot.conversationId,
-      modelEvidence: snapshot.modelEvidence
+      modelEvidence: snapshot.modelEvidence,
+      identityMode: renderedExact ? 'rendered_exact' : 'exact_composer_causal_binding',
+      composerPromptSha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+      renderedIdentityDiagnostic: {
+        newUserMessageCount: newUserMessages.length,
+        renderedContentCandidateCount,
+        exactMatchCount: renderedExact ? 1 : 0,
+        readableCandidateCount: message.textIdentityReadable === true ? 1 : 0,
+        ...renderedContentDiagnostic
+      }
     });
-    return await this.#waitForReviewAssistant({ userMessageId: matches[0].id, deadline, identity });
+    return await this.#waitForReviewAssistant({ userMessageId: message.id, deadline, identity });
   }
 
   async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400 } = {}) {

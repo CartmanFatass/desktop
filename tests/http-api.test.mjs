@@ -72,11 +72,32 @@ test('http-api: strict review query returns a durable receipt and does not dupli
   const controller = {
     async reviewQuery(args) {
       sends += 1;
-      await args.onSubmitted({
-        userMessageId: 'user-http-1',
+      await args.onPrepared({
+        baselineMessageIds: [],
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
+      });
+      const composerIdentity = {
+        ok: true,
+        serializerOk: true,
+        serializedLength: prompt.length,
+        expectedLength: prompt.length
+      };
+      await args.onSendIntent({ composerPromptSha256: promptSha256, composerIdentity });
+      await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
+      await args.onSubmitted({
+        userMessageId: 'user-http-1',
+        newUserMessageCount: 1,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro',
+        identityMode: 'exact_composer_causal_binding',
+        composerPromptSha256: promptSha256,
+        renderedIdentityDiagnostic: {
+          newUserMessageCount: 1,
+          renderedContentCandidateCount: 3
+        }
       });
       return {
         userMessageId: 'user-http-1',
@@ -123,6 +144,7 @@ test('http-api: strict review query returns a durable receipt and does not dupli
   const first = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
   assert.equal(first.res.status, 200);
   assert.equal(first.data.receipt.status, 'COMPLETE');
+  assert.equal(first.data.receipt.sendActionCount, 1);
   assert.equal(first.data.receipt.responseSha256, responseSha256);
   const duplicate = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
   assert.equal(duplicate.res.status, 200);

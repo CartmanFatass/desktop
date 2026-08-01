@@ -174,6 +174,37 @@ test('chatgpt-controller: submission diagnosis injects the structure summarizer 
   assert.equal(result.serializedLength, prompt.length);
 });
 
+test('chatgpt-controller: submission diagnosis rejects multiple new user message identities', async () => {
+  const url = 'https://chatgpt.com/c/conversation-multiple';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate() {
+      return {
+        messages: [
+          { order: 0, role: 'user', id: 'user-1', text: 'exact', textLength: 5, textIdentityReadable: true },
+          { order: 1, role: 'user', id: 'user-2', text: 'exact', textLength: 5, textIdentityReadable: true }
+        ],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.inspectReviewSubmissionIdentity({
+    prompt: 'exact',
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'conversation-multiple',
+    expectedModel: 'GPT-5.6 Pro'
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.newUserMessageCount, 2);
+  assert.equal(result.exactMatchCount, 2);
+});
+
 test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
   const content = elementNode('DIV', textNode('alpha\n\nbeta'));
   content.querySelectorAll = () => [];
@@ -596,7 +627,7 @@ test('chatgpt-controller: strict review rechecks exact composer in the send eval
   assert.equal(sendEvaluationReached, true);
 });
 
-test('chatgpt-controller: strict review binds one rendered Markdown message to the exact composer receipt', async () => {
+test('chatgpt-controller: strict review binds one long multi-node message causally to the exact composer receipt', async () => {
   const url = 'https://chatgpt.com/c/conversation-rendered';
   const prompt = '```text\nsynthetic\n```\n';
   let strictClicks = 0;
@@ -633,7 +664,7 @@ test('chatgpt-controller: strict review binds one rendered Markdown message to t
             textIdentityError: 'review_composer_element_unsupported',
             textIdentityTag: 'PRE',
             textIdentityDiagnostic: {
-              candidateCount: 1,
+              candidateCount: 4,
               rootTag: 'PRE',
               elementCount: 2,
               textNodeCount: 1,
@@ -674,7 +705,11 @@ test('chatgpt-controller: strict review binds one rendered Markdown message to t
   assert.equal(strictClicks, 1);
   assert.equal(result.userMessageId, 'user-rendered');
   assert.equal(submittedReceipt.identityMode, 'exact_composer_causal_binding');
+  assert.equal(submittedReceipt.newUserMessageCount, 1);
   assert.equal(submittedReceipt.clickCount, 1);
+  assert.equal(submittedReceipt.renderedIdentityDiagnostic.newUserMessageCount, 1);
+  assert.equal(submittedReceipt.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
+  assert.equal('candidateCount' in submittedReceipt.renderedIdentityDiagnostic, false);
   assert.equal(submittedReceipt.renderedIdentityDiagnostic.serializerTag, 'PRE');
   assert.equal(submittedReceipt.composerPromptSha256, crypto.createHash('sha256').update(prompt).digest('hex'));
 });
@@ -735,9 +770,7 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
           { order: 0, role: 'user', id: 'historical-user', text: prompt },
           { order: 1, role: 'assistant', id: 'historical-assistant', text: 'old' },
           { order: 2, role: 'user', id: 'current-user', text: prompt },
-          { order: 3, role: 'assistant', id: 'current-assistant', text: 'new' },
-          { order: 4, role: 'user', id: 'later-user', text: 'later' },
-          { order: 5, role: 'assistant', id: 'later-assistant', text: 'later response' }
+          { order: 3, role: 'assistant', id: 'current-assistant', text: 'new' }
         ],
         modelEvidence: 'GPT-5.6 Pro',
         modelEvidenceCandidates: ['GPT-5.6 Pro'],
@@ -763,6 +796,7 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
     expectedConversationId: 'conversation-1',
     expectedModel: 'GPT-5.6 Pro',
     timeoutMs: 5_000,
+    exactComposerCausalBinding: true,
     onRecovered: async ({ userMessageId }) => {
       recoveredId = userMessageId;
     }
@@ -771,6 +805,96 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
   assert.equal(result.userMessageId, 'current-user');
   assert.equal(result.assistantMessageId, 'current-assistant');
   assert.equal(result.text, 'new');
+});
+
+test('chatgpt-controller: crash recovery accepts one attachment-backed message under exact composer causality', async () => {
+  const url = 'https://chatgpt.com/c/conversation-attachment';
+  const prompt = 'long exact prompt';
+  let receipt = null;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      assert.equal(js.includes('.click()'), false);
+      return {
+        messages: [
+          {
+            order: 0,
+            role: 'user',
+            id: 'attachment-user',
+            text: 'Pasted_text.txt',
+            textLength: 15,
+            textIdentityReadable: false,
+            textIdentityDiagnostic: { candidateCount: 4, rootTag: 'PRE' }
+          },
+          { order: 1, role: 'assistant', id: 'attachment-assistant', text: 'done' }
+        ],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.recoverReviewSubmission({
+    prompt,
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'conversation-attachment',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 5_000,
+    exactComposerCausalBinding: true,
+    onRecovered: async (value) => { receipt = value; }
+  });
+  assert.equal(receipt.identityMode, 'exact_composer_causal_binding');
+  assert.equal(receipt.newUserMessageCount, 1);
+  assert.equal(receipt.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
+  assert.equal(result.userMessageId, 'attachment-user');
+  assert.equal(result.assistantMessageId, 'attachment-assistant');
+});
+
+test('chatgpt-controller: crash recovery rejects missing causal receipt and ambiguous new messages', async () => {
+  const url = 'https://chatgpt.com/c/conversation-recovery-negative';
+  let messageCount = 1;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate() {
+      return {
+        messages: Array.from({ length: messageCount }, (_, index) => ({
+          order: index,
+          role: 'user',
+          id: `user-${index}`,
+          text: 'attachment'
+        })),
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const base = {
+    prompt: 'exact prompt',
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'conversation-recovery-negative',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 5_000
+  };
+  await assert.rejects(controller.recoverReviewSubmission(base), /review_composer_causal_binding_missing/);
+  messageCount = 0;
+  await assert.rejects(
+    controller.recoverReviewSubmission({ ...base, exactComposerCausalBinding: true }),
+    /review_user_message_identity_unreadable/
+  );
+  messageCount = 2;
+  await assert.rejects(
+    controller.recoverReviewSubmission({ ...base, exactComposerCausalBinding: true }),
+    /review_user_message_identity_unreadable/
+  );
 });
 
 test('chatgpt-controller: observe-only review never activates continuation controls', async () => {
