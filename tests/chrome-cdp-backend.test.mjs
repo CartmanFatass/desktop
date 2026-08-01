@@ -237,6 +237,10 @@ test('chrome-cdp-backend: createSession closes target if initialization fails', 
     /page_enable_failed/
   );
 
+  assert.deepEqual(
+    calls.find((item) => item.method === 'Target.createTarget')?.params,
+    { url: 'https://chatgpt.com/', newWindow: false }
+  );
   assert.equal(calls.some((item) => item.method === 'Target.closeTarget' && item.params?.targetId === 'target-1'), true);
 });
 

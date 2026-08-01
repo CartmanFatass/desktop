@@ -85,3 +85,29 @@ test('tab-manager: exact stable binding rejects another conversation URL for the
     /key_url_mismatch/
   );
 });
+
+test('tab-manager: repeated exact stable binding reuses one live tab session', async () => {
+  let sessionCreates = 0;
+  const browserBackend = {
+    async createSession() {
+      sessionCreates += 1;
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const binding = {
+    key: 'hmasd-formal-pro',
+    name: 'hmasd-formal-pro',
+    vendorId: 'chatgpt',
+    vendorName: 'ChatGPT',
+    url: 'https://chatgpt.com/c/conversation-a',
+    exactUrl: true
+  };
+
+  const first = await manager.ensureTab(binding);
+  const second = await manager.ensureTab(binding);
+
+  assert.equal(second, first);
+  assert.equal(sessionCreates, 1);
+  assert.equal(manager.listTabs().length, 1);
+});

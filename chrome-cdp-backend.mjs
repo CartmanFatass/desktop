@@ -633,12 +633,7 @@ export class ChromeCdpBrowserBackend {
   async createSession({ url, show = false, onClosed } = {}) {
     await this.start();
 
-    let target;
-    try {
-      target = await this.client.send('Target.createTarget', { url, newWindow: true });
-    } catch {
-      target = await this.client.send('Target.createTarget', { url, newWindow: true });
-    }
+    const target = await this.client.send('Target.createTarget', { url, newWindow: false });
     const targetId = String(target?.targetId || '').trim();
     if (!targetId) throw new Error('chrome_cdp_target_create_failed');
     try {
