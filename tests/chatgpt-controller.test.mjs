@@ -19,7 +19,11 @@ const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNo
 test('chatgpt-controller: ordinary verify wording is not an access block', () => {
   assert.equal(looksLikeBlockedPage('Please verify the estimator before reporting. Prompt visible.'), false);
   assert.equal(looksLikeBlockedPage('403 Forbidden'), true);
+  assert.equal(looksLikeBlockedPage('Access denied'), true);
+  assert.equal(looksLikeBlockedPage('Forbidden'), true);
+  assert.equal(looksLikeBlockedPage('Unusual traffic'), true);
   assert.equal(looksLikeBlockedPage('Verify you are human'), true);
+  assert.equal(looksLikeBlockedPage('Human verification'), true);
 });
 
 test('chatgpt-controller: structural composer serialization preserves exact multiline plain text', () => {
