@@ -1001,12 +1001,20 @@ export class ChatGPTController {
 
   async #reviewSnapshot(expectedModel = '') {
     const url = await this.page.getUrl();
+    const isGemini = (() => {
+      try { return new URL(url).hostname === 'gemini.google.com'; } catch { return false; }
+    })();
     const stopSel = JSON.stringify(this.selectors.stopButton);
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
     const expectedModelLiteral = JSON.stringify(String(expectedModel || ''));
-    const reviewUserSel = JSON.stringify(this.selectors.reviewUserMessage || '[data-message-author-role="user"]');
-    const reviewAssistantSel = JSON.stringify(this.selectors.reviewAssistantMessage || '[data-message-author-role="assistant"]');
+    const reviewUserSel = JSON.stringify(isGemini
+      ? 'user-query, [data-test-id="user-query"], [data-message-author-role="user"]'
+      : this.selectors.reviewUserMessage || '[data-message-author-role="user"]');
+    const reviewAssistantSel = JSON.stringify(isGemini
+      ? 'model-response, [data-test-id="model-response"], [data-message-author-role="assistant"]'
+      : this.selectors.reviewAssistantMessage || '[data-message-author-role="assistant"]');
+    const isGeminiLiteral = JSON.stringify(isGemini);
     const reviewModelSel = JSON.stringify(
       this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]'
     );
@@ -1022,20 +1030,24 @@ export class ChatGPTController {
         const style = window.getComputedStyle(node);
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
-      const identity = (node) => {
-        const host = node?.closest?.('[data-message-id]') || null;
-        return String(host?.getAttribute?.('data-message-id') || '').trim();
+      const identity = (node, role, order) => {
+        const host = node?.closest?.('[data-message-id], [data-turn-id]') || null;
+        const exact = String(
+          host?.getAttribute?.('data-message-id') || host?.getAttribute?.('data-turn-id') || node?.id || ''
+        ).trim();
+        return exact || (${isGeminiLiteral} ? role + ':' + order : '');
       };
       const messages = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}))
         .map((node, order) => {
-          const role = String(node.getAttribute('data-message-author-role') || '').trim();
+          const role = String(node.getAttribute('data-message-author-role') || '').trim()
+            || (${isGeminiLiteral} && node.matches(${reviewUserSel}) ? 'user' : 'assistant');
           const serialized = role === 'user'
             ? serializeReviewUserMessage(node)
             : { ok: true, text: String(node.innerText || '') };
           return {
             order,
             role,
-            id: identity(node),
+            id: identity(node, role, order),
             text: serialized.ok === true ? serialized.text : null,
             textLength: serialized.ok === true ? serialized.text.length : null,
             textIdentityReadable: serialized.ok === true,

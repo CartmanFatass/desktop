@@ -530,6 +530,8 @@ test('chatgpt-controller: strict review recognizes a Gemini app conversation ide
     async getUrl() { return url; },
     async evaluate(js) {
       assert.equal(js.includes('reviewSnapshotMarker'), true);
+      assert.equal(js.includes('user-query'), true);
+      assert.equal(js.includes('model-response'), true);
       return {
         messages: [{ order: 0, role: 'user', id: 'gemini-user', text: 'question', textLength: 8, textIdentityReadable: true }],
         modelEvidence: 'Gemini 2.5 Pro',
@@ -549,6 +551,57 @@ test('chatgpt-controller: strict review recognizes a Gemini app conversation ide
     expectedModel: 'Gemini 2.5 Pro'
   });
   assert.equal(result.ok, true);
+});
+
+test('chatgpt-controller: Gemini strict review inserts once and completes on the same app identity', async () => {
+  const url = 'https://gemini.google.com/app/gemini-strict';
+  const prompt = 'scientific question';
+  let insertCalls = 0;
+  let strictClicks = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('observedLengths')) return { ok: true, observedLengths: [prompt.length], expectedLength: prompt.length };
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        assert.equal(js.includes('user-query'), true);
+        assert.equal(js.includes('model-response'), true);
+        return {
+          messages: strictClicks ? [
+            { order: 0, role: 'user', id: 'user:0', text: prompt },
+            { order: 1, role: 'assistant', id: 'assistant:1', text: 'GEMINI_OK' }
+          ] : [],
+          modelEvidence: 'Gemini 2.5 Pro',
+          modelEvidenceCandidates: ['Gemini 2.5 Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { insertCalls += 1; assert.equal(text, prompt); },
+    async sendKey() {},
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: url,
+    expectedConversationId: 'gemini-strict',
+    expectedModel: 'Gemini 2.5 Pro',
+    timeoutMs: 8_000
+  });
+  assert.equal(insertCalls, 1);
+  assert.equal(strictClicks, 1);
+  assert.equal(result.text, 'GEMINI_OK');
 });
 
 test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
