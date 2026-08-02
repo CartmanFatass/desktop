@@ -481,6 +481,12 @@ test('chatgpt-controller: public query allows the full 45-minute response window
   assert.match(source, /Math\.min\(timeoutMs, 45 \* 60_000\)/);
 });
 
+test('chatgpt-controller: public query never returns page chrome as an assistant response', () => {
+  const source = readFileSync(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /fallbackMainText/);
+  assert.doesNotMatch(source, /fallbackStableLongEnough/);
+});
+
 test('chatgpt-controller: wait response observes one active answer without sending', async () => {
   let responseChecks = 0;
   let insertCalls = 0;

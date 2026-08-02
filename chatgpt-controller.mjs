@@ -1587,13 +1587,12 @@ export class ChatGPTController {
         const sendEnabled = send ? !send.disabled : true;
         const nodes = Array.from(document.querySelectorAll(${assistantSel}));
         const lastNode = nodes[nodes.length - 1];
-        const fallbackMainText = ((document.querySelector('main') || document.body)?.innerText || '').trim();
-        const txt = (lastNode?.innerText || fallbackMainText).trim();
+        const txt = String(lastNode?.innerText || '').trim();
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasAnswerNow = Array.from(document.querySelectorAll('button, a')).some(b => /answer now/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { stop, sendEnabled, txt, count: nodes.length, usedFallback: !lastNode, hasError, hasContinue, hasRegenerate, hasAnswerNow };
+        return { stop, sendEnabled, txt, count: nodes.length, hasError, hasContinue, hasRegenerate, hasAnswerNow };
       })()`);
 
       const txt = String(snap?.txt || '');
@@ -1613,11 +1612,9 @@ export class ChatGPTController {
       const stopGoneLongEnough = stopGoneAt != null && Date.now() - stopGoneAt >= 800;
 
       const readyByNodes = (snap?.count || 0) > baselineAssistantCount;
-      const fallbackWaited = !!snap?.usedFallback && (Date.now() - start >= 2500);
-      const fallbackStableLongEnough = txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
       const done =
-        (!generating && !snap?.hasContinue && !snap?.hasAnswerNow && stopGoneLongEnough && snap?.sendEnabled && stable && txt.length > 0 && (readyByNodes || fallbackWaited)) ||
-        (!generating && !snap?.hasContinue && !snap?.hasAnswerNow && fallbackStableLongEnough && (readyByNodes || fallbackWaited));
+        !generating && !snap?.hasContinue && !snap?.hasAnswerNow && stopGoneLongEnough &&
+        snap?.sendEnabled && stable && txt.length > 0 && readyByNodes;
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
