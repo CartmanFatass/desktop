@@ -12,7 +12,7 @@ const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').dige
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, ensure: [], update: [] };
+  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
   let reviewFailure = null;
   let sendControlFailure = null;
@@ -171,6 +171,10 @@ async function fixture() {
     }
   };
   const tabs = {
+    async adoptTab(args) {
+      calls.adopt.push(args);
+      return args.id;
+    },
     async ensureTab(args) {
       calls.ensure.push(args);
       return 'tab-1';
@@ -215,6 +219,22 @@ async function fixture() {
     }
   };
 }
+
+test('review transport: adopts an exact existing tab before the normal send lifecycle', async () => {
+  const f = await fixture();
+  const request = { ...f.request, existingTabId: 'tab-existing' };
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  assert.equal(receipt.status, 'COMPLETE');
+  assert.deepEqual(f.calls.adopt, [{
+    id: 'tab-existing',
+    key: request.stableKey,
+    name: request.stableKey,
+    url: request.conversationUrl,
+    vendorId: request.provider,
+    vendorName: 'ChatGPT'
+  }]);
+  assert.equal(f.calls.review, 1);
+});
 
 test('review transport: mismatch diagnostics retain only non-content structural metadata', () => {
   assert.deepEqual(sanitizeReviewErrorData({
@@ -481,6 +501,26 @@ test('review transport: stable-key mismatch fails while caller prompt hash is ig
   });
   assert.equal(retry.status, 'COMPLETE');
   assert.equal(f.calls.review, 2);
+});
+
+test('review transport: binding mismatch cannot adopt or re-key a tab', async () => {
+  const f = await fixture();
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: {
+        ...f.request,
+        idempotencyKey: 'different-operation',
+        conversationUrl: 'https://chatgpt.com/c/conversation-2',
+        conversationId: 'conversation-2',
+        existingTabId: 'tab-existing'
+      }
+    }),
+    /review_binding_mismatch/
+  );
+  assert.deepEqual(f.calls.adopt, []);
 });
 
 test('review transport: timeout above 45 minutes is rejected before tab or send', async () => {

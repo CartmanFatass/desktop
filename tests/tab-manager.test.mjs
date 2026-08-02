@@ -129,3 +129,36 @@ test('tab-manager: first binding updates the stable tab to the created conversat
     exactUrl: true
   }), tabId);
 });
+
+test('tab-manager: adopts the exact default tab without creating or navigating', async () => {
+  let sessionCreates = 0;
+  const browserBackend = {
+    async createSession() {
+      sessionCreates += 1;
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({
+    key: 'default',
+    vendorId: 'chatgpt',
+    vendorName: 'ChatGPT',
+    url: 'https://chatgpt.com/c/conversation-a'
+  });
+
+  assert.equal(await manager.adoptTab({
+    id: tabId,
+    key: 'hmasd-uav-formal-pro',
+    vendorId: 'chatgpt',
+    vendorName: 'ChatGPT',
+    url: 'https://chatgpt.com/c/conversation-a'
+  }), tabId);
+  assert.equal(sessionCreates, 1);
+  assert.equal(manager.listTabs()[0].key, 'hmasd-uav-formal-pro');
+  assert.equal(await manager.ensureTab({
+    key: 'hmasd-uav-formal-pro',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/conversation-a',
+    exactUrl: true
+  }), tabId);
+});

@@ -127,6 +127,29 @@ export class TabManager {
     return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
   }
 
+  async adoptTab({ id, key, name, url, vendorId, vendorName } = {}) {
+    return await this.mutex.run(async () => {
+      if (!id) throw new Error('missing_tabId');
+      if (!key) throw new Error('missing_key');
+      const tab = this.tabs.get(id);
+      if (!tab || tab.session?.isClosed?.()) throw new Error('tab_not_found');
+      const existing = this.keyToId.get(key);
+      if (existing && existing !== id) throw new Error('key_already_bound');
+      if (String(tab.url || '') !== String(url || '')) throw new Error('tab_url_mismatch');
+      if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('tab_vendor_mismatch');
+      if (tab.key && tab.key !== key && tab.key !== 'default') throw new Error('tab_key_mismatch');
+      if (tab.key && this.keyToId.get(tab.key) === id) this.keyToId.delete(tab.key);
+      tab.key = key;
+      tab.name = name || key;
+      tab.vendorId = tab.vendorId || vendorId || null;
+      tab.vendorName = tab.vendorName || vendorName || null;
+      tab.lastUsedAt = Date.now();
+      this.keyToId.set(key, id);
+      this.onChanged?.();
+      return id;
+    });
+  }
+
   updateTabUrl(id, url) {
     const tab = this.tabs.get(id);
     if (!tab) throw new Error('tab_not_found');

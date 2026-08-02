@@ -126,6 +126,9 @@ function normalizeRequest(input) {
   }
   const verifyExisting = request.verifyExisting === true;
   const diagnoseExisting = request.diagnoseExisting === true;
+  const existingTabId = request.existingTabId == null
+    ? null
+    : requiredText(request.existingTabId, 'existingTabId', { max: 512 });
   if (verifyExisting && diagnoseExisting) fail('review_invalid_request', { field: 'operationMode' });
   return {
     stableKey,
@@ -139,7 +142,8 @@ function normalizeRequest(input) {
     timeoutMs,
     verifyExisting,
     diagnoseExisting,
-    firstBinding
+    firstBinding,
+    existingTabId
   };
 }
 
@@ -269,6 +273,16 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     } else {
       if (binding && !sameBinding(binding, request)) fail('review_binding_mismatch');
       if (!binding) state.bindings[request.stableKey] = { ...expectedBinding, createdAt: now, updatedAt: now };
+    }
+    if (request.existingTabId && !existing) {
+      await tabs.adoptTab({
+        id: request.existingTabId,
+        key: request.stableKey,
+        name: request.stableKey,
+        url: request.conversationUrl,
+        vendorId: request.provider,
+        vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT'
+      });
     }
     if (request.diagnoseExisting && !existing) fail('review_diagnostic_operation_missing');
     if (existing) return { existing: true, operation: { ...existing }, binding: binding ? { ...binding } : null };
