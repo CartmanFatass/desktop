@@ -1580,7 +1580,7 @@ export class ChatGPTController {
     try {
       await this.ensureReady({ timeoutMs });
       await this.#attachFiles(attachments);
-      await this.#typePrompt(prompt);
+      await this.#typePrompt(prompt, { human: false });
       await this.#clickSend();
       return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
     } finally {

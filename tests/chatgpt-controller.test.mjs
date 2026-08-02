@@ -395,6 +395,54 @@ test('chatgpt-controller: send falls back to requestSubmit on the active compose
   assert.equal(events.includes('key:Enter'), false);
 });
 
+test('chatgpt-controller: public query inserts a multiline prompt once', async () => {
+  const prompt = 'first line\nsecond line\nthird line';
+  const inserted = [];
+  let requestSubmitCount = 0;
+  let promptChecks = 0;
+  const page = {
+    async navigate() {},
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('form.requestSubmit')) { requestSubmitCount += 1; return true; }
+      if (js.includes('already_generating')) return { ok: true, requestSubmit: true, host: 'chatgpt.com' };
+      if (js.includes('promptLen')) {
+        promptChecks += 1;
+        return promptChecks >= 2
+          ? { stopVisible: false, sendDisabled: true, promptLen: 0 }
+          : { stopVisible: false, sendDisabled: false, promptLen: prompt.length };
+      }
+      if (js.includes('const codes =')) return { codeBlocks: [] };
+      if (js.includes('const nodes = Array.from(document.querySelectorAll')) {
+        return { stop: false, sendEnabled: true, txt: 'done', count: 1, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    },
+    async sendKey() {},
+    async insertText(text) { inserted.push(text); },
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {},
+    async setFileInputFiles() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: {
+      promptTextarea: '#prompt-textarea',
+      sendButton: 'button[data-testid="send-button"]',
+      stopButton: 'button[data-testid="stop-button"]',
+      assistantMessage: '[data-message-author-role="assistant"]'
+    }
+  });
+
+  const result = await controller.query({ prompt, timeoutMs: 5_000 });
+  assert.equal(result.text, 'done');
+  assert.deepEqual(inserted, [prompt]);
+  assert.equal(requestSubmitCount, 1);
+});
+
 test('chatgpt-controller: strict review submits with one send control and returns two stable exact-message snapshots', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   const prompt = 'x';
