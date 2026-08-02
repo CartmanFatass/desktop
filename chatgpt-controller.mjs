@@ -1024,9 +1024,11 @@ export class ChatGPTController {
   async #ensureExpectedModel(expectedModel, timeoutMs = 20_000) {
     const expected = String(expectedModel || '').trim();
     if (!expected) return null;
-    const modelSel = JSON.stringify(
-      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]'
-    );
+    const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
+    const modelSel = JSON.stringify([
+      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
+      composerModelPicker
+    ].join(', '));
     const readModel = async () => await this.#eval(`(() => {
       const agentifyModelStateMarker = true;
       const visible = (node) => {
@@ -1042,24 +1044,31 @@ export class ChatGPTController {
         .filter(Boolean);
       return { matched: labels.some((label) => canonical(label) === canonical(expected)), labels };
     })()`);
-    let state = await readModel();
-    if (state?.matched) return state;
-
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    let state = null;
+    let opened = null;
     await this.#emitProgress({ phase: 'selecting_model' });
-    const opened = await this.#eval(`(() => {
-      const agentifyOpenModelPickerMarker = true;
-      const visible = (node) => {
-        const rect = node?.getBoundingClientRect?.();
-        const style = node ? window.getComputedStyle(node) : null;
-        return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
-      };
-      const preferred = Array.from(document.querySelectorAll('button[data-testid*="model-switcher" i], [role="button"][data-testid*="model-switcher" i]')).filter(visible);
-      const fallback = Array.from(document.querySelectorAll(${modelSel})).filter((node) => visible(node) && node.matches('button, [role="button"]'));
-      const picker = preferred[0] || fallback[0] || null;
-      if (!picker) return { ok: false, error: 'model_switcher_unavailable' };
-      picker.click();
-      return { ok: true };
-    })()`);
+    while (Date.now() < deadline) {
+      state = await readModel();
+      if (state?.matched) return state;
+      opened = await this.#eval(`(() => {
+        const agentifyOpenModelPickerMarker = true;
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+        };
+        const composerPicker = Array.from(document.querySelectorAll(${JSON.stringify(composerModelPicker)})).filter(visible);
+        const preferred = Array.from(document.querySelectorAll('button[data-testid*="model-switcher" i], [role="button"][data-testid*="model-switcher" i]')).filter(visible);
+        const fallback = Array.from(document.querySelectorAll(${modelSel})).filter((node) => visible(node) && node.matches('button, [role="button"]'));
+        const picker = composerPicker[0] || preferred[0] || fallback[0] || null;
+        if (!picker) return { ok: false, error: 'model_switcher_unavailable' };
+        picker.click();
+        return { ok: true };
+      })()`);
+      if (opened?.ok) break;
+      await sleep(200);
+    }
     if (!opened?.ok) throw new Error(opened?.error || 'model_switcher_unavailable');
     await sleep(250);
 
@@ -1072,7 +1081,7 @@ export class ChatGPTController {
       };
       const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
       const expected = ${JSON.stringify(expected)};
-      const candidates = Array.from(document.querySelectorAll('[role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
+      const candidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
         .filter(visible)
         .filter((node) => canonical(node.textContent || node.getAttribute('aria-label') || '') === canonical(expected));
       const target = candidates[0] || null;
@@ -1082,7 +1091,6 @@ export class ChatGPTController {
     })()`);
     if (!chosen?.ok) throw new Error(chosen?.error || 'expected_model_unavailable');
 
-    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
     while (Date.now() < deadline) {
       state = await readModel();
       if (state?.matched) return state;

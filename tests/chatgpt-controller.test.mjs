@@ -410,9 +410,22 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
     async getUrl() { return 'https://chatgpt.com/'; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
-      if (js.includes('agentifyModelStateMarker')) return { matched: modelSelected, labels: [modelSelected ? 'GPT-5.6 Pro' : 'GPT-5.6 High'] };
-      if (js.includes('agentifyOpenModelPickerMarker')) { modelPickerClicks += 1; return { ok: true }; }
-      if (js.includes('agentifyChooseModelMarker')) { modelOptionClicks += 1; modelSelected = true; return { ok: true }; }
+      if (js.includes('agentifyModelStateMarker')) {
+        assert.match(js, /data-composer-transition-slot/);
+        return { matched: modelSelected, labels: [modelSelected ? 'Pro' : 'High'] };
+      }
+      if (js.includes('agentifyOpenModelPickerMarker')) {
+        assert.match(js, /data-composer-transition-slot/);
+        assert.doesNotMatch(js, /textContent[^;]*===/);
+        modelPickerClicks += 1;
+        return { ok: true };
+      }
+      if (js.includes('agentifyChooseModelMarker')) {
+        assert.match(js, /menuitemradio/);
+        modelOptionClicks += 1;
+        modelSelected = true;
+        return { ok: true };
+      }
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('form.requestSubmit')) { requestSubmitCount += 1; return true; }
       if (js.includes('already_generating')) return { ok: true, requestSubmit: true, host: 'chatgpt.com' };
@@ -453,7 +466,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
     }
   });
 
-  const result = await controller.query({ prompt, expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  const result = await controller.query({ prompt, expectedModel: 'Pro', timeoutMs: 5_000 });
   assert.equal(result.text, 'done');
   assert.deepEqual(inserted, [prompt]);
   assert.equal(requestSubmitCount, 1);
