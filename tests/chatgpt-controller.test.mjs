@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 
 import {
   ChatGPTController,
+  canonicalizeGeminiReviewMessageNodes,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
   looksLikeBlockedPage,
@@ -15,6 +16,28 @@ import {
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
+
+test('chatgpt-controller: Gemini nested selectors canonicalize to one node per turn and role', () => {
+  const turn = (id) => ({ getAttribute: (name) => name === 'data-turn-id' ? id : null });
+  const node = ({ role, id, parent = null }) => ({
+    id: '',
+    matches: () => role === 'user',
+    closest: () => turn(id),
+    contains: (other) => other === parent
+  });
+  const userNested = node({ role: 'user', id: 'turn-user' });
+  const userHost = node({ role: 'user', id: 'turn-user', parent: userNested });
+  const assistantNested = node({ role: 'assistant', id: 'turn-assistant' });
+  const assistantHost = node({ role: 'assistant', id: 'turn-assistant', parent: assistantNested });
+  const result = canonicalizeGeminiReviewMessageNodes(
+    [userHost, userNested, assistantHost, assistantNested],
+    'user-query'
+  );
+  assert.deepEqual(result.map(({ role, identity }) => [role, identity]), [
+    ['user', 'turn-user'],
+    ['assistant', 'turn-assistant']
+  ]);
+});
 
 test('chatgpt-controller: ordinary verify wording is not an access block', () => {
   assert.equal(looksLikeBlockedPage('Please verify the estimator before reporting. Prompt visible.'), false);

@@ -36,6 +36,24 @@ export function deduplicateReviewModelEvidence(values) {
   return [...unique.values()];
 }
 
+export function canonicalizeGeminiReviewMessageNodes(nodes, userSelector) {
+  const accepted = [];
+  for (const node of Array.from(nodes || [])) {
+    const role = node?.matches?.(userSelector) ? 'user' : 'assistant';
+    const host = node?.closest?.('[data-message-id], [data-turn-id]') || null;
+    const identity = String(
+      host?.getAttribute?.('data-message-id') || host?.getAttribute?.('data-turn-id') || node?.id || ''
+    ).trim();
+    const duplicate = accepted.some((entry) =>
+      entry.role === role && (
+        (identity && entry.identity === identity) || entry.node?.contains?.(node)
+      )
+    );
+    if (!duplicate) accepted.push({ node, role, identity });
+  }
+  return accepted;
+}
+
 function reviewConversationId(value) {
   try {
     const parsed = new URL(value);
@@ -1024,6 +1042,7 @@ export class ChatGPTController {
       const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
       const serializeReviewUserMessage = ${serializeReviewUserMessage.toString()};
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
+      const canonicalizeGeminiReviewMessageNodes = ${canonicalizeGeminiReviewMessageNodes.toString()};
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -1037,17 +1056,22 @@ export class ChatGPTController {
         ).trim();
         return exact || (${isGeminiLiteral} ? role + ':' + order : '');
       };
-      const messages = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}))
-        .map((node, order) => {
-          const role = String(node.getAttribute('data-message-author-role') || '').trim()
-            || (${isGeminiLiteral} && node.matches(${reviewUserSel}) ? 'user' : 'assistant');
+      const messageNodes = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}));
+      const messageEntries = ${isGeminiLiteral}
+        ? canonicalizeGeminiReviewMessageNodes(messageNodes, ${reviewUserSel})
+        : messageNodes.map((node) => ({
+          node,
+          role: String(node.getAttribute('data-message-author-role') || '').trim(),
+          identity: ''
+        }));
+      const messages = messageEntries.map(({ node, role, identity: canonicalIdentity }, order) => {
           const serialized = role === 'user'
             ? serializeReviewUserMessage(node)
             : { ok: true, text: String(node.innerText || '') };
           return {
             order,
             role,
-            id: identity(node, role, order),
+            id: canonicalIdentity || identity(node, role, order),
             text: serialized.ok === true ? serialized.text : null,
             textLength: serialized.ok === true ? serialized.text.length : null,
             textIdentityReadable: serialized.ok === true,
