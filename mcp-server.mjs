@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -38,7 +39,8 @@ registerTool(
       tabId: z.string().optional().describe('Tab/session id to use (for parallel jobs).'),
       key: z.string().optional().describe('Stable tab key (e.g., project name); creates a tab if missing.'),
       bundleName: z.string().optional().describe('Named context bundle to merge into this query before sending.'),
-      prompt: z.string().describe('Prompt to send to the selected AI web UI.'),
+      prompt: z.string().optional().describe('Prompt to send to the selected AI web UI. Use either prompt or promptPath.'),
+      promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is sent as the prompt. Use either promptPath or prompt.'),
       promptPrefix: z.string().optional().describe('Optional reusable instruction block prepended before packed context and prompt.'),
       attachments: z.array(z.string()).optional().describe('Local file paths to upload before sending the prompt.'),
       contextPaths: z.array(z.string()).optional().describe('Local files/folders to pack into the prompt and/or attach automatically.'),
@@ -59,6 +61,7 @@ registerTool(
     key,
     bundleName,
     prompt,
+    promptPath,
     promptPrefix,
     attachments,
     contextPaths,
@@ -71,6 +74,15 @@ registerTool(
     maxContextAttachments,
     timeoutMs
   }) => {
+    const hasPrompt = typeof prompt === 'string';
+    const hasPromptPath = typeof promptPath === 'string' && promptPath.trim().length > 0;
+    if (hasPrompt === hasPromptPath) throw new Error('exactly_one_of_prompt_or_promptPath_required');
+    const resolvedPromptPath = hasPromptPath
+      ? (path.isAbsolute(promptPath) ? promptPath : path.resolve(process.cwd(), promptPath))
+      : null;
+    const exactPrompt = resolvedPromptPath
+      ? await fs.readFile(resolvedPromptPath, 'utf8')
+      : prompt;
     const resolvedAttachments = resolveLocalPaths(attachments || []);
     const resolvedContextPaths = resolveLocalPaths(contextPaths || []);
     const conn = await getConn();
@@ -85,7 +97,7 @@ registerTool(
         tabId,
         key,
         bundleName,
-        prompt,
+        prompt: exactPrompt,
         promptPrefix,
         attachments: resolvedAttachments,
         contextPaths: resolvedContextPaths,

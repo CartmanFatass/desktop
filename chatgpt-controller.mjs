@@ -1610,11 +1610,13 @@ export class ChatGPTController {
       const dynamicStableMs = Math.max(stableMs, txt.length > 8000 ? 3000 : txt.length > 2000 ? 2200 : stableMs);
       const stable = Date.now() - lastChange >= dynamicStableMs;
       const stopGoneLongEnough = stopGoneAt != null && Date.now() - stopGoneAt >= 800;
+      const transientPlaceholder = /^(?:(?:gpt[-\s]?\S+|pro)\s+)?thinking(?:[.…]{0,3})?$/i.test(txt.trim());
 
       const readyByNodes = (snap?.count || 0) > baselineAssistantCount;
       const done =
         !generating && !snap?.hasContinue && !snap?.hasAnswerNow && stopGoneLongEnough &&
-        snap?.sendEnabled && stable && txt.length > 0 && readyByNodes;
+        snap?.sendEnabled && stable && txt.length > 0 && !snap?.hasError &&
+        !transientPlaceholder && readyByNodes;
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));

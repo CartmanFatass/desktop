@@ -487,6 +487,12 @@ test('chatgpt-controller: public query never returns page chrome as an assistant
   assert.doesNotMatch(source, /fallbackStableLongEnough/);
 });
 
+test('chatgpt-controller: public query rejects transient thinking placeholders as completion', () => {
+  const source = readFileSync(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
+  assert.match(source, /transientPlaceholder/);
+  assert.match(source, /!transientPlaceholder/);
+});
+
 test('chatgpt-controller: wait response observes one active answer without sending', async () => {
   let responseChecks = 0;
   let insertCalls = 0;
