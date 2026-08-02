@@ -1496,7 +1496,6 @@ export class ChatGPTController {
     let last = '';
     let lastChange = Date.now();
     let stopGoneAt = null;
-    let continueClicks = 0;
 
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
@@ -1534,22 +1533,12 @@ export class ChatGPTController {
       const stable = Date.now() - lastChange >= dynamicStableMs;
       const stopGoneLongEnough = stopGoneAt != null && Date.now() - stopGoneAt >= 800;
 
-      if (!snap?.stop && snap?.hasContinue && continueClicks < 3) {
-        continueClicks += 1;
-        await this.#eval(`(() => {
-          const btn = Array.from(document.querySelectorAll('button, a')).find(b => /continue generating/i.test((b.textContent||'').trim()));
-          if (btn) btn.click();
-        })()`);
-        await sleep(250);
-        continue;
-      }
-
       const readyByNodes = (snap?.count || 0) > 0;
       const fallbackWaited = !!snap?.usedFallback && (Date.now() - start >= 2500);
       const fallbackStableLongEnough = txt.length > 0 && (Date.now() - lastChange >= Math.max(dynamicStableMs, 5000));
       const done =
-        (!generating && stopGoneLongEnough && snap?.sendEnabled && stable && txt.length > 0 && (readyByNodes || fallbackWaited)) ||
-        (!generating && fallbackStableLongEnough && (readyByNodes || fallbackWaited));
+        (!generating && !snap?.hasContinue && stopGoneLongEnough && snap?.sendEnabled && stable && txt.length > 0 && (readyByNodes || fallbackWaited)) ||
+        (!generating && !snap?.hasContinue && fallbackStableLongEnough && (readyByNodes || fallbackWaited));
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
@@ -1582,7 +1571,7 @@ export class ChatGPTController {
       await this.#attachFiles(attachments);
       await this.#typePrompt(prompt, { human: false });
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 8 * 60_000) });
+      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 45 * 60_000) });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

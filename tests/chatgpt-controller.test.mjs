@@ -400,6 +400,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   const inserted = [];
   let requestSubmitCount = 0;
   let promptChecks = 0;
+  let responseChecks = 0;
   const page = {
     async navigate() {},
     async getUrl() { return 'https://chatgpt.com/'; },
@@ -416,7 +417,8 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
       }
       if (js.includes('const codes =')) return { codeBlocks: [] };
       if (js.includes('const nodes = Array.from(document.querySelectorAll')) {
-        return { stop: false, sendEnabled: true, txt: 'done', count: 1, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false };
+        responseChecks += 1;
+        return { stop: false, sendEnabled: true, txt: 'done', count: 1, usedFallback: false, hasError: false, hasContinue: responseChecks < 2, hasRegenerate: false };
       }
       throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     },
@@ -441,6 +443,11 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   assert.equal(result.text, 'done');
   assert.deepEqual(inserted, [prompt]);
   assert.equal(requestSubmitCount, 1);
+});
+
+test('chatgpt-controller: public query allows the full 45-minute response window', () => {
+  const source = readFileSync(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
+  assert.match(source, /Math\.min\(timeoutMs, 45 \* 60_000\)/);
 });
 
 test('chatgpt-controller: strict review submits with one send control and returns two stable exact-message snapshots', async () => {
