@@ -34,6 +34,7 @@ registerTool(
       'Send a prompt to a local Agentify Desktop browser session and return the latest assistant response. If a CAPTCHA/login challenge appears, the browser window will ask for user intervention and resume automatically.',
     inputSchema: {
       model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
+      expectedModel: z.string().optional().describe('Exact visible reviewer model to select before sending (e.g., "GPT-5.6 Pro").'),
       tabId: z.string().optional().describe('Tab/session id to use (for parallel jobs).'),
       key: z.string().optional().describe('Stable tab key (e.g., project name); creates a tab if missing.'),
       bundleName: z.string().optional().describe('Named context bundle to merge into this query before sending.'),
@@ -53,6 +54,7 @@ registerTool(
   },
   async ({
     model,
+    expectedModel,
     tabId,
     key,
     bundleName,
@@ -79,6 +81,7 @@ registerTool(
       body: {
         source: 'mcp',
         model,
+        expectedModel,
         tabId,
         key,
         bundleName,

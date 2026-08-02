@@ -868,6 +868,7 @@ export function startHttpApi({
         const attachments = Array.isArray(body.attachments) ? body.attachments.map(String) : [];
         const contextPaths = Array.isArray(body.contextPaths) ? body.contextPaths.map(String) : [];
         const promptPrefix = String(body.promptPrefix || '');
+        const expectedModel = String(body.expectedModel || '').trim();
         const bundleName = String(body.bundleName || '').trim() || null;
         const op = {
           id: crypto.randomUUID(),
@@ -930,6 +931,7 @@ export function startHttpApi({
               controller.query({
                 prompt: packed.prompt,
                 attachments: packed.attachments,
+                expectedModel,
                 timeoutMs,
                 onProgress: (patch) => patchActiveQuery(tabId, patch)
               })

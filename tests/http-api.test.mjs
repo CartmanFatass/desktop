@@ -768,10 +768,11 @@ test('http-api: query packs context paths before forwarding to controller', asyn
     token: 'secret',
     method: 'POST',
     pth: '/query',
-    body: { prompt: 'Summarize this project.', contextPaths: [dir], attachments: [] }
+    body: { prompt: 'Summarize this project.', expectedModel: 'GPT-5.6 Pro', contextPaths: [dir], attachments: [] }
   });
 
   assert.equal(r.res.status, 200);
+  assert.equal(seen?.expectedModel, 'GPT-5.6 Pro');
   assert.match(String(seen?.prompt || ''), /Packed Context Summary/);
   assert.ok(Array.isArray(seen?.attachments));
   assert.ok(seen.attachments.some((p) => p.endsWith('image.png')));
