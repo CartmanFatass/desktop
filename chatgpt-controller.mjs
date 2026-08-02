@@ -66,6 +66,10 @@ function reviewConversationId(value) {
   }
 }
 
+function provisionalChatgptConversationId(value) {
+  return typeof value === 'string' && value.startsWith('WEB:');
+}
+
 export function serializeReviewComposer(root) {
   const inlineTags = new Set([
     'A', 'B', 'CODE', 'EM', 'I', 'MARK', 'S', 'SMALL', 'SPAN', 'STRONG',
@@ -1173,6 +1177,7 @@ export class ChatGPTController {
   }
 
   async #waitForReviewUserMessage({ baselineIds, deadline, identity, firstBinding = false }) {
+    let submittedUserMessageId = null;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
@@ -1188,7 +1193,16 @@ export class ChatGPTController {
       const newUserMessages = (snapshot.messages || []).filter(
         (message) => message.role === 'user' && !baselineIds.has(message.id)
       );
-      if (newUserMessages.length) return { snapshot, message: newUserMessages.at(-1) };
+      if (newUserMessages.length) {
+        submittedUserMessageId ||= newUserMessages.at(-1).id;
+        const message = newUserMessages.find((candidate) => candidate.id === submittedUserMessageId);
+        if (!message) throw new Error('review_user_message_identity_unreadable');
+        if (firstBinding && provisionalChatgptConversationId(snapshot.conversationId)) {
+          await sleep(400);
+          continue;
+        }
+        return { snapshot, message };
+      }
       await sleep(400);
     }
     throw new Error('review_user_message_identity_unreadable');
@@ -1349,10 +1363,31 @@ export class ChatGPTController {
 
   async observeReviewResponse({ expectedUrl, expectedConversationId, expectedModel, userMessageId, timeoutMs }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
+    let identity = { expectedUrl, expectedConversationId, expectedModel };
+    while (provisionalChatgptConversationId(identity.expectedConversationId) && Date.now() < deadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot(expectedModel);
+      const sameUser = (snapshot.messages || []).some(
+        (candidate) => candidate.role === 'user' && candidate.id === userMessageId
+      );
+      if (
+        sameUser &&
+        snapshot.url?.startsWith('https://chatgpt.com/c/') &&
+        snapshot.conversationId &&
+        !provisionalChatgptConversationId(snapshot.conversationId)
+      ) {
+        identity = { expectedUrl: snapshot.url, expectedConversationId: snapshot.conversationId, expectedModel };
+        break;
+      }
+      await sleep(400);
+    }
+    if (provisionalChatgptConversationId(identity.expectedConversationId)) {
+      throw new Error('review_first_binding_canonical_identity_unreadable');
+    }
     return await this.#waitForReviewAssistant({
       userMessageId,
       deadline,
-      identity: { expectedUrl, expectedConversationId, expectedModel }
+      identity
     });
   }
 

@@ -97,6 +97,10 @@ function conversationIdentityFromUrl(value) {
   return { provider, conversationId: parts[marker + 1] };
 }
 
+function provisionalChatgptConversationId(value) {
+  return typeof value === 'string' && value.startsWith('WEB:');
+}
+
 function normalizeRequest(input) {
   const request = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const stableKey = requiredText(request.stableKey, 'stableKey', { max: 128 });
@@ -489,7 +493,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       ? { ...request, conversationUrl: execution.result.conversationUrl, conversationId: execution.result.conversationId }
       : request;
     const validated = validateResult(execution.result, resultRequest, execution.expectedUserMessageId);
-    return await mutateState(stateDir, async (state) => {
+    let canonicalizedExistingBinding = false;
+    const completed = await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (op.sendCount > 1) fail('review_send_receipt_invalid');
@@ -502,8 +507,20 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         completedAt: Date.now(),
         updatedAt: Date.now()
       });
+      if (request.firstBinding && provisionalChatgptConversationId(state.bindings[request.stableKey]?.conversationId)) {
+        const binding = state.bindings[request.stableKey];
+        if (!binding || binding.provider !== request.provider || binding.model !== request.model) {
+          fail('review_binding_mismatch');
+        }
+        binding.conversationUrl = validated.conversationUrl;
+        binding.conversationId = validated.conversationId;
+        binding.updatedAt = Date.now();
+        canonicalizedExistingBinding = true;
+      }
       return { ...op };
     });
+    if (canonicalizedExistingBinding) tabs.updateTabUrl(tabId, validated.conversationUrl);
+    return completed;
   } catch (error) {
     if (request.diagnoseExisting) throw error;
     let safeErrorData = sanitizeReviewErrorData(error?.data);

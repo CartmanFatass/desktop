@@ -498,6 +498,7 @@ test('chatgpt-controller: first binding pastes once and follows the created Chat
   let currentUrl = 'https://chatgpt.com/';
   let strictClicks = 0;
   let insertCalls = 0;
+  let postSendSnapshots = 0;
   const page = {
     async getUrl() { return currentUrl; },
     async evaluate(js) {
@@ -506,10 +507,13 @@ test('chatgpt-controller: first binding pastes once and follows the created Chat
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
         strictClicks += 1;
-        currentUrl = 'https://chatgpt.com/c/created-conversation';
+        currentUrl = 'https://chatgpt.com/c/WEB:temporary-conversation';
         return { ok: true, clickCount: 1, label: 'Send prompt' };
       }
       if (js.includes('reviewSnapshotMarker')) {
+        if (strictClicks && ++postSendSnapshots >= 2) {
+          currentUrl = 'https://chatgpt.com/c/created-conversation';
+        }
         return {
           messages: strictClicks ? [
             { order: 0, role: 'user', id: 'created-user', text: prompt },

@@ -14,6 +14,8 @@ async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
   const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
+  let failAfterSubmittedReceipt = false;
+  let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
   let reviewFailure = null;
   let sendControlFailure = null;
   let diagnosticResult = null;
@@ -80,8 +82,8 @@ async function fixture() {
     },
     async reviewQuery(args) {
       calls.review += 1;
-      const submittedUrl = args.firstBinding ? 'https://chatgpt.com/c/first-bound' : args.expectedUrl;
-      const submittedId = args.firstBinding ? 'first-bound' : args.expectedConversationId;
+      const submittedUrl = args.firstBinding ? firstBindingSubmittedUrl : args.expectedUrl;
+      const submittedId = args.firstBinding ? firstBindingSubmittedUrl.split('/').at(-1) : args.expectedConversationId;
       await args.onPrepared({
         baselineMessageIds: ['historical-user-1'],
         preparedAt: 50,
@@ -105,6 +107,7 @@ async function fixture() {
         modelEvidence: 'GPT-5.6 Pro',
         ...exactIdentityFields()
       });
+      if (failAfterSubmittedReceipt) throw new Error('simulated_crash_after_submitted_receipt');
       return {
         userMessageId: 'user-1',
         assistantMessageId: 'assistant-1',
@@ -121,6 +124,12 @@ async function fixture() {
     },
     async observeReviewResponse(args) {
       calls.observe += 1;
+      const recoveredUrl = args.expectedConversationId?.startsWith('WEB:')
+        ? 'https://chatgpt.com/c/canonical-bound'
+        : args.expectedUrl;
+      const recoveredId = args.expectedConversationId?.startsWith('WEB:')
+        ? 'canonical-bound'
+        : args.expectedConversationId;
       return {
         userMessageId: args.userMessageId,
         assistantMessageId: 'assistant-1',
@@ -130,8 +139,8 @@ async function fixture() {
           { observedAt: 8100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
         ],
         controls: { stop: false, continue: false, retry: false, answerNow: false },
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
+        conversationUrl: recoveredUrl,
+        conversationId: recoveredId,
         modelEvidence: 'GPT-5.6 Pro'
       };
     },
@@ -206,6 +215,12 @@ async function fixture() {
     request,
     setFailBeforeSubmittedReceipt(value) {
       failBeforeSubmittedReceipt = !!value;
+    },
+    setFailAfterSubmittedReceipt(value) {
+      failAfterSubmittedReceipt = !!value;
+    },
+    setFirstBindingSubmittedUrl(value) {
+      firstBindingSubmittedUrl = value;
     },
     setReviewFailure(error, diagnostic) {
       reviewFailure = error;
@@ -429,6 +444,41 @@ test('review transport: first ChatGPT binding captures the created conversation 
   const state = await readReviewTransportState(f.stateDir);
   assert.equal(state.bindings['first-binding-key'].conversationId, 'first-bound');
   assert.equal(state.operations['first-binding-op'].conversationId, 'first-bound');
+});
+
+test('review transport: a submitted provisional first binding adopts the canonical identity without another send', async () => {
+  const f = await fixture();
+  const request = {
+    ...f.request,
+    stableKey: 'first-binding-recovery-key',
+    idempotencyKey: 'first-binding-recovery-op',
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    firstBinding: true
+  };
+  f.setFirstBindingSubmittedUrl('https://chatgpt.com/c/WEB:temporary-bound');
+  f.setFailAfterSubmittedReceipt(true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }),
+    /simulated_crash_after_submitted_receipt/
+  );
+  const blocked = await readReviewTransportState(f.stateDir);
+  assert.equal(blocked.operations[request.idempotencyKey].sendCount, 1);
+  assert.equal(blocked.operations[request.idempotencyKey].userMessageId, 'user-1');
+  assert.equal(blocked.operations[request.idempotencyKey].conversationId, 'WEB:temporary-bound');
+
+  f.setFailAfterSubmittedReceipt(false);
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  assert.equal(receipt.status, 'COMPLETE');
+  assert.equal(receipt.sendCount, 1);
+  assert.equal(receipt.conversationUrl, 'https://chatgpt.com/c/canonical-bound');
+  assert.equal(receipt.conversationId, 'canonical-bound');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+  assert.deepEqual(f.calls.update, [
+    { tabId: 'tab-1', url: 'https://chatgpt.com/c/WEB:temporary-bound' },
+    { tabId: 'tab-1', url: 'https://chatgpt.com/c/canonical-bound' }
+  ]);
 });
 
 test('review transport: Gemini uses the same strict receipt lifecycle with provider-specific identity', async () => {
