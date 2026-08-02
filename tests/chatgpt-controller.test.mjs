@@ -423,9 +423,10 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
       if (js.includes('const codes =')) return { codeBlocks: [] };
       if (js.includes('const nodes = Array.from(document.querySelectorAll')) {
         responseChecks += 1;
-        return responseChecks < 2
-          ? { stop: false, sendEnabled: true, txt: 'old response', count: 1, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false }
-          : { stop: false, sendEnabled: true, txt: 'done', count: 2, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false };
+        if (responseChecks < 2) {
+          return { stop: false, sendEnabled: true, txt: 'old response', count: 1, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false, hasAnswerNow: false };
+        }
+        return { stop: false, sendEnabled: true, txt: 'done', count: 2, usedFallback: false, hasError: false, hasContinue: false, hasRegenerate: false, hasAnswerNow: responseChecks < 4 };
       }
       throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     },
@@ -451,7 +452,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   assert.deepEqual(inserted, [prompt]);
   assert.equal(requestSubmitCount, 1);
   assert.equal(baselineChecks, 1);
-  assert.ok(responseChecks >= 2);
+  assert.ok(responseChecks >= 4);
 });
 
 test('chatgpt-controller: public query allows the full 45-minute response window', () => {
