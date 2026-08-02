@@ -1579,6 +1579,35 @@ export class ChatGPTController {
     }
   }
 
+  async waitForCurrentResponse({ timeoutMs = 45 * 60_000, onProgress = null } = {}) {
+    const run = { kind: 'wait_response', requested: false, requestedAt: null, reason: null, onProgress };
+    this.currentRun = run;
+    try {
+      const assistantSel = JSON.stringify(this.selectors.assistantMessage);
+      const stopSel = JSON.stringify(this.selectors.stopButton);
+      const sendSel = JSON.stringify(this.selectors.sendButton);
+      const initial = await this.#eval(`(() => {
+        const stop = !!document.querySelector(${stopSel});
+        const send = Array.from(document.querySelectorAll(${sendSel})).find((n) => {
+          const r = n.getBoundingClientRect();
+          const style = window.getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        });
+        const generating = stop && send ? !!send.disabled : stop;
+        const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
+        const hasAnswerNow = Array.from(document.querySelectorAll('button, a')).some(b => /answer now/i.test((b.textContent||'').trim()));
+        return { count: document.querySelectorAll(${assistantSel}).length, active: generating || hasContinue || hasAnswerNow };
+      })()`);
+      if (!initial?.active) throw new Error('no_active_response');
+      return await this.#waitForAssistantStable({
+        timeoutMs: Math.min(timeoutMs, 45 * 60_000),
+        baselineAssistantCount: Math.max(0, Number(initial.count || 0) - 1)
+      });
+    } finally {
+      if (this.currentRun === run) this.currentRun = null;
+    }
+  }
+
   async send({ text, timeoutMs = 3 * 60_000, stopAfterSend = false, onProgress = null } = {}) {
     const prompt = String(text || '');
     if (!prompt.trim()) throw new Error('missing_prompt');

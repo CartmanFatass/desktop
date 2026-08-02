@@ -191,6 +191,33 @@ registerTool(
 );
 
 registerTool(
+  'agentify_wait_response',
+  {
+    description: 'Wait for the currently generating assistant response on an existing Agentify tab and return it after natural completion. This tool never sends a prompt or activates a response control.',
+    inputSchema: {
+      model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
+      tabId: z.string().optional().describe('Existing tab/session id to use.'),
+      key: z.string().optional().describe('Existing stable tab key to use.'),
+      timeoutMs: z.number().optional().describe('Maximum time to wait for natural completion.')
+    }
+  },
+  async ({ model, tabId, key, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/wait-response',
+      body: { model, tabId, key, timeoutMs: timeoutMs || 45 * 60_000 }
+    });
+    const text = data.result?.text || '';
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: { tabId: data.tabId || tabId || null, text, meta: data.result?.meta || null }
+    };
+  }
+);
+
+registerTool(
   'agentify_navigate',
   {
     description: 'Navigate the Agentify Desktop browser window to a URL (local UI automation).',

@@ -1061,6 +1061,16 @@ export function startHttpApi({
         return sendJson(res, 200, { ok: true, tabId, text });
       }
 
+      if (url.pathname === '/wait-response' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const timeoutMs = positiveIntOr(body.timeoutMs, 45 * 60_000, 45 * 60_000);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        assertTabNotBusy(tabId);
+        const controller = tabs.getControllerById(tabId);
+        const result = await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
       if (url.pathname === '/download-images' && req.method === 'POST') {
         const body = await parseBody(req);
         const maxImages = positiveIntOr(body.maxImages, 6, 50);

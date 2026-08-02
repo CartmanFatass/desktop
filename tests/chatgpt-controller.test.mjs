@@ -460,6 +460,54 @@ test('chatgpt-controller: public query allows the full 45-minute response window
   assert.match(source, /Math\.min\(timeoutMs, 45 \* 60_000\)/);
 });
 
+test('chatgpt-controller: wait response observes one active answer without sending', async () => {
+  let responseChecks = 0;
+  let insertCalls = 0;
+  let sendCalls = 0;
+  const page = {
+    async navigate() {},
+    async getUrl() { return 'https://chatgpt.com/c/current'; },
+    async evaluate(js) {
+      if (js.includes('active: generating || hasContinue || hasAnswerNow')) {
+        return { count: 2, active: true };
+      }
+      if (js.includes('const codes =')) return { codeBlocks: [] };
+      if (js.includes('const nodes = Array.from(document.querySelectorAll')) {
+        responseChecks += 1;
+        return {
+          stop: false,
+          sendEnabled: true,
+          txt: 'completed current answer',
+          count: 2,
+          usedFallback: false,
+          hasError: false,
+          hasContinue: false,
+          hasRegenerate: false,
+          hasAnswerNow: responseChecks < 3
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
+    },
+    async insertText() { insertCalls += 1; },
+    async sendKey() { sendCalls += 1; }
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: {
+      promptTextarea: '#prompt-textarea',
+      sendButton: 'button[data-testid="send-button"]',
+      stopButton: 'button[data-testid="stop-button"]',
+      assistantMessage: '[data-message-author-role="assistant"]'
+    }
+  });
+
+  const result = await controller.waitForCurrentResponse({ timeoutMs: 6_000 });
+  assert.equal(result.text, 'completed current answer');
+  assert.equal(insertCalls, 0);
+  assert.equal(sendCalls, 0);
+  assert.ok(responseChecks >= 3);
+});
+
 test('chatgpt-controller: strict review submits with one send control and returns two stable exact-message snapshots', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   const prompt = 'x';

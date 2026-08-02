@@ -683,6 +683,11 @@ test('http-api: operations run through controller.runExclusive when available', 
       calls.push('query');
       return { text: 'ok' };
     },
+    waitForCurrentResponse: async () => {
+      assert.equal(inExclusive, true);
+      calls.push('waitForCurrentResponse');
+      return { text: 'waited' };
+    },
     readPageText: async () => {
       assert.equal(inExclusive, true);
       calls.push('readPageText');
@@ -718,10 +723,12 @@ test('http-api: operations run through controller.runExclusive when available', 
   await req({ port, token: 'secret', method: 'POST', pth: '/navigate', body: { url: 'https://chatgpt.com/' } });
   await req({ port, token: 'secret', method: 'POST', pth: '/ensure-ready', body: { timeoutMs: 1000 } });
   await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hi' } });
+  const waited = await req({ port, token: 'secret', method: 'POST', pth: '/wait-response', body: { timeoutMs: 1000 } });
   await req({ port, token: 'secret', method: 'POST', pth: '/read-page', body: { maxChars: 10 } });
   await req({ port, token: 'secret', method: 'POST', pth: '/download-images', body: { maxImages: 1 } });
 
-  assert.deepEqual(calls, ['navigate', 'ensureReady', 'query', 'readPageText', 'downloadLastAssistantImages']);
+  assert.equal(waited.data.result.text, 'waited');
+  assert.deepEqual(calls, ['navigate', 'ensureReady', 'query', 'waitForCurrentResponse', 'readPageText', 'downloadLastAssistantImages']);
 });
 
 test('http-api: query packs context paths before forwarding to controller', async (t) => {
