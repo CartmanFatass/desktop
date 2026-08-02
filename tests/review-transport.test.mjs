@@ -12,7 +12,7 @@ const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').dige
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, ensure: [] };
+  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
   let reviewFailure = null;
   let sendControlFailure = null;
@@ -80,6 +80,8 @@ async function fixture() {
     },
     async reviewQuery(args) {
       calls.review += 1;
+      const submittedUrl = args.firstBinding ? 'https://chatgpt.com/c/first-bound' : args.expectedUrl;
+      const submittedId = args.firstBinding ? 'first-bound' : args.expectedConversationId;
       await args.onPrepared({
         baselineMessageIds: ['historical-user-1'],
         preparedAt: 50,
@@ -98,8 +100,8 @@ async function fixture() {
       await args.onSubmitted({
         userMessageId: 'user-1',
         submittedAt: 100,
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
+        conversationUrl: submittedUrl,
+        conversationId: submittedId,
         modelEvidence: 'GPT-5.6 Pro',
         ...exactIdentityFields()
       });
@@ -112,8 +114,8 @@ async function fixture() {
           { observedAt: 4100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
         ],
         controls: { stop: false, continue: false, retry: false, answerNow: false },
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
+        conversationUrl: submittedUrl,
+        conversationId: submittedId,
         modelEvidence: 'GPT-5.6 Pro'
       };
     },
@@ -175,6 +177,9 @@ async function fixture() {
     },
     getControllerById() {
       return controller;
+    },
+    updateTabUrl(tabId, url) {
+      calls.update.push({ tabId, url });
     }
   };
   const prompt = 'Return exactly SMOKE_OK.';
@@ -384,6 +389,43 @@ test('review transport: one send persists a complete receipt and duplicate retur
   const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   assert.equal(duplicate.status, 'COMPLETE');
   assert.equal(duplicate.operationId, first.operationId);
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: first ChatGPT binding captures the created conversation after one strict send', async () => {
+  const f = await fixture();
+  const request = {
+    ...f.request,
+    stableKey: 'first-binding-key',
+    idempotencyKey: 'first-binding-op',
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    firstBinding: true
+  };
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  assert.equal(receipt.conversationUrl, 'https://chatgpt.com/c/first-bound');
+  assert.equal(receipt.conversationId, 'first-bound');
+  assert.deepEqual(f.calls.update, [{ tabId: 'tab-1', url: 'https://chatgpt.com/c/first-bound' }]);
+  const state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings['first-binding-key'].conversationId, 'first-bound');
+  assert.equal(state.operations['first-binding-op'].conversationId, 'first-bound');
+});
+
+test('review transport: Gemini uses the same strict receipt lifecycle with provider-specific identity', async () => {
+  const f = await fixture();
+  const request = {
+    ...f.request,
+    stableKey: 'gemini-review-key',
+    idempotencyKey: 'gemini-review-op',
+    provider: 'gemini',
+    model: 'Gemini 2.5 Pro',
+    conversationUrl: 'https://gemini.google.com/app/gemini-conversation',
+    conversationId: 'gemini-conversation'
+  };
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  assert.equal(receipt.provider, 'gemini');
+  assert.equal(receipt.conversationId, 'gemini-conversation');
+  assert.equal(f.calls.ensure[0].vendorName, 'Gemini');
   assert.equal(f.calls.review, 1);
 });
 

@@ -111,3 +111,21 @@ test('tab-manager: repeated exact stable binding reuses one live tab session', a
   assert.equal(sessionCreates, 1);
   assert.equal(manager.listTabs().length, 1);
 });
+
+test('tab-manager: first binding updates the stable tab to the created conversation URL', async () => {
+  const browserBackend = {
+    async createSession() {
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({ key: 'first-binding', vendorId: 'chatgpt', url: 'https://chatgpt.com/' });
+  manager.updateTabUrl(tabId, 'https://chatgpt.com/c/new-conversation');
+  assert.equal(manager.listTabs()[0].url, 'https://chatgpt.com/c/new-conversation');
+  assert.equal(await manager.ensureTab({
+    key: 'first-binding',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/new-conversation',
+    exactUrl: true
+  }), tabId);
+});

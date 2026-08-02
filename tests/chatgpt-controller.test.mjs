@@ -470,6 +470,87 @@ test('chatgpt-controller: strict review submits with one send control and return
   assert.equal(result.controls.answerNow, true);
 });
 
+test('chatgpt-controller: first binding pastes once and follows the created ChatGPT conversation', async () => {
+  const prompt = 'raw scientific question';
+  let currentUrl = 'https://chatgpt.com/';
+  let strictClicks = 0;
+  let insertCalls = 0;
+  const page = {
+    async getUrl() { return currentUrl; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('observedLengths')) return { ok: true, observedLengths: [prompt.length], expectedLength: prompt.length };
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        currentUrl = 'https://chatgpt.com/c/created-conversation';
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: strictClicks ? [
+            { order: 0, role: 'user', id: 'created-user', text: prompt },
+            { order: 1, role: 'assistant', id: 'created-assistant', text: 'CREATED_OK' }
+          ] : [],
+          modelEvidence: 'GPT-5.6 Pro',
+          modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async sendKey() {},
+    async insertText(text) { insertCalls += 1; assert.equal(text, prompt); },
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  let submitted = null;
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/',
+    expectedConversationId: '__new__',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000,
+    firstBinding: true,
+    onSubmitted: async (value) => { submitted = value; }
+  });
+  assert.equal(insertCalls, 1);
+  assert.equal(strictClicks, 1);
+  assert.equal(submitted.conversationId, 'created-conversation');
+  assert.equal(result.conversationUrl, 'https://chatgpt.com/c/created-conversation');
+});
+
+test('chatgpt-controller: strict review recognizes a Gemini app conversation identity', async () => {
+  const url = 'https://gemini.google.com/app/gemini-review';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      assert.equal(js.includes('reviewSnapshotMarker'), true);
+      return {
+        messages: [{ order: 0, role: 'user', id: 'gemini-user', text: 'question', textLength: 8, textIdentityReadable: true }],
+        modelEvidence: 'Gemini 2.5 Pro',
+        modelEvidenceCandidates: ['Gemini 2.5 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.inspectReviewSubmissionIdentity({
+    prompt: 'question',
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'gemini-review',
+    expectedModel: 'Gemini 2.5 Pro'
+  });
+  assert.equal(result.ok, true);
+});
+
 test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
   const url = 'https://chatgpt.com/c/conversation-structural';
   const prompt = 'alpha\n\nbeta';

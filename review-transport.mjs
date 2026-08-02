@@ -76,20 +76,25 @@ export function sanitizeReviewErrorData(value) {
   return Object.keys(output).length ? output : null;
 }
 
-function conversationIdFromUrl(value) {
+function conversationIdentityFromUrl(value) {
   let parsed;
   try {
     parsed = new URL(value);
   } catch {
     fail('review_invalid_request', { field: 'conversationUrl' });
   }
-  if (parsed.protocol !== 'https:' || parsed.hostname !== 'chatgpt.com') {
+  const provider = parsed.hostname === 'chatgpt.com'
+    ? 'chatgpt'
+    : parsed.hostname === 'gemini.google.com'
+      ? 'gemini'
+      : null;
+  if (parsed.protocol !== 'https:' || !provider || parsed.search || parsed.hash) {
     fail('review_invalid_request', { field: 'conversationUrl' });
   }
   const parts = parsed.pathname.split('/').filter(Boolean);
-  const marker = parts.lastIndexOf('c');
+  const marker = parts.lastIndexOf(provider === 'chatgpt' ? 'c' : 'app');
   if (marker < 0 || marker + 1 >= parts.length) fail('review_invalid_request', { field: 'conversationUrl' });
-  return parts[marker + 1];
+  return { provider, conversationId: parts[marker + 1] };
 }
 
 function normalizeRequest(input) {
@@ -98,12 +103,20 @@ function normalizeRequest(input) {
   const idempotencyKey = requiredText(request.idempotencyKey, 'idempotencyKey', { max: 128 });
   if (!KEY_RE.test(stableKey) || !KEY_RE.test(idempotencyKey)) fail('review_invalid_request', { field: 'key' });
   const provider = requiredText(request.provider, 'provider', { max: 64 }).toLowerCase();
-  if (provider !== 'chatgpt') fail('review_invalid_request', { field: 'provider' });
+  if (!['chatgpt', 'gemini'].includes(provider)) fail('review_invalid_request', { field: 'provider' });
   const model = requiredText(request.model, 'model', { max: 128 });
   const conversationUrl = requiredText(request.conversationUrl, 'conversationUrl', { max: 2048 });
   const conversationId = requiredText(request.conversationId, 'conversationId', { max: 256 });
-  if (conversationIdFromUrl(conversationUrl) !== conversationId) {
-    fail('review_conversation_identity_mismatch');
+  const firstBinding = request.firstBinding === true;
+  if (firstBinding) {
+    if (provider !== 'chatgpt' || conversationUrl !== 'https://chatgpt.com/' || conversationId !== '__new__') {
+      fail('review_invalid_request', { field: 'firstBinding' });
+    }
+  } else {
+    const identity = conversationIdentityFromUrl(conversationUrl);
+    if (identity.provider !== provider || identity.conversationId !== conversationId) {
+      fail('review_conversation_identity_mismatch');
+    }
   }
   const prompt = requiredExactText(request.prompt, 'prompt', { max: 200_000 });
   const promptSha256 = sha256(prompt);
@@ -125,7 +138,8 @@ function normalizeRequest(input) {
     promptSha256,
     timeoutMs,
     verifyExisting,
-    diagnoseExisting
+    diagnoseExisting,
+    firstBinding
   };
 }
 
@@ -139,7 +153,8 @@ function requestFingerprint(request) {
       conversationId: request.conversationId,
       idempotencyKey: request.idempotencyKey,
       promptSha256: request.promptSha256,
-      timeoutMs: request.timeoutMs
+      timeoutMs: request.timeoutMs,
+      firstBinding: request.firstBinding
     })
   );
 }
@@ -247,12 +262,16 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       conversationUrl: request.conversationUrl,
       conversationId: request.conversationId
     };
-    if (binding && !sameBinding(binding, request)) fail('review_binding_mismatch');
-    if (!binding) state.bindings[request.stableKey] = { ...expectedBinding, createdAt: now, updatedAt: now };
     const existing = state.operations[request.idempotencyKey];
     if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+    if (request.firstBinding) {
+      if (binding && !existing) fail('review_binding_mismatch');
+    } else {
+      if (binding && !sameBinding(binding, request)) fail('review_binding_mismatch');
+      if (!binding) state.bindings[request.stableKey] = { ...expectedBinding, createdAt: now, updatedAt: now };
+    }
     if (request.diagnoseExisting && !existing) fail('review_diagnostic_operation_missing');
-    if (existing) return { existing: true, operation: { ...existing } };
+    if (existing) return { existing: true, operation: { ...existing }, binding: binding ? { ...binding } : null };
     const operation = {
       operationId: crypto.randomUUID(),
       idempotencyKey: request.idempotencyKey,
@@ -274,7 +293,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       updatedAt: now
     };
     state.operations[request.idempotencyKey] = operation;
-    return { existing: false, operation: { ...operation } };
+    return { existing: false, operation: { ...operation }, binding: null };
   });
 
   if (
@@ -283,12 +302,13 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     !request.verifyExisting &&
     !request.diagnoseExisting
   ) return intake.operation;
+  const liveIdentity = intake.binding || request;
   const tabId = await tabs.ensureTab({
     key: request.stableKey,
     name: request.stableKey,
-    url: request.conversationUrl,
+    url: liveIdentity.conversationUrl,
     vendorId: request.provider,
-    vendorName: 'ChatGPT',
+    vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT',
     show: false,
     exactUrl: true
   });
@@ -298,6 +318,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
 
   const onSubmitted = async (submitted) => {
     const userMessageId = requiredText(submitted?.userMessageId, 'userMessageId', { max: 512 });
+    const submittedUrl = requiredText(submitted?.conversationUrl, 'conversationUrl', { max: 2048 });
+    const submittedId = requiredText(submitted?.conversationId, 'conversationId', { max: 256 });
+    const submittedIdentity = conversationIdentityFromUrl(submittedUrl);
+    if (submittedIdentity.provider !== request.provider || submittedIdentity.conversationId !== submittedId) {
+      fail('review_conversation_identity_mismatch');
+    }
+    if (!request.firstBinding && (submittedUrl !== request.conversationUrl || submittedId !== request.conversationId)) {
+      fail('review_conversation_identity_mismatch');
+    }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
@@ -305,11 +334,26 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.status = 'SUBMITTED';
       op.sendCount = 1;
       op.userMessageId = userMessageId;
+      op.conversationUrl = submittedUrl;
+      op.conversationId = submittedId;
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
       op.modelEvidence = submitted?.modelEvidence || null;
       op.updatedAt = Date.now();
+      if (request.firstBinding) {
+        const now = Date.now();
+        state.bindings[request.stableKey] = {
+          stableKey: request.stableKey,
+          provider: request.provider,
+          model: request.model,
+          conversationUrl: submittedUrl,
+          conversationId: submittedId,
+          createdAt: now,
+          updatedAt: now
+        };
+      }
     });
+    if (request.firstBinding) tabs.updateTabUrl(tabId, submittedUrl);
   };
 
   const onSendAction = async (action) => {
@@ -372,8 +416,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         const diagnostic = await controller.inspectReviewSubmissionIdentity({
           prompt: request.prompt,
           baselineMessageIds: currentOperation.baselineMessageIds,
-          expectedUrl: request.conversationUrl,
-          expectedConversationId: request.conversationId,
+          expectedUrl: currentOperation.conversationUrl,
+          expectedConversationId: currentOperation.conversationId,
           expectedModel: request.model
         });
         return { diagnosticOnly: true, diagnostic };
@@ -386,8 +430,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       const result = intake.existing
         ? currentOperation.userMessageId
           ? await controller.observeReviewResponse({
-          expectedUrl: request.conversationUrl,
-          expectedConversationId: request.conversationId,
+          expectedUrl: currentOperation.conversationUrl,
+          expectedConversationId: currentOperation.conversationId,
           expectedModel: request.model,
           userMessageId: currentOperation.userMessageId,
           timeoutMs: remainingMs
@@ -401,7 +445,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           timeoutMs: remainingMs,
           onPrepared,
           onSendAction,
-          onSubmitted
+          onSubmitted,
+          firstBinding: request.firstBinding
         });
       return { result, expectedUserMessageId: currentOperation.userMessageId || null };
     });
@@ -426,7 +471,10 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       });
     }
     if (execution.completedOperation) return execution.completedOperation;
-    const validated = validateResult(execution.result, request, execution.expectedUserMessageId);
+    const resultRequest = request.firstBinding
+      ? { ...request, conversationUrl: execution.result.conversationUrl, conversationId: execution.result.conversationId }
+      : request;
+    const validated = validateResult(execution.result, resultRequest, execution.expectedUserMessageId);
     return await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');

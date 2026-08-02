@@ -36,6 +36,18 @@ export function deduplicateReviewModelEvidence(values) {
   return [...unique.values()];
 }
 
+function reviewConversationId(value) {
+  try {
+    const parsed = new URL(value);
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const marker = parsed.hostname === 'chatgpt.com' ? 'c' : parsed.hostname === 'gemini.google.com' ? 'app' : null;
+    const index = marker ? parts.lastIndexOf(marker) : -1;
+    return index >= 0 && index + 1 < parts.length ? parts[index + 1] : null;
+  } catch {
+    return null;
+  }
+}
+
 export function serializeReviewComposer(root) {
   const inlineTags = new Set([
     'A', 'B', 'CODE', 'EM', 'I', 'MARK', 'S', 'SMALL', 'SPAN', 'STRONG',
@@ -1075,12 +1087,7 @@ export class ChatGPTController {
         sendVisible: sendCandidates.length > 0
       };
     })()`);
-    let conversationId = null;
-    try {
-      const parts = new URL(url).pathname.split('/').filter(Boolean);
-      const marker = parts.lastIndexOf('c');
-      if (marker >= 0 && marker + 1 < parts.length) conversationId = parts[marker + 1];
-    } catch {}
+    const conversationId = reviewConversationId(url);
     const controls = classifyReviewControls(dom?.controlText, {
       selectorStop: !!dom?.selectorStop,
       sendVisible: !!dom?.sendVisible
@@ -1088,7 +1095,8 @@ export class ChatGPTController {
     return { url, conversationId, ...(dom || {}), controls };
   }
 
-  #assertReviewIdentity(snapshot, { expectedUrl, expectedConversationId, expectedModel }) {
+  #assertReviewIdentity(snapshot, { expectedUrl, expectedConversationId, expectedModel, allowUnboundRoot = false }) {
+    if (allowUnboundRoot && snapshot?.url === expectedUrl && !snapshot?.conversationId) return;
     if (snapshot?.url !== expectedUrl || snapshot?.conversationId !== expectedConversationId) {
       const error = new Error('review_conversation_identity_mismatch');
       error.data = { url: snapshot?.url || null, conversationId: snapshot?.conversationId || null };
@@ -1128,11 +1136,19 @@ export class ChatGPTController {
     return result;
   }
 
-  async #waitForReviewUserMessage({ baselineIds, deadline, identity }) {
+  async #waitForReviewUserMessage({ baselineIds, deadline, identity, firstBinding = false }) {
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
-      this.#assertReviewIdentity(snapshot, identity);
+      if (firstBinding) {
+        if (snapshot.url === identity.expectedUrl && !snapshot.conversationId) {
+          await sleep(400);
+          continue;
+        }
+        if (!snapshot.conversationId) throw new Error('review_conversation_identity_mismatch');
+      } else {
+        this.#assertReviewIdentity(snapshot, identity);
+      }
       const newUserMessages = (snapshot.messages || []).filter(
         (message) => message.role === 'user' && !baselineIds.has(message.id)
       );
@@ -1239,11 +1255,12 @@ export class ChatGPTController {
     timeoutMs,
     onPrepared,
     onSendAction,
-    onSubmitted
+    onSubmitted,
+    firstBinding = false
   }) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     const deadline = Date.now() + Number(timeoutMs || 0);
-    const identity = { expectedUrl, expectedConversationId, expectedModel };
+    const identity = { expectedUrl, expectedConversationId, expectedModel, allowUnboundRoot: firstBinding };
     const run = { kind: 'review_query', requested: false, requestedAt: null, reason: null, onProgress: null };
     this.currentRun = run;
     try {
@@ -1271,7 +1288,12 @@ export class ChatGPTController {
         sendActionCount: 1,
         sendActionAt: Date.now()
       });
-      const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity });
+      const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity, firstBinding });
+      const submittedIdentity = {
+        expectedUrl: submitted.snapshot.url,
+        expectedConversationId: submitted.snapshot.conversationId,
+        expectedModel
+      };
       await onSubmitted?.({
         userMessageId: submitted.message.id,
         submittedAt: Date.now(),
@@ -1279,7 +1301,11 @@ export class ChatGPTController {
         conversationId: submitted.snapshot.conversationId,
         modelEvidence: submitted.snapshot.modelEvidence
       });
-      return await this.#waitForReviewAssistant({ userMessageId: submitted.message.id, deadline, identity });
+      return await this.#waitForReviewAssistant({
+        userMessageId: submitted.message.id,
+        deadline,
+        identity: firstBinding ? submittedIdentity : identity
+      });
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

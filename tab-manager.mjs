@@ -127,6 +127,16 @@ export class TabManager {
     return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
   }
 
+  updateTabUrl(id, url) {
+    const tab = this.tabs.get(id);
+    if (!tab) throw new Error('tab_not_found');
+    const nextUrl = String(url || '').trim();
+    if (!nextUrl) throw new Error('missing_url');
+    tab.url = nextUrl;
+    tab.lastUsedAt = Date.now();
+    this.onChanged?.();
+  }
+
   listTabs() {
     const out = [];
     for (const t of this.tabs.values()) {
