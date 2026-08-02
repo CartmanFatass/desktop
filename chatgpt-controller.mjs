@@ -1072,23 +1072,28 @@ export class ChatGPTController {
     if (!opened?.ok) throw new Error(opened?.error || 'model_switcher_unavailable');
     await sleep(250);
 
-    const chosen = await this.#eval(`(() => {
-      const agentifyChooseModelMarker = true;
-      const visible = (node) => {
-        const rect = node?.getBoundingClientRect?.();
-        const style = node ? window.getComputedStyle(node) : null;
-        return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
-      };
-      const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
-      const expected = ${JSON.stringify(expected)};
-      const candidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
-        .filter(visible)
-        .filter((node) => canonical(node.textContent || node.getAttribute('aria-label') || '') === canonical(expected));
-      const target = candidates[0] || null;
-      if (!target) return { ok: false, error: 'expected_model_unavailable' };
-      target.click();
-      return { ok: true };
-    })()`);
+    let chosen = null;
+    while (Date.now() < deadline) {
+      chosen = await this.#eval(`(() => {
+        const agentifyChooseModelMarker = true;
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+        };
+        const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
+        const expected = ${JSON.stringify(expected)};
+        const candidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
+          .filter(visible)
+          .filter((node) => canonical(node.textContent || node.getAttribute('aria-label') || '') === canonical(expected));
+        const target = candidates[0] || null;
+        if (!target) return { ok: false, error: 'expected_model_unavailable' };
+        target.click();
+        return { ok: true };
+      })()`);
+      if (chosen?.ok) break;
+      await sleep(200);
+    }
     if (!chosen?.ok) throw new Error(chosen?.error || 'expected_model_unavailable');
 
     while (Date.now() < deadline) {
@@ -1646,7 +1651,7 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs });
-      await this.#ensureExpectedModel(expectedModel, Math.min(timeoutMs, 20_000));
+      await this.#ensureExpectedModel(expectedModel, Math.min(timeoutMs, 60_000));
       await this.#attachFiles(attachments);
       await this.#typePrompt(prompt, { human: false });
       const baselineAssistantCount = Number(await this.#eval(`(() => document.querySelectorAll(${JSON.stringify(this.selectors.assistantMessage)}).length)()`)) || 0;

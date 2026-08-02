@@ -423,6 +423,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
       if (js.includes('agentifyChooseModelMarker')) {
         assert.match(js, /menuitemradio/);
         modelOptionClicks += 1;
+        if (modelOptionClicks === 1) return { ok: false, error: 'expected_model_unavailable' };
         modelSelected = true;
         return { ok: true };
       }
@@ -472,13 +473,14 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   assert.equal(requestSubmitCount, 1);
   assert.equal(baselineChecks, 1);
   assert.equal(modelPickerClicks, 1);
-  assert.equal(modelOptionClicks, 1);
+  assert.equal(modelOptionClicks, 2);
   assert.ok(responseChecks >= 4);
 });
 
 test('chatgpt-controller: public query allows the full 45-minute response window', () => {
   const source = readFileSync(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
   assert.match(source, /Math\.min\(timeoutMs, 45 \* 60_000\)/);
+  assert.match(source, /#ensureExpectedModel\(expectedModel, Math\.min\(timeoutMs, 60_000\)\)/);
 });
 
 test('chatgpt-controller: public query never returns page chrome as an assistant response', () => {
