@@ -352,6 +352,58 @@ test('http-api: same-tab query/send requests are rejected while a run is already
   assert.equal(st2.data.runtime?.activeQueries?.length, 0);
 });
 
+test('http-api: wait-response joins the active query without a second controller action', async (t) => {
+  let releaseQuery = null;
+  let queryCalls = 0;
+  let waitCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      queryCalls += 1;
+      await new Promise((resolve) => {
+        releaseQuery = resolve;
+      });
+      return { text: 'joined result', codeBlocks: [], meta: {} };
+    },
+    waitForCurrentResponse: async () => {
+      waitCalls += 1;
+      return { text: 'wrong path', codeBlocks: [], meta: {} };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt', vendorName: 'ChatGPT' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'one send' } });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const wait = req({ port, token: 'secret', method: 'POST', pth: '/wait-response', body: { timeoutMs: 1000 } });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  releaseQuery?.();
+
+  const [queryResult, waitResult] = await Promise.all([query, wait]);
+  assert.equal(queryResult.res.status, 200);
+  assert.equal(waitResult.res.status, 200);
+  assert.equal(waitResult.data.result.text, 'joined result');
+  assert.equal(queryCalls, 1);
+  assert.equal(waitCalls, 0);
+});
+
 test('http-api: status invalid tabId returns 404', async (t) => {
   const tabs = {
     listTabs: () => [],

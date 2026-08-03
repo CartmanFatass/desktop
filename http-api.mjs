@@ -473,6 +473,7 @@ export function startHttpApi({
   // Governor state (per-desktop instance).
   const inflight = { queries: 0 };
   const activeQueries = new Map(); // tabId -> runtime status
+  const activeQueryRuns = new Map(); // tabId -> in-process query promise
   const activeScopes = new Map(); // request scope -> runtime status
   const lastOutcomes = new Map(); // tabId -> last finished outcome
   const lastQueryAt = new Map(); // tabId -> ms
@@ -927,7 +928,7 @@ export function startHttpApi({
             checkAndConsumeQueryBudget({ tabId, governor });
             inflight.queries += 1;
             const controller = tabs.getControllerById(tabId);
-            const result = await runExclusive(controller, async () =>
+            const queryPromise = runExclusive(controller, async () =>
               controller.query({
                 prompt: packed.prompt,
                 attachments: packed.attachments,
@@ -936,6 +937,8 @@ export function startHttpApi({
                 onProgress: (patch) => patchActiveQuery(tabId, patch)
               })
             );
+            activeQueryRuns.set(tabId, { id: op.id, promise: queryPromise });
+            const result = await queryPromise;
             setLastOutcome(tabId, {
               status: 'success',
               label: 'Response received',
@@ -958,6 +961,7 @@ export function startHttpApi({
             setLastOutcome(tabId, outcomeFromError(error, op));
             throw error;
           } finally {
+            if (activeQueryRuns.get(tabId)?.id === op.id) activeQueryRuns.delete(tabId);
             clearActiveQuery(tabId, op.id);
             inflight.queries = Math.max(0, inflight.queries - 1);
           }
@@ -1067,9 +1071,12 @@ export function startHttpApi({
         const body = await parseBody(req);
         const timeoutMs = positiveIntOr(body.timeoutMs, 45 * 60_000, 45 * 60_000);
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
-        assertTabNotBusy(tabId);
         const controller = tabs.getControllerById(tabId);
-        const result = await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
+        const activeRun = activeQueryRuns.get(tabId);
+        if (!activeRun) assertTabNotBusy(tabId);
+        const result = activeRun
+          ? await activeRun.promise
+          : await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 
