@@ -771,6 +771,20 @@ export function startHttpApi({
       if (url.pathname === '/tabs' && req.method === 'GET') {
         return sendJson(res, 200, { ok: true, tabs: tabs.listTabs(), defaultTabId });
       }
+      if (url.pathname === '/conversations/list' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
+        const controller = tabs.getControllerById(tabId);
+        const conversations = await runExclusive(controller, async () => controller.listConversations({ limit: body.limit }));
+        return sendJson(res, 200, { ok: true, tabId, conversations });
+      }
+      if (url.pathname === '/conversations/new' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
+        const controller = tabs.getControllerById(tabId);
+        const conversationUrl = await runExclusive(controller, async () => controller.newConversation());
+        return sendJson(res, 200, { ok: true, tabId, url: conversationUrl });
+      }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
         const bundles = await listBundles(stateDir);
         return sendJson(res, 200, { ok: true, bundles });
@@ -859,7 +873,7 @@ export function startHttpApi({
 
       if (url.pathname === '/query' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 5_000_000 });
-        const timeoutMs = positiveIntOr(body.timeoutMs, 10 * 60_000, 30 * 60_000);
+        const timeoutMs = positiveIntOr(body.timeoutMs, 10 * 60_000, 45 * 60_000);
         const prompt = String(body.prompt || '');
         if (!prompt.trim()) throw new Error('missing_prompt');
         if (prompt.length > 200_000) throw new Error('prompt_too_large');

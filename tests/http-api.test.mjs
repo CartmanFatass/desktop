@@ -447,6 +447,48 @@ test('http-api: wait-response returns in-progress before the client deadline wit
   await query;
 });
 
+test('http-api: conversation routes list sessions and open a clean composer on the selected tab', async (t) => {
+  const calls = [];
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    listConversations: async ({ limit }) => {
+      calls.push(['list', limit]);
+      return [{ title: 'Review A', url: 'https://chatgpt.com/c/review-a' }];
+    },
+    newConversation: async () => {
+      calls.push(['new']);
+      return 'https://chatgpt.com/';
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'review', vendorId: 'chatgpt', vendorName: 'ChatGPT' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const listed = await req({ port, token: 'secret', method: 'POST', pth: '/conversations/list', body: { key: 'review', limit: 25 } });
+  const created = await req({ port, token: 'secret', method: 'POST', pth: '/conversations/new', body: { key: 'review' } });
+
+  assert.equal(listed.res.status, 200);
+  assert.deepEqual(listed.data.conversations, [{ title: 'Review A', url: 'https://chatgpt.com/c/review-a' }]);
+  assert.equal(created.data.url, 'https://chatgpt.com/');
+  assert.deepEqual(calls, [['list', 25], ['new']]);
+});
+
 test('http-api: status invalid tabId returns 404', async (t) => {
   const tabs = {
     listTabs: () => [],
@@ -2445,7 +2487,7 @@ test('http-api: oversized numeric overrides are clamped to bounded ceilings', as
     }
   });
   assert.equal(queried.res.status, 200);
-  assert.equal(seen.query[0], 30 * 60_000);
+  assert.equal(seen.query[0], 45 * 60_000);
   assert.equal(queried.data.packedContextBudget.maxContextChars, 500_000);
   assert.equal(queried.data.packedContextBudget.maxFiles, 500);
   assert.equal(queried.data.packedContextBudget.maxFileChars, 100_000);

@@ -206,6 +206,67 @@ registerTool(
 );
 
 registerTool(
+  'agentify_list_conversations',
+  {
+    description: 'List ChatGPT conversations currently visible in the selected Agentify page so an operator can choose the appropriate session.',
+    inputSchema: {
+      model: z.string().optional().describe('Target provider hint (normally "chatgpt").'),
+      tabId: z.string().optional().describe('Tab id to inspect.'),
+      key: z.string().optional().describe('Stable tab key to inspect or create.'),
+      limit: z.number().optional().describe('Maximum visible conversations to return.')
+    }
+  },
+  async ({ model, tabId, key, limit }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/conversations/list',
+      body: { model, tabId, key, limit: limit || 100 }
+    });
+    return {
+      content: [{ type: 'text', text: JSON.stringify(data.conversations || [], null, 2) }],
+      structuredContent: data
+    };
+  }
+);
+
+registerTool(
+  'agentify_open_conversation',
+  {
+    description: 'Open an exact ChatGPT conversation URL in the selected Agentify page.',
+    inputSchema: {
+      model: z.string().optional().describe('Target provider hint (normally "chatgpt").'),
+      tabId: z.string().optional().describe('Tab id to use.'),
+      key: z.string().optional().describe('Stable tab key to use or create.'),
+      url: z.string().describe('Exact ChatGPT conversation URL returned by the page or supplied by the task.')
+    }
+  },
+  async ({ model, tabId, key, url }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/navigate', body: { model, tabId, key, url } });
+    return { content: [{ type: 'text', text: data.url || 'ok' }], structuredContent: data };
+  }
+);
+
+registerTool(
+  'agentify_new_conversation',
+  {
+    description: 'Open a clean new ChatGPT conversation composer in the selected Agentify page.',
+    inputSchema: {
+      model: z.string().optional().describe('Target provider hint (normally "chatgpt").'),
+      tabId: z.string().optional().describe('Tab id to use.'),
+      key: z.string().optional().describe('Stable tab key to use or create.')
+    }
+  },
+  async ({ model, tabId, key }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/conversations/new', body: { model, tabId, key } });
+    return { content: [{ type: 'text', text: data.url || 'ok' }], structuredContent: data };
+  }
+);
+
+registerTool(
   'agentify_wait_response',
   {
     description: 'Wait for the currently generating assistant response on an existing Agentify tab. A long generation returns IN_PROGRESS before the MCP client deadline; call this same tool again. This tool never sends a prompt or activates a response control.',

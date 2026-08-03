@@ -16,6 +16,9 @@ test('mcp-server registers agentify_* tools only', async () => {
   assert.ok(src.includes("await fs.readFile(resolvedPromptPath, 'utf8')"), 'expected Agentify to read prompt files directly');
   assert.ok(src.includes('exactly_one_of_prompt_or_promptPath_required'), 'expected ambiguous prompt input rejection');
   assert.ok(src.includes("'agentify_wait_response'"), 'expected wait-response tool');
+  assert.ok(src.includes("'agentify_list_conversations'"), 'expected conversation-list tool');
+  assert.ok(src.includes("'agentify_open_conversation'"), 'expected conversation-open tool');
+  assert.ok(src.includes("'agentify_new_conversation'"), 'expected new-conversation tool');
   assert.ok(src.includes("path: '/wait-response'"), 'expected wait-response endpoint forwarding');
   assert.ok(src.includes("'agentify_review_query'"), 'expected strict agentify_review_query tool');
   assert.ok(src.includes("path: '/review-query'"), 'expected strict review-query endpoint forwarding');

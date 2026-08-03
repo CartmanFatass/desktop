@@ -543,6 +543,57 @@ test('chatgpt-controller: wait response observes one active answer without sendi
   assert.ok(responseChecks >= 3);
 });
 
+test('chatgpt-controller: lists visible conversations and opens a clean conversation', async () => {
+  const navigations = [];
+  const page = {
+    async navigate(url) { navigations.push(url); },
+    async getUrl() { return navigations[navigations.length - 1] || 'https://chatgpt.com/c/current'; },
+    async evaluate(js) {
+      assert.match(js, /a\[href\*="\/c\/"\]/);
+      return [
+        { title: 'Research review', url: 'https://chatgpt.com/c/research' },
+        { title: 'UAV review', url: 'https://chatgpt.com/c/uav' }
+      ];
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+
+  assert.deepEqual(await controller.listConversations(), [
+    { title: 'Research review', url: 'https://chatgpt.com/c/research' },
+    { title: 'UAV review', url: 'https://chatgpt.com/c/uav' }
+  ]);
+  assert.equal(await controller.newConversation(), 'https://chatgpt.com/');
+  assert.deepEqual(navigations, ['https://chatgpt.com/']);
+});
+
+test('chatgpt-controller: wait response recovers the completed latest exchange from an idle page', async () => {
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/completed'; },
+    async evaluate(js) {
+      assert.match(js, /latestAssistantText/);
+      return {
+        count: 3,
+        active: false,
+        latestAssistantText: 'completed answer',
+        latestUserText: 'current scientific question'
+      };
+    }
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: {
+      sendButton: 'button[data-testid="send-button"]',
+      stopButton: 'button[data-testid="stop-button"]',
+      assistantMessage: '[data-message-author-role="assistant"]'
+    }
+  });
+
+  const result = await controller.waitForCurrentResponse({ timeoutMs: 1_000 });
+  assert.equal(result.text, 'completed answer');
+  assert.equal(result.meta.recoveredFromIdle, true);
+  assert.equal(result.meta.latestUserText, 'current scientific question');
+});
+
 test('chatgpt-controller: strict review submits with one send control and returns two stable exact-message snapshots', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   const prompt = 'x';

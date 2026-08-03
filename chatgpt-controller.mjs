@@ -305,6 +305,37 @@ export class ChatGPTController {
     return String(text || '');
   }
 
+  async listConversations({ limit = 100 } = {}) {
+    const cap = Math.max(1, Math.min(500, Number(limit) || 100));
+    const conversations = await this.#eval(`(() => {
+      const limit = ${cap};
+      const seen = new Set();
+      const rows = [];
+      for (const anchor of document.querySelectorAll('a[href*="/c/"]')) {
+        let url = '';
+        try { url = new URL(anchor.getAttribute('href') || anchor.href || '', location.href).href; } catch {}
+        if (!/^https:\/\/chatgpt\.com\/c\/[^/?#]+/i.test(url) || seen.has(url)) continue;
+        seen.add(url);
+        const title = String(anchor.innerText || anchor.textContent || anchor.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        rows.push({ url, title });
+        if (rows.length >= limit) break;
+      }
+      return rows;
+    })()`);
+    return Array.isArray(conversations) ? conversations : [];
+  }
+
+  async newConversation() {
+    const current = await this.page.getUrl();
+    let target = 'https://chatgpt.com/';
+    try {
+      const parsed = new URL(current);
+      if (parsed.hostname === 'chatgpt.com') target = `${parsed.origin}/`;
+    } catch {}
+    await this.page.navigate(target);
+    return await this.page.getUrl();
+  }
+
   async detectChallenge() {
     const result = await this.#eval(`(() => {
       const url = location.href || '';
@@ -1679,9 +1710,28 @@ export class ChatGPTController {
         const generating = stop && send ? !!send.disabled : stop;
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasAnswerNow = Array.from(document.querySelectorAll('button, a')).some(b => /answer now/i.test((b.textContent||'').trim()));
-        return { count: document.querySelectorAll(${assistantSel}).length, active: generating || hasContinue || hasAnswerNow };
+        const assistants = Array.from(document.querySelectorAll(${assistantSel}));
+        const users = Array.from(document.querySelectorAll('[data-message-author-role="user"], user-query, [data-test-id="user-query"]'));
+        return {
+          count: assistants.length,
+          active: generating || hasContinue || hasAnswerNow,
+          latestAssistantText: String(assistants[assistants.length - 1]?.innerText || '').trim(),
+          latestUserText: String(users[users.length - 1]?.innerText || '').trim()
+        };
       })()`);
-      if (!initial?.active) throw new Error('no_active_response');
+      if (!initial?.active) {
+        const text = String(initial?.latestAssistantText || '');
+        if (!text) throw new Error('no_active_response');
+        return {
+          text,
+          codeBlocks: [],
+          meta: {
+            count: Number(initial.count || 0),
+            recoveredFromIdle: true,
+            latestUserText: String(initial?.latestUserText || '')
+          }
+        };
+      }
       return await this.#waitForAssistantStable({
         timeoutMs: Math.min(timeoutMs, 45 * 60_000),
         baselineAssistantCount: Math.max(0, Number(initial.count || 0) - 1)
