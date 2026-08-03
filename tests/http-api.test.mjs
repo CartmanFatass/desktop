@@ -404,6 +404,49 @@ test('http-api: wait-response joins the active query without a second controller
   assert.equal(waitCalls, 0);
 });
 
+test('http-api: wait-response returns in-progress before the client deadline without a second action', async (t) => {
+  let releaseQuery = null;
+  let queryCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      queryCalls += 1;
+      await new Promise((resolve) => { releaseQuery = resolve; });
+      return { text: 'eventual result', codeBlocks: [], meta: {} };
+    },
+    waitForCurrentResponse: async () => { throw new Error('must_not_run'); }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt', vendorName: 'ChatGPT' }],
+    ensureTab: async () => 't0',
+    createTab: async () => 't0',
+    closeTab: async () => true,
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-test',
+    stateDir: '/tmp',
+    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
+  });
+  t.after(() => { releaseQuery?.(); server.close(); });
+  const port = server.address().port;
+
+  const query = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'one send' } });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const wait = await req({ port, token: 'secret', method: 'POST', pth: '/wait-response', body: { timeoutMs: 20 } });
+
+  assert.equal(wait.res.status, 200);
+  assert.equal(wait.data.inProgress, true);
+  assert.equal(queryCalls, 1);
+  releaseQuery?.();
+  await query;
+});
+
 test('http-api: status invalid tabId returns 404', async (t) => {
   const tabs = {
     listTabs: () => [],

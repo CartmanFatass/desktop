@@ -1074,9 +1074,31 @@ export function startHttpApi({
         const controller = tabs.getControllerById(tabId);
         const activeRun = activeQueryRuns.get(tabId);
         if (!activeRun) assertTabNotBusy(tabId);
-        const result = activeRun
-          ? await activeRun.promise
-          : await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
+        let result;
+        if (activeRun) {
+          const pending = Symbol('active-query-pending');
+          let timer;
+          try {
+            result = await Promise.race([
+              activeRun.promise,
+              new Promise((resolve) => {
+                timer = setTimeout(() => resolve(pending), Math.min(timeoutMs, 240_000));
+              })
+            ]);
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+          if (result === pending) {
+            return sendJson(res, 200, {
+              ok: true,
+              tabId,
+              inProgress: true,
+              activeQuery: activeQueries.get(tabId) || null
+            });
+          }
+        } else {
+          result = await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
+        }
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 

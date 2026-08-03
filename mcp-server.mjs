@@ -208,7 +208,7 @@ registerTool(
 registerTool(
   'agentify_wait_response',
   {
-    description: 'Wait for the currently generating assistant response on an existing Agentify tab and return it after natural completion. This tool never sends a prompt or activates a response control.',
+    description: 'Wait for the currently generating assistant response on an existing Agentify tab. A long generation returns IN_PROGRESS before the MCP client deadline; call this same tool again. This tool never sends a prompt or activates a response control.',
     inputSchema: {
       model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
       tabId: z.string().optional().describe('Existing tab/session id to use.'),
@@ -224,10 +224,16 @@ registerTool(
       path: '/wait-response',
       body: { model, tabId, key, timeoutMs: timeoutMs || 45 * 60_000 }
     });
+    const inProgress = data.inProgress === true;
     const text = data.result?.text || '';
     return {
-      content: [{ type: 'text', text }],
-      structuredContent: { tabId: data.tabId || tabId || null, text, meta: data.result?.meta || null }
+      content: [{ type: 'text', text: inProgress ? 'IN_PROGRESS' : text }],
+      structuredContent: {
+        status: inProgress ? 'IN_PROGRESS' : 'COMPLETE',
+        tabId: data.tabId || tabId || null,
+        text,
+        meta: data.result?.meta || null
+      }
     };
   }
 );
