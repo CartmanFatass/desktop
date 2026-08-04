@@ -1094,10 +1094,13 @@ export class ChatGPTController {
         const fallback = Array.from(document.querySelectorAll(${modelSel})).filter((node) => visible(node) && node.matches('button, [role="button"]'));
         const picker = composerPicker[0] || preferred[0] || fallback[0] || null;
         if (!picker) return { ok: false, error: 'model_switcher_unavailable' };
-        picker.click();
-        return { ok: true };
+        const rect = picker.getBoundingClientRect();
+        return { ok: true, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
       })()`);
-      if (opened?.ok) break;
+      if (opened?.ok) {
+        await this.#clickAt(opened.rect.x + opened.rect.w / 2, opened.rect.y + opened.rect.h / 2);
+        break;
+      }
       await sleep(200);
     }
     if (!opened?.ok) throw new Error(opened?.error || 'model_switcher_unavailable');
@@ -1114,18 +1117,29 @@ export class ChatGPTController {
         };
         const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
         const expected = ${JSON.stringify(expected)};
-        const candidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
-          .filter(visible)
+        const visibleCandidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
+          .filter(visible);
+        const labels = visibleCandidates
+          .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean);
+        const candidates = visibleCandidates
           .filter((node) => canonical(node.textContent || node.getAttribute('aria-label') || '') === canonical(expected));
         const target = candidates[0] || null;
-        if (!target) return { ok: false, error: 'expected_model_unavailable' };
-        target.click();
-        return { ok: true };
+        if (!target) return { ok: false, error: 'expected_model_unavailable', labels };
+        const rect = target.getBoundingClientRect();
+        return { ok: true, labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
       })()`);
-      if (chosen?.ok) break;
+      if (chosen?.ok) {
+        await this.#clickAt(chosen.rect.x + chosen.rect.w / 2, chosen.rect.y + chosen.rect.h / 2);
+        break;
+      }
       await sleep(200);
     }
-    if (!chosen?.ok) throw new Error(chosen?.error || 'expected_model_unavailable');
+    if (!chosen?.ok) {
+      const err = new Error(chosen?.error || 'expected_model_unavailable');
+      err.data = { expectedModel: expected, availableModels: chosen?.labels || [] };
+      throw err;
+    }
 
     while (Date.now() < deadline) {
       state = await readModel();

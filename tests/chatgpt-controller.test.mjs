@@ -405,6 +405,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   let modelSelected = false;
   let modelPickerClicks = 0;
   let modelOptionClicks = 0;
+  const trustedClicks = [];
   const page = {
     async navigate() {},
     async getUrl() { return 'https://chatgpt.com/'; },
@@ -417,15 +418,17 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
       if (js.includes('agentifyOpenModelPickerMarker')) {
         assert.match(js, /data-composer-transition-slot/);
         assert.doesNotMatch(js, /textContent[^;]*===/);
+        assert.doesNotMatch(js, /picker\.click\(\)/);
         modelPickerClicks += 1;
-        return { ok: true };
+        return { ok: true, rect: { x: 20, y: 30, w: 80, h: 20 } };
       }
       if (js.includes('agentifyChooseModelMarker')) {
         assert.match(js, /menuitemradio/);
+        assert.doesNotMatch(js, /target\.click\(\)/);
         modelOptionClicks += 1;
         if (modelOptionClicks === 1) return { ok: false, error: 'expected_model_unavailable' };
         modelSelected = true;
-        return { ok: true };
+        return { ok: true, labels: ['Medium', 'Pro'], rect: { x: 30, y: 40, w: 100, h: 24 } };
       }
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('form.requestSubmit')) { requestSubmitCount += 1; return true; }
@@ -453,7 +456,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
     async sendKey() {},
     async insertText(text) { inserted.push(text); },
     async moveMouse() {},
-    async mouseDown() {},
+    async mouseDown(x, y) { trustedClicks.push([x, y]); },
     async mouseUp() {},
     async setFileInputFiles() {}
   };
@@ -474,6 +477,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   assert.equal(baselineChecks, 1);
   assert.equal(modelPickerClicks, 1);
   assert.equal(modelOptionClicks, 2);
+  assert.deepEqual(trustedClicks.slice(0, 2), [[60, 40], [80, 52]]);
   assert.ok(responseChecks >= 4);
 });
 
