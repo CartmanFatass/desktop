@@ -112,9 +112,13 @@ registerTool(
       }
     });
     const structuredContent = {
+      status: data.result?.status || 'COMPLETE',
       text: data.result?.text || '',
       codeBlocks: data.result?.codeBlocks || [],
       meta: data.result?.meta || null,
+      conversationUrl: data.result?.conversationUrl || null,
+      conversationId: data.result?.conversationId || null,
+      modelEvidence: data.result?.modelEvidence || null,
       packedContext: data.packedContext || null,
       packedContextSummary: data.packedContextSummary || data.packedContext?.summary || null,
       bundle: data.bundle || null
@@ -274,16 +278,17 @@ registerTool(
       model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
       tabId: z.string().optional().describe('Existing tab/session id to use.'),
       key: z.string().optional().describe('Existing stable tab key to use.'),
-      timeoutMs: z.number().optional().describe('Maximum time to wait for natural completion.')
+      timeoutMs: z.number().optional().describe('Maximum time to wait for natural completion.'),
+      expectedModel: z.string().optional().describe('Exact visible model that must remain selected through terminal completion.')
     }
   },
-  async ({ model, tabId, key, timeoutMs }) => {
+  async ({ model, tabId, key, timeoutMs, expectedModel }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
       path: '/wait-response',
-      body: { model, tabId, key, timeoutMs: timeoutMs || 45 * 60_000 }
+      body: { model, tabId, key, expectedModel, timeoutMs: timeoutMs || 45 * 60_000 }
     });
     const inProgress = data.inProgress === true;
     const text = data.result?.text || '';
@@ -293,7 +298,10 @@ registerTool(
         status: inProgress ? 'IN_PROGRESS' : 'COMPLETE',
         tabId: data.tabId || tabId || null,
         text,
-        meta: data.result?.meta || null
+        meta: data.result?.meta || null,
+        conversationUrl: data.result?.conversationUrl || null,
+        conversationId: data.result?.conversationId || null,
+        modelEvidence: data.result?.modelEvidence || null
       }
     };
   }

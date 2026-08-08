@@ -12,6 +12,9 @@ test('mcp-server registers agentify_* tools only', async () => {
 
   assert.ok(src.includes("'agentify_query'"), 'expected agentify_query tool');
   assert.ok(src.includes('expectedModel'), 'expected query model-selection forwarding');
+  assert.ok(src.includes('conversationUrl: data.result?.conversationUrl || null'), 'expected terminal conversation URL forwarding');
+  assert.ok(src.includes('modelEvidence: data.result?.modelEvidence || null'), 'expected terminal model evidence forwarding');
+  assert.ok(src.includes("status: data.result?.status || 'COMPLETE'"), 'expected structured query terminal status');
   assert.ok(src.includes('promptPath: z.string().optional()'), 'expected exact prompt-file input');
   assert.ok(src.includes("await fs.readFile(resolvedPromptPath, 'utf8')"), 'expected Agentify to read prompt files directly');
   assert.ok(src.includes('exactly_one_of_prompt_or_promptPath_required'), 'expected ambiguous prompt input rejection');

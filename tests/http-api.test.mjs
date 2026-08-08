@@ -356,6 +356,7 @@ test('http-api: wait-response joins the active query without a second controller
   let releaseQuery = null;
   let queryCalls = 0;
   let waitCalls = 0;
+  const updatedUrls = [];
   const controller = {
     runExclusive: async (fn) => await fn(),
     query: async () => {
@@ -363,7 +364,15 @@ test('http-api: wait-response joins the active query without a second controller
       await new Promise((resolve) => {
         releaseQuery = resolve;
       });
-      return { text: 'joined result', codeBlocks: [], meta: {} };
+      return {
+        status: 'COMPLETE',
+        text: 'joined result',
+        codeBlocks: [],
+        meta: {},
+        conversationUrl: 'https://chatgpt.com/c/joined',
+        conversationId: 'joined',
+        modelEvidence: 'Pro'
+      };
     },
     waitForCurrentResponse: async () => {
       waitCalls += 1;
@@ -375,6 +384,7 @@ test('http-api: wait-response joins the active query without a second controller
     ensureTab: async () => 't0',
     createTab: async () => 't0',
     closeTab: async () => true,
+    updateTabUrl: (_id, url) => { updatedUrls.push(url); },
     getControllerById: () => controller
   };
   const server = await startHttpApi({
@@ -400,6 +410,10 @@ test('http-api: wait-response joins the active query without a second controller
   assert.equal(queryResult.res.status, 200);
   assert.equal(waitResult.res.status, 200);
   assert.equal(waitResult.data.result.text, 'joined result');
+  assert.equal(waitResult.data.result.status, 'COMPLETE');
+  assert.equal(waitResult.data.result.conversationUrl, 'https://chatgpt.com/c/joined');
+  assert.equal(waitResult.data.result.modelEvidence, 'Pro');
+  assert.deepEqual(updatedUrls, ['https://chatgpt.com/c/joined', 'https://chatgpt.com/c/joined']);
   assert.equal(queryCalls, 1);
   assert.equal(waitCalls, 0);
 });

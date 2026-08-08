@@ -36,6 +36,20 @@ export function deduplicateReviewModelEvidence(values) {
   return [...unique.values()];
 }
 
+export function modelLabelMatches(actual, expected) {
+  const words = (value) => String(value || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const actualWords = words(actual);
+  const expectedWords = words(expected);
+  if (!actualWords.length || !expectedWords.length) return false;
+  if (actualWords.join('') === expectedWords.join('')) return true;
+  if (expectedWords.length === 1 && expectedWords[0] === 'pro') return actualWords.at(-1) === 'pro';
+  if (actualWords.length === 1 && actualWords[0] === 'pro') return expectedWords.at(-1) === 'pro';
+  return false;
+}
+
 export function canonicalizeGeminiReviewMessageNodes(nodes, userSelector) {
   const accepted = [];
   for (const node of Array.from(nodes || [])) {
@@ -810,6 +824,40 @@ export class ChatGPTController {
     return false;
   }
 
+  async #composerCleared({ timeoutMs = 2000, pollMs = 150 } = {}) {
+    // The authoritative postcondition of a successful send: the composer that
+    // held the prompt is empty. #waitForSendSignal can report a false positive
+    // when its promptLen probe lands on a different (empty) textbox, so a
+    // "sent" signal is only trusted once the real composer has drained.
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const len = await this.#eval(`(() => {
+        const composerClearedMarker = true;
+        const visible = (n) => {
+          if (!n) return false;
+          const r = n.getBoundingClientRect();
+          const style = window.getComputedStyle(n);
+          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const candidates = Array.from(document.querySelectorAll(${promptSel}))
+          .concat(Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"]')));
+        let max = 0;
+        const seen = new Set();
+        for (const n of candidates) {
+          if (!n || seen.has(n) || !visible(n)) continue;
+          seen.add(n);
+          const txt = n.matches('textarea, input') ? String(n.value || '') : String(n.innerText || n.textContent || '');
+          max = Math.max(max, txt.trim().length);
+        }
+        return max;
+      })()`);
+      if (Number(len) === 0) return true;
+      await sleep(pollMs);
+    }
+    return false;
+  }
+
   async #clickSend() {
     await this.#emitProgress({ phase: 'sending_prompt' });
     const sendSel = JSON.stringify(this.selectors.sendButton);
@@ -955,6 +1003,7 @@ export class ChatGPTController {
       const cy = Math.round(res.rect.y + res.rect.h / 2);
       await this.#clickAt(cx, cy);
       sent = await this.#waitForSendSignal({ timeoutMs: 2200, pollMs: 120 });
+      if (sent && !(await this.#composerCleared())) sent = false;
     }
 
     if (!sent && !res?.fallbackEnter) {
@@ -1000,6 +1049,7 @@ export class ChatGPTController {
         return false;
       })()`);
       sent = await this.#waitForSendSignal({ timeoutMs: 1400, pollMs: 120 });
+      if (sent && !(await this.#composerCleared())) sent = false;
     }
 
     if (!sent) {
@@ -1024,6 +1074,7 @@ export class ChatGPTController {
         await sleep(jitter(25, 90));
         await this.#sendKey(key, { modifiers });
         sent = await this.#waitForSendSignal({ timeoutMs: 1500, pollMs: 120 });
+        if (sent && !(await this.#composerCleared())) sent = false;
         if (sent) break;
       }
     }
@@ -1052,6 +1103,35 @@ export class ChatGPTController {
     await this.page.setFileInputFiles(absFiles);
   }
 
+  async #readExpectedModelState(expectedModel) {
+    const expected = String(expectedModel || '').trim();
+    if (!expected) return { matched: true, labels: [], matchedLabel: null };
+    const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
+    const modelSel = JSON.stringify([
+      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
+      composerModelPicker
+    ].join(', '));
+    return await this.#eval(`(() => {
+      const agentifyModelStateMarker = true;
+      const modelLabelMatches = ${modelLabelMatches.toString()};
+      const visible = (node) => {
+        const rect = node?.getBoundingClientRect?.();
+        const style = node ? window.getComputedStyle(node) : null;
+        return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+      };
+      const expected = ${JSON.stringify(expected)};
+      const readLabels = (nodes) => Array.from(nodes)
+        .filter(visible)
+        .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      const composerLabels = readLabels(document.querySelectorAll(${JSON.stringify(composerModelPicker)}));
+      const semanticLabels = readLabels(document.querySelectorAll(${modelSel}));
+      const labels = composerLabels.length ? composerLabels : semanticLabels;
+      const matchedLabel = labels.find((label) => modelLabelMatches(label, expected)) || null;
+      return { matched: !!matchedLabel, labels, matchedLabel };
+    })()`);
+  }
+
   async #ensureExpectedModel(expectedModel, timeoutMs = 20_000) {
     const expected = String(expectedModel || '').trim();
     if (!expected) return null;
@@ -1060,27 +1140,12 @@ export class ChatGPTController {
       this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
       composerModelPicker
     ].join(', '));
-    const readModel = async () => await this.#eval(`(() => {
-      const agentifyModelStateMarker = true;
-      const visible = (node) => {
-        const rect = node?.getBoundingClientRect?.();
-        const style = node ? window.getComputedStyle(node) : null;
-        return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
-      };
-      const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
-      const expected = ${JSON.stringify(expected)};
-      const labels = Array.from(document.querySelectorAll(${modelSel}))
-        .filter(visible)
-        .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
-        .filter(Boolean);
-      return { matched: labels.some((label) => canonical(label) === canonical(expected)), labels };
-    })()`);
     const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
     let state = null;
     let opened = null;
     await this.#emitProgress({ phase: 'selecting_model' });
     while (Date.now() < deadline) {
-      state = await readModel();
+      state = await this.#readExpectedModelState(expected);
       if (state?.matched) return state;
       opened = await this.#eval(`(() => {
         const agentifyOpenModelPickerMarker = true;
@@ -1110,12 +1175,12 @@ export class ChatGPTController {
     while (Date.now() < deadline) {
       chosen = await this.#eval(`(() => {
         const agentifyChooseModelMarker = true;
+        const modelLabelMatches = ${modelLabelMatches.toString()};
         const visible = (node) => {
           const rect = node?.getBoundingClientRect?.();
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const canonical = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '').replace(/^(?:chatgpt|gpt)/, '');
         const expected = ${JSON.stringify(expected)};
         const visibleCandidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
           .filter(visible);
@@ -1123,7 +1188,7 @@ export class ChatGPTController {
           .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
           .filter(Boolean);
         const candidates = visibleCandidates
-          .filter((node) => canonical(node.textContent || node.getAttribute('aria-label') || '') === canonical(expected));
+          .filter((node) => modelLabelMatches(node.textContent || node.getAttribute('aria-label') || '', expected));
         const target = candidates[0] || null;
         if (!target) return { ok: false, error: 'expected_model_unavailable', labels };
         const rect = target.getBoundingClientRect();
@@ -1142,11 +1207,28 @@ export class ChatGPTController {
     }
 
     while (Date.now() < deadline) {
-      state = await readModel();
+      state = await this.#readExpectedModelState(expected);
       if (state?.matched) return state;
       await sleep(200);
     }
     throw new Error('expected_model_switch_unconfirmed');
+  }
+
+  async #completionMetadata(expectedModel = '') {
+    const conversationUrl = await this.page.getUrl();
+    const conversationId = reviewConversationId(conversationUrl);
+    let hostname = '';
+    try { hostname = new URL(conversationUrl).hostname; } catch {}
+    if (hostname === 'chatgpt.com' && !conversationId) throw new Error('conversation_identity_unreadable');
+    const expected = String(expectedModel || '').trim();
+    const modelState = expected ? await this.#readExpectedModelState(expected) : null;
+    if (expected && !modelState?.matched) throw new Error('expected_model_switch_unconfirmed');
+    return {
+      status: 'COMPLETE',
+      conversationUrl,
+      conversationId,
+      modelEvidence: modelState?.matchedLabel || null
+    };
   }
 
   async #reviewSnapshot(expectedModel = '') {
@@ -1615,7 +1697,7 @@ export class ChatGPTController {
     return await this.#waitForReviewAssistant({ userMessageId: message.id, deadline, identity });
   }
 
-  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 1500, pollMs = 400, baselineAssistantCount = 0 } = {}) {
+  async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 3000, pollMs = 400, baselineAssistantCount = 0 } = {}) {
     await this.#emitProgress({ phase: 'waiting_for_response', blocked: false, blockedKind: null, blockedTitle: null });
     const assistantSel = JSON.stringify(this.selectors.assistantMessage);
     const stopSel = JSON.stringify(this.selectors.stopButton);
@@ -1628,11 +1710,15 @@ export class ChatGPTController {
     while (Date.now() - start < timeoutMs) {
       this.#throwIfStopRequested();
       const snap = await this.#eval(`(() => {
-        const stop = !!document.querySelector(${stopSel});
-        const send = Array.from(document.querySelectorAll(${sendSel})).find((n) => {
+        const visible = (n) => {
+          if (!n) return false;
           const r = n.getBoundingClientRect();
           const style = window.getComputedStyle(n);
           return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        };
+        const stop = Array.from(document.querySelectorAll(${stopSel})).some(visible);
+        const send = Array.from(document.querySelectorAll(${sendSel})).find((n) => {
+          return visible(n);
         });
         const sendEnabled = send ? !send.disabled : true;
         const nodes = Array.from(document.querySelectorAll(${assistantSel}));
@@ -1641,8 +1727,9 @@ export class ChatGPTController {
         const hasContinue = Array.from(document.querySelectorAll('button, a')).some(b => /continue generating/i.test((b.textContent||'').trim()));
         const hasRegenerate = Array.from(document.querySelectorAll('button, a')).some(b => /regenerate/i.test((b.textContent||'').trim()));
         const hasAnswerNow = Array.from(document.querySelectorAll('button, a')).some(b => /answer now/i.test((b.textContent||'').trim()));
+        const hasRetry = Array.from(document.querySelectorAll('button, a')).some(b => /^(retry|try again|retry response)$/i.test((b.textContent||'').trim()));
         const hasError = /something went wrong|try again|error/i.test(txt) && txt.length < 500;
-        return { stop, sendEnabled, txt, count: nodes.length, hasError, hasContinue, hasRegenerate, hasAnswerNow };
+        return { stop, sendEnabled, txt, count: nodes.length, hasError, hasContinue, hasRegenerate, hasAnswerNow, hasRetry };
       })()`);
 
       const txt = String(snap?.txt || '');
@@ -1651,9 +1738,7 @@ export class ChatGPTController {
         lastChange = Date.now();
       }
 
-      // Some providers expose unrelated visible "stop/cancel" controls.
-      // Treat "generating" as stop-visible only when send is not enabled.
-      const generating = !!snap?.stop && !snap?.sendEnabled;
+      const generating = !!snap?.stop;
       if (generating) stopGoneAt = null;
       else if (stopGoneAt == null) stopGoneAt = Date.now();
 
@@ -1666,7 +1751,7 @@ export class ChatGPTController {
       const done =
         !generating && !snap?.hasContinue && !snap?.hasAnswerNow && stopGoneLongEnough &&
         snap?.sendEnabled && stable && txt.length > 0 && !snap?.hasError &&
-        !transientPlaceholder && readyByNodes;
+        !snap?.hasRetry && !transientPlaceholder && readyByNodes;
       if (done) {
         const extra = await this.#eval(`(() => {
           const nodes = Array.from(document.querySelectorAll(${assistantSel}));
@@ -1701,13 +1786,14 @@ export class ChatGPTController {
       await this.#typePrompt(prompt, { human: false });
       const baselineAssistantCount = Number(await this.#eval(`(() => document.querySelectorAll(${JSON.stringify(this.selectors.assistantMessage)}).length)()`)) || 0;
       await this.#clickSend();
-      return await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 45 * 60_000), baselineAssistantCount });
+      const result = await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 45 * 60_000), baselineAssistantCount });
+      return { ...result, ...(await this.#completionMetadata(expectedModel)) };
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }
   }
 
-  async waitForCurrentResponse({ timeoutMs = 45 * 60_000, onProgress = null } = {}) {
+  async waitForCurrentResponse({ timeoutMs = 45 * 60_000, onProgress = null, expectedModel = '' } = {}) {
     const run = { kind: 'wait_response', requested: false, requestedAt: null, reason: null, onProgress };
     this.currentRun = run;
     try {
@@ -1736,20 +1822,22 @@ export class ChatGPTController {
       if (!initial?.active) {
         const text = String(initial?.latestAssistantText || '');
         if (!text) throw new Error('no_active_response');
-        return {
-          text,
-          codeBlocks: [],
-          meta: {
-            count: Number(initial.count || 0),
-            recoveredFromIdle: true,
-            latestUserText: String(initial?.latestUserText || '')
-          }
+        const result = await this.#waitForAssistantStable({
+          timeoutMs: Math.min(timeoutMs, 45 * 60_000),
+          baselineAssistantCount: Math.max(0, Number(initial.count || 0) - 1)
+        });
+        result.meta = {
+          ...(result.meta || {}),
+          recoveredFromIdle: true,
+          latestUserText: String(initial?.latestUserText || '')
         };
+        return { ...result, ...(await this.#completionMetadata(expectedModel)) };
       }
-      return await this.#waitForAssistantStable({
+      const result = await this.#waitForAssistantStable({
         timeoutMs: Math.min(timeoutMs, 45 * 60_000),
         baselineAssistantCount: Math.max(0, Number(initial.count || 0) - 1)
       });
+      return { ...result, ...(await this.#completionMetadata(expectedModel)) };
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

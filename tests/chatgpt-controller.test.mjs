@@ -9,6 +9,7 @@ import {
   classifyReviewControls,
   deduplicateReviewModelEvidence,
   looksLikeBlockedPage,
+  modelLabelMatches,
   serializeReviewComposer,
   serializeReviewUserMessage,
   summarizeReviewComposerStructure
@@ -342,6 +343,13 @@ test('chatgpt-controller: strict control classifier rejects bare Continue and Re
   assert.equal(classifyReviewControls(['Continue with Google']).continue, false);
 });
 
+test('chatgpt-controller: Pro aliases match but High never satisfies Pro', () => {
+  assert.equal(modelLabelMatches('Pro', 'Pro'), true);
+  assert.equal(modelLabelMatches('GPT-5.6 Pro', 'Pro'), true);
+  assert.equal(modelLabelMatches('Pro', 'GPT-5.6 Pro'), true);
+  assert.equal(modelLabelMatches('High', 'Pro'), false);
+});
+
 test('chatgpt-controller: send falls back to requestSubmit on the active composer before Enter', async () => {
   const events = [];
   let waitForSendChecks = 0;
@@ -362,6 +370,7 @@ test('chatgpt-controller: send falls back to requestSubmit on the active compose
           ? { stopVisible: false, sendDisabled: true, promptLen: 0 }
           : { stopVisible: false, sendDisabled: false, promptLen: 7 };
       }
+      if (js.includes('composerClearedMarker')) return 0;
       throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     },
     async getUrl() {
@@ -408,12 +417,16 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
   const trustedClicks = [];
   const page = {
     async navigate() {},
-    async getUrl() { return 'https://chatgpt.com/'; },
+    async getUrl() { return 'https://chatgpt.com/c/public-query'; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('agentifyModelStateMarker')) {
         assert.match(js, /data-composer-transition-slot/);
-        return { matched: modelSelected, labels: [modelSelected ? 'Pro' : 'High'] };
+        return {
+          matched: modelSelected,
+          labels: [modelSelected ? 'Pro' : 'High'],
+          matchedLabel: modelSelected ? 'Pro' : null
+        };
       }
       if (js.includes('agentifyOpenModelPickerMarker')) {
         assert.match(js, /data-composer-transition-slot/);
@@ -439,6 +452,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
           ? { stopVisible: false, sendDisabled: true, promptLen: 0 }
           : { stopVisible: false, sendDisabled: false, promptLen: prompt.length };
       }
+      if (js.includes('composerClearedMarker')) return 0;
       if (js.includes('document.querySelectorAll') && js.includes('.length)()')) {
         baselineChecks += 1;
         return 1;
@@ -472,6 +486,10 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
 
   const result = await controller.query({ prompt, expectedModel: 'Pro', timeoutMs: 5_000 });
   assert.equal(result.text, 'done');
+  assert.equal(result.status, 'COMPLETE');
+  assert.equal(result.conversationUrl, 'https://chatgpt.com/c/public-query');
+  assert.equal(result.conversationId, 'public-query');
+  assert.equal(result.modelEvidence, 'Pro');
   assert.deepEqual(inserted, [prompt]);
   assert.equal(requestSubmitCount, 1);
   assert.equal(baselineChecks, 1);
@@ -571,16 +589,34 @@ test('chatgpt-controller: lists visible conversations and opens a clean conversa
 });
 
 test('chatgpt-controller: wait response recovers the completed latest exchange from an idle page', async () => {
+  let initialRead = true;
   const page = {
     async getUrl() { return 'https://chatgpt.com/c/completed'; },
     async evaluate(js) {
-      assert.match(js, /latestAssistantText/);
-      return {
-        count: 3,
-        active: false,
-        latestAssistantText: 'completed answer',
-        latestUserText: 'current scientific question'
-      };
+      if (js.includes('latestAssistantText') && initialRead) {
+        initialRead = false;
+        return {
+          count: 3,
+          active: false,
+          latestAssistantText: 'completed answer',
+          latestUserText: 'current scientific question'
+        };
+      }
+      if (js.includes('const nodes = Array.from(document.querySelectorAll')) {
+        return {
+          stop: false,
+          sendEnabled: true,
+          txt: 'completed answer',
+          count: 3,
+          hasError: false,
+          hasContinue: false,
+          hasRegenerate: true,
+          hasAnswerNow: false,
+          hasRetry: false
+        };
+      }
+      if (js.includes('const codes =')) return { codeBlocks: [] };
+      throw new Error(`unexpected_eval:${js.slice(0, 80)}`);
     }
   };
   const controller = new ChatGPTController({
@@ -592,7 +628,7 @@ test('chatgpt-controller: wait response recovers the completed latest exchange f
     }
   });
 
-  const result = await controller.waitForCurrentResponse({ timeoutMs: 1_000 });
+  const result = await controller.waitForCurrentResponse({ timeoutMs: 5_000 });
   assert.equal(result.text, 'completed answer');
   assert.equal(result.meta.recoveredFromIdle, true);
   assert.equal(result.meta.latestUserText, 'current scientific question');

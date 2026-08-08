@@ -953,6 +953,7 @@ export function startHttpApi({
             );
             activeQueryRuns.set(tabId, { id: op.id, promise: queryPromise });
             const result = await queryPromise;
+            if (result?.conversationUrl) tabs.updateTabUrl(tabId, result.conversationUrl);
             setLastOutcome(tabId, {
               status: 'success',
               label: 'Response received',
@@ -1084,6 +1085,7 @@ export function startHttpApi({
       if (url.pathname === '/wait-response' && req.method === 'POST') {
         const body = await parseBody(req);
         const timeoutMs = positiveIntOr(body.timeoutMs, 45 * 60_000, 45 * 60_000);
+        const expectedModel = String(body.expectedModel || '').trim();
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
         const controller = tabs.getControllerById(tabId);
         const activeRun = activeQueryRuns.get(tabId);
@@ -1111,8 +1113,9 @@ export function startHttpApi({
             });
           }
         } else {
-          result = await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs }));
+          result = await runExclusive(controller, async () => controller.waitForCurrentResponse({ timeoutMs, expectedModel }));
         }
+        if (result?.conversationUrl) tabs.updateTabUrl(tabId, result.conversationUrl);
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 
