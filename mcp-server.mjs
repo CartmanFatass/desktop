@@ -7,6 +7,7 @@ import { z } from 'zod';
 
 import { defaultStateDir } from './state.mjs';
 import { ensureDesktopRunning, requestJson } from './mcp-lib.mjs';
+import { prepareReviewPromptInput } from './review-transport.mjs';
 
 const server = new McpServer({ name: 'agentify-desktop', version: '0.1.0' });
 const stateDir = defaultStateDir();
@@ -142,7 +143,8 @@ registerTool(
       conversationUrl: z.string().describe('Exact registered ChatGPT conversation URL.'),
       conversationId: z.string().describe('Exact conversation identity contained in conversationUrl.'),
       idempotencyKey: z.string().describe('Immutable operation idempotency key.'),
-      prompt: z.string().describe('Exact prompt bytes to submit once.'),
+      prompt: z.string().optional().describe('Exact prompt bytes to submit once. Use either prompt or promptPath.'),
+      promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is submitted once. Use either promptPath or prompt.'),
       promptSha256: z.string().describe('Lowercase SHA-256 of the exact UTF-8 prompt.'),
       timeoutMs: z.number().optional().describe('Single absolute operation deadline, maximum 45 minutes.'),
       verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.')
@@ -156,10 +158,12 @@ registerTool(
     conversationId,
     idempotencyKey,
     prompt,
+    promptPath,
     promptSha256,
     timeoutMs,
     verifyExisting
   }) => {
+    const exactPrompt = await prepareReviewPromptInput({ prompt, promptPath, promptSha256 });
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
@@ -172,7 +176,7 @@ registerTool(
         conversationUrl,
         conversationId,
         idempotencyKey,
-        prompt,
+        prompt: exactPrompt,
         promptSha256,
         timeoutMs: timeoutMs ?? 45 * 60_000,
         verifyExisting: verifyExisting === true

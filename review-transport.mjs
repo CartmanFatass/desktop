@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { readReviewTransportState, writeReviewTransportState } from './state.mjs';
@@ -31,6 +32,35 @@ function requiredExactText(value, field, { max }) {
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+export async function resolveReviewPromptInput(
+  { prompt, promptPath } = {},
+  { cwd = process.cwd(), readFile = fs.readFile } = {}
+) {
+  const hasPrompt = typeof prompt === 'string';
+  const hasPromptPath = typeof promptPath === 'string' && promptPath.trim().length > 0;
+  if (hasPrompt === hasPromptPath) throw new Error('exactly_one_of_prompt_or_promptPath_required');
+  if (!hasPromptPath) return prompt;
+  const resolvedPromptPath = path.isAbsolute(promptPath) ? promptPath : path.resolve(cwd, promptPath);
+  return await readFile(resolvedPromptPath, 'utf8');
+}
+
+export function validateReviewPromptSha256(prompt, promptSha256) {
+  if (typeof promptSha256 !== 'string' || !SHA256_RE.test(promptSha256)) {
+    fail('review_prompt_sha256_invalid');
+  }
+  if (promptSha256 !== sha256(prompt)) fail('review_prompt_sha256_mismatch');
+  return promptSha256;
+}
+
+export async function prepareReviewPromptInput(
+  { prompt, promptPath, promptSha256 } = {},
+  options = {}
+) {
+  const exactPrompt = await resolveReviewPromptInput({ prompt, promptPath }, options);
+  validateReviewPromptSha256(exactPrompt, promptSha256);
+  return exactPrompt;
 }
 
 export function sanitizeReviewErrorData(value) {
@@ -123,7 +153,7 @@ function normalizeRequest(input) {
     }
   }
   const prompt = requiredExactText(request.prompt, 'prompt', { max: 200_000 });
-  const promptSha256 = sha256(prompt);
+  const promptSha256 = validateReviewPromptSha256(prompt, request.promptSha256);
   const timeoutMs = Number(request.timeoutMs ?? MAX_REVIEW_TIMEOUT_MS);
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_REVIEW_TIMEOUT_MS || timeoutMs > MAX_REVIEW_TIMEOUT_MS) {
     fail('review_timeout_out_of_range');

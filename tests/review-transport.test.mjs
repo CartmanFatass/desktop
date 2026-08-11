@@ -5,14 +5,19 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { runReviewQuery, sanitizeReviewErrorData } from '../review-transport.mjs';
+import {
+  prepareReviewPromptInput,
+  resolveReviewPromptInput,
+  runReviewQuery,
+  sanitizeReviewErrorData
+} from '../review-transport.mjs';
 import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
+  const calls = { review: 0, reviewPrompts: [], observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
   let failAfterSubmittedReceipt = false;
   let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
@@ -82,6 +87,7 @@ async function fixture() {
     },
     async reviewQuery(args) {
       calls.review += 1;
+      calls.reviewPrompts.push(args.prompt);
       const submittedUrl = args.firstBinding ? firstBindingSubmittedUrl : args.expectedUrl;
       const submittedId = args.firstBinding ? firstBindingSubmittedUrl.split('/').at(-1) : args.expectedConversationId;
       await args.onPrepared({
@@ -234,6 +240,91 @@ async function fixture() {
     }
   };
 }
+
+test('review prompt input: reads exact UTF-8 promptPath once from relative or absolute paths', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-prompt-'));
+  const relativePath = 'review-prompt.txt';
+  const absolutePath = path.join(tempDir, relativePath);
+  const exactPrompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
+  await fs.writeFile(absolutePath, exactPrompt, 'utf8');
+  try {
+    const relativeReads = [];
+    const readFile = async (...args) => {
+      relativeReads.push(args);
+      return await fs.readFile(...args);
+    };
+    assert.equal(
+      await resolveReviewPromptInput({ promptPath: relativePath }, { cwd: tempDir, readFile }),
+      exactPrompt
+    );
+    assert.deepEqual(relativeReads, [[absolutePath, 'utf8']]);
+
+    const absoluteReads = [];
+    assert.equal(
+      await resolveReviewPromptInput({ promptPath: absolutePath }, {
+        cwd: path.dirname(tempDir),
+        readFile: async (...args) => {
+          absoluteReads.push(args);
+          return await fs.readFile(...args);
+        }
+      }),
+      exactPrompt
+    );
+    assert.deepEqual(absoluteReads, [[absolutePath, 'utf8']]);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('review prompt input: requires exactly one inline prompt or nonblank promptPath', async () => {
+  await assert.rejects(resolveReviewPromptInput({}), /exactly_one_of_prompt_or_promptPath_required/);
+  await assert.rejects(
+    resolveReviewPromptInput({ prompt: 'inline', promptPath: 'review-prompt.txt' }),
+    /exactly_one_of_prompt_or_promptPath_required/
+  );
+  await assert.rejects(
+    resolveReviewPromptInput({ promptPath: '   ' }),
+    /exactly_one_of_prompt_or_promptPath_required/
+  );
+  let reads = 0;
+  const inlinePrompt = 'inline\r\n\u3053\u3093\u306b\u3061\u306f';
+  assert.equal(
+    await resolveReviewPromptInput({ prompt: inlinePrompt }, { readFile: async () => { reads += 1; } }),
+    inlinePrompt
+  );
+  assert.equal(reads, 0);
+});
+
+test('review prompt preparation: invalid hashes fail before connection after one exact file read', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-prompt-hash-'));
+  const promptPath = path.join(tempDir, 'review-prompt.txt');
+  const exactPrompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
+  await fs.writeFile(promptPath, exactPrompt, 'utf8');
+  try {
+    for (const [promptSha256, expectedError] of [
+      ['A'.repeat(64), /review_prompt_sha256_invalid/],
+      ['0'.repeat(64), /review_prompt_sha256_mismatch/]
+    ]) {
+      const reads = [];
+      await assert.rejects(
+        prepareReviewPromptInput(
+          { promptPath: 'review-prompt.txt', promptSha256 },
+          {
+            cwd: tempDir,
+            readFile: async (...args) => {
+              reads.push(args);
+              return await fs.readFile(...args);
+            }
+          }
+        ),
+        expectedError
+      );
+      assert.deepEqual(reads, [[promptPath, 'utf8']]);
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
 
 test('review transport: adopts an exact existing tab before the normal send lifecycle', async () => {
   const f = await fixture();
@@ -514,6 +605,47 @@ test('review transport: conflicting idempotency payload is rejected without anot
   assert.equal(f.calls.review, 1);
 });
 
+test('review transport: exact CRLF and non-ASCII prompt content is hash-bound before send', async () => {
+  const f = await fixture();
+  const prompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
+  const receipt = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: {
+      ...f.request,
+      idempotencyKey: 'exact-crlf-nonascii',
+      prompt,
+      promptSha256: sha256(prompt)
+    }
+  });
+  assert.equal(receipt.promptSha256, sha256(prompt));
+  assert.deepEqual(f.calls.reviewPrompts, [prompt]);
+});
+
+test('review transport: malformed or mismatched prompt hash fails before state, tab, or send', async () => {
+  const f = await fixture();
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, promptSha256: 'A'.repeat(64) }
+    }),
+    /review_prompt_sha256_invalid/
+  );
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, promptSha256: '0'.repeat(64) }
+    }),
+    /review_prompt_sha256_mismatch/
+  );
+  assert.deepEqual(await fs.readdir(f.stateDir), []);
+  assert.equal(f.calls.review, 0);
+  assert.deepEqual(f.calls.adopt, []);
+  assert.deepEqual(f.calls.ensure, []);
+});
+
 test('review transport: restart verification is observe-only and bound to the same operation', async () => {
   const f = await fixture();
   const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -528,7 +660,7 @@ test('review transport: restart verification is observe-only and bound to the sa
   assert.equal(f.calls.observe, 1);
 });
 
-test('review transport: stable-key mismatch fails while caller prompt hash is ignored', async () => {
+test('review transport: stable-key mismatch and prompt hash mismatch fail without another send', async () => {
   const f = await fixture();
   await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   await assert.rejects(
@@ -544,13 +676,15 @@ test('review transport: stable-key mismatch fails while caller prompt hash is ig
     }),
     /review_binding_mismatch/
   );
-  const retry = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, idempotencyKey: 'hash-ignored', promptSha256: '0'.repeat(64) }
-  });
-  assert.equal(retry.status, 'COMPLETE');
-  assert.equal(f.calls.review, 2);
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, idempotencyKey: 'hash-mismatch', promptSha256: '0'.repeat(64) }
+    }),
+    /review_prompt_sha256_mismatch/
+  );
+  assert.equal(f.calls.review, 1);
 });
 
 test('review transport: binding mismatch cannot adopt or re-key a tab', async () => {
