@@ -473,6 +473,7 @@ export function startHttpApi({
   // Governor state (per-desktop instance).
   const inflight = { queries: 0 };
   const activeQueries = new Map(); // tabId -> runtime status
+  const activeReviewQueries = new Map(); // runtime key -> strict-review status
   const activeQueryRuns = new Map(); // tabId -> in-process query promise
   const activeScopes = new Map(); // request scope -> runtime status
   const lastOutcomes = new Map(); // tabId -> last finished outcome
@@ -626,8 +627,8 @@ export function startHttpApi({
   };
 
   const runtimeSnapshot = () => ({
-    inflightQueries: inflight.queries,
-    activeQueries: Array.from(activeQueries.values())
+    inflightQueries: inflight.queries + activeReviewQueries.size,
+    activeQueries: [...activeQueries.values(), ...activeReviewQueries.values()]
       .map((item) => ({ ...item }))
       .sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0)),
     lastOutcomes: Array.from(lastOutcomes.entries())
@@ -750,7 +751,10 @@ export function startHttpApi({
         const st = await getStatus({ tabId });
         return sendJson(res, 200, {
           ...st,
-          activeQuery: activeQueries.get(tabId) || null,
+          activeQuery:
+            activeQueries.get(tabId) ||
+            Array.from(activeReviewQueries.values()).find((item) => item.tabId === tabId) ||
+            null,
           runtime: runtimeSnapshot()
         });
       }
@@ -872,8 +876,53 @@ export function startHttpApi({
 
       if (url.pathname === '/review-query' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 2_000_000 });
-        const receipt = await runReviewQuery({ stateDir, tabs, request: body });
-        return sendJson(res, 200, { ok: true, receipt });
+        const runtimeKey = `review:${crypto.randomUUID()}`;
+        const startedAt = Date.now();
+        const reviewRun = {
+          id: runtimeKey.slice('review:'.length),
+          kind: 'review_query',
+          source: 'strict-review',
+          phase: body.verifyExisting === true ? 'observing_existing' : 'strict_transport',
+          tabId: body.existingTabId ? String(body.existingTabId).trim() : null,
+          stableKey: body.stableKey ? String(body.stableKey).trim() : null,
+          idempotencyKey: body.idempotencyKey ? String(body.idempotencyKey).trim() : null,
+          verifyExisting: body.verifyExisting === true,
+          startedAt,
+          updatedAt: startedAt
+        };
+        activeReviewQueries.set(runtimeKey, reviewRun);
+        emitRuntimeChanged();
+        try {
+          const receipt = await runReviewQuery({ stateDir, tabs, request: body });
+          if (reviewRun.tabId) {
+            setLastOutcome(reviewRun.tabId, {
+              status: 'success',
+              label: reviewRun.verifyExisting ? 'Strict review observed' : 'Strict review completed',
+              detail: receipt?.terminalState || receipt?.status || 'complete',
+              source: 'strict-review',
+              kind: 'review_query',
+              finishedAt: Date.now(),
+              durationMs: Math.max(0, Date.now() - startedAt)
+            });
+          }
+          return sendJson(res, 200, { ok: true, receipt });
+        } catch (error) {
+          if (reviewRun.tabId) {
+            setLastOutcome(reviewRun.tabId, {
+              status: 'error',
+              label: 'Strict review failed',
+              detail: String(error?.message || error),
+              source: 'strict-review',
+              kind: 'review_query',
+              finishedAt: Date.now(),
+              durationMs: Math.max(0, Date.now() - startedAt)
+            });
+          }
+          throw error;
+        } finally {
+          activeReviewQueries.delete(runtimeKey);
+          emitRuntimeChanged();
+        }
       }
 
       if (url.pathname === '/query' && req.method === 'POST') {

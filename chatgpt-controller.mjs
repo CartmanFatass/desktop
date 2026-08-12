@@ -18,10 +18,10 @@ export function classifyReviewControls(labels, { selectorStop = false, sendVisib
     : [];
   const has = (pattern) => values.some((value) => pattern.test(value));
   return {
-    stop: !!selectorStop || has(/^(stop|stop generating|stop response)$/i),
-    continue: has(/^(continue|continue generating|continue response)$/i),
-    retry: has(/^(retry|response retry|try again|retry response)$/i),
-    answerNow: has(/^answer now$/i),
+    stop: !!selectorStop || has(/^(stop|stop generating|stop response|停止|停止生成|停止回答)$/i),
+    continue: has(/^(continue|continue generating|continue response|继续|继续生成)$/i),
+    retry: has(/^(retry|response retry|try again|retry response|重试|再试一次)$/i),
+    answerNow: has(/^(answer now|立即回答)$/i),
     sendVisible: !!sendVisible
   };
 }
@@ -1323,14 +1323,32 @@ export class ChatGPTController {
             return value && normalizeModel(value) === normalizeModel(expectedModel);
           })
         : [];
+      const geminiModeItems = ${isGeminiLiteral}
+        ? Array.from(document.querySelectorAll('[data-test-id^="bard-mode-option-"], [data-test-id="gem-mode-menu"] [role="menuitem"]'))
+        : [];
+      const geminiSelected = (node) => !!node && (
+        node.getAttribute('data-active') === 'true' ||
+        /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
+        node.getAttribute('aria-checked') === 'true' ||
+        node.getAttribute('aria-selected') === 'true' ||
+        Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|已选中/i.test(String(child.getAttribute('aria-label') || '')))
+      );
+      const geminiProItem = geminiModeItems.find((node) => /^3\.1 Pro(?:\s|$)/i.test(String(node.textContent || '').replace(/\s+/g, ' ').trim()));
+      const geminiThinkingItem = geminiModeItems.find((node) => /^(Extended thinking|扩展思考)(?:\s|$)/i.test(String(node.textContent || '').replace(/\s+/g, ' ').trim()));
+      const geminiExactEvidence = geminiSelected(geminiProItem) && geminiSelected(geminiThinkingItem)
+        ? 'Gemini 3.1 Pro extended'
+        : null;
       const modelEvidenceCandidates = deduplicateReviewModelEvidence(
-        [...semanticModelNodes, ...composerModelNodes]
-          .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+        [
+          geminiExactEvidence,
+          ...[...semanticModelNodes, ...composerModelNodes]
+            .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+        ]
       );
       const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);
       return {
         messages,
-        modelEvidence: modelEvidenceCandidates.length === 1 ? modelEvidenceCandidates[0] : null,
+        modelEvidence: geminiExactEvidence || (modelEvidenceCandidates.length === 1 ? modelEvidenceCandidates[0] : null),
         modelEvidenceCandidates,
         controlText,
         selectorStop,
@@ -1346,10 +1364,19 @@ export class ChatGPTController {
   }
 
   #assertReviewIdentity(snapshot, { expectedUrl, expectedConversationId, expectedModel, allowUnboundRoot = false }) {
-    if (allowUnboundRoot && snapshot?.url === expectedUrl && !snapshot?.conversationId) return;
-    if (snapshot?.url !== expectedUrl || snapshot?.conversationId !== expectedConversationId) {
+    const rootIdentityMatches = allowUnboundRoot && snapshot?.url === expectedUrl && !snapshot?.conversationId;
+    if (!rootIdentityMatches && (snapshot?.url !== expectedUrl || snapshot?.conversationId !== expectedConversationId)) {
       const error = new Error('review_conversation_identity_mismatch');
       error.data = { url: snapshot?.url || null, conversationId: snapshot?.conversationId || null };
+      throw error;
+    }
+    const expected = String(expectedModel || '').trim();
+    const evidence = Array.isArray(snapshot?.modelEvidenceCandidates)
+      ? snapshot.modelEvidenceCandidates
+      : snapshot?.modelEvidence ? [snapshot.modelEvidence] : [];
+    if (expected && !evidence.some((label) => modelLabelMatches(label, expected))) {
+      const error = new Error('review_model_mismatch');
+      error.data = { expectedModel: expected, modelEvidenceCandidates: evidence };
       throw error;
     }
   }
@@ -1370,8 +1397,15 @@ export class ChatGPTController {
         node.textContent || ''
       ].join(' ').trim();
       const prohibited = /continue|retry|try again|response retry|answer now|regenerate|stop/i;
-      const candidates = Array.from(document.querySelectorAll(${sendSel}))
+      const allCandidates = Array.from(document.querySelectorAll(${sendSel}))
         .filter((node) => visible(node) && !node.disabled && !prohibited.test(label(node)));
+      const isGemini = location.hostname === 'gemini.google.com';
+      const geminiSend = (node) => {
+        const aria = String(node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const dataTestId = String(node.getAttribute('data-test-id') || node.getAttribute('data-testid') || '').trim();
+        return /^(send|发送)$/i.test(aria) || /^send-button$/i.test(dataTestId);
+      };
+      const candidates = isGemini ? allCandidates.filter(geminiSend) : allCandidates;
       if (candidates.length !== 1) return { ok: false, error: 'review_send_control_ambiguous', count: candidates.length };
       candidates[0].click();
       return { ok: true, clickCount: 1, label: label(candidates[0]) };
@@ -1447,21 +1481,142 @@ export class ChatGPTController {
     throw new Error('review_baseline_identity_unstable');
   }
 
-  async #waitForReviewAssistant({ userMessageId, deadline, identity }) {
+  async #reviewAssistantResult({ snapshot, userMessageId, currentUserMessageId = userMessageId, contentRebind = null }) {
+    const userIndex = (snapshot.messages || []).findIndex(
+      (message) => message.role === 'user' && message.id === currentUserMessageId
+    );
+    if (userIndex < 0) throw new Error('review_user_message_identity_unreadable');
+    const following = snapshot.messages.slice(userIndex + 1);
+    const nextUserOffset = following.findIndex((message) => message.role === 'user');
+    const targetTurn = nextUserOffset >= 0 ? following.slice(0, nextUserOffset) : following;
+    const assistants = targetTurn.filter((message) => message.role === 'assistant');
+    if (assistants.length > 1) throw new Error('review_assistant_message_ambiguous');
+    const assistant = assistants[0] || null;
+    const active =
+      !!snapshot.controls?.stop ||
+      !!snapshot.controls?.continue ||
+      !!snapshot.controls?.retry ||
+      !!snapshot.controls?.answerNow;
+    return { userIndex, assistant, active, userMessageId, currentUserMessageId, contentRebind };
+  }
+
+  async #resolveReviewUserAnchor({
+    userMessageId,
+    deadline,
+    identity,
+    expectedPrompt,
+    expectedPromptSha256,
+    baselineMessageIds,
+    sendCount,
+    sendActionCount
+  }) {
+    const originalIdDeadline = Math.min(deadline, Date.now() + 5_000);
+    while (Date.now() < originalIdDeadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
+      this.#assertReviewIdentity(snapshot, identity);
+      if ((snapshot.messages || []).some((message) => message.role === 'user' && message.id === userMessageId)) {
+        return { currentUserMessageId: userMessageId, contentRebind: null };
+      }
+      await sleep(250);
+    }
+
+    if (
+      typeof expectedPrompt !== 'string' ||
+      crypto.createHash('sha256').update(expectedPrompt, 'utf8').digest('hex') !== expectedPromptSha256 ||
+      !Array.isArray(baselineMessageIds) ||
+      new Set(baselineMessageIds).size !== baselineMessageIds.length ||
+      sendCount !== 1 ||
+      sendActionCount !== 1
+    ) {
+      throw new Error('review_content_rebind_receipt_invalid');
+    }
+
     let firstStable = null;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
       this.#assertReviewIdentity(snapshot, identity);
-      const userIndex = (snapshot.messages || []).findIndex((message) => message.role === 'user' && message.id === userMessageId);
-      if (userIndex < 0) throw new Error('review_user_message_identity_unreadable');
-      const following = snapshot.messages.slice(userIndex + 1);
-      const nextUserOffset = following.findIndex((message) => message.role === 'user');
-      const targetTurn = nextUserOffset >= 0 ? following.slice(0, nextUserOffset) : following;
-      const assistants = targetTurn.filter((message) => message.role === 'assistant');
-      if (assistants.length > 1) throw new Error('review_assistant_message_ambiguous');
-      const assistant = assistants[0] || null;
-      const active = !!snapshot.controls?.stop || !!snapshot.controls?.continue || !!snapshot.controls?.retry;
+      if (
+        snapshot.controls?.stop ||
+        snapshot.controls?.continue ||
+        snapshot.controls?.retry ||
+        snapshot.controls?.answerNow
+      ) {
+        throw new Error('review_content_rebind_controls_active');
+      }
+      const users = (snapshot.messages || []).filter((message) => message.role === 'user');
+      if (users.some((message) => message.textIdentityReadable !== true)) {
+        throw new Error('review_content_rebind_user_content_unreadable');
+      }
+      const matches = users.filter((message) =>
+        message.text === expectedPrompt &&
+        crypto.createHash('sha256').update(message.text, 'utf8').digest('hex') === expectedPromptSha256
+      );
+      if (matches.length !== 1) throw new Error('review_content_rebind_user_match_ambiguous');
+      const anchor = matches[0];
+      if (!anchor.id) throw new Error('review_content_rebind_anchor_unreadable');
+      if (baselineMessageIds.includes(anchor.id)) throw new Error('review_content_rebind_baseline_collision');
+      const turn = await this.#reviewAssistantResult({
+        snapshot,
+        userMessageId,
+        currentUserMessageId: anchor.id
+      });
+      if (!turn.assistant?.id || !turn.assistant.text) {
+        throw new Error('review_content_rebind_assistant_unreadable');
+      }
+      const laterUsers = users.filter((message) => message.order > anchor.order);
+      if (laterUsers.length) throw new Error('review_content_rebind_later_user_ambiguous');
+      const signature = JSON.stringify({
+        url: snapshot.url,
+        conversationId: snapshot.conversationId,
+        modelEvidence: snapshot.modelEvidence,
+        currentUserMessageId: anchor.id,
+        assistantMessageId: turn.assistant?.id || null,
+        assistantCount: turn.assistant ? 1 : 0,
+        assistantTextSha256: turn.assistant?.text
+          ? crypto.createHash('sha256').update(turn.assistant.text, 'utf8').digest('hex')
+          : null
+      });
+      const now = Date.now();
+      if (!firstStable || firstStable.signature !== signature) {
+        firstStable = { signature, observedAt: now, currentUserMessageId: anchor.id };
+      } else if (now - firstStable.observedAt >= 3_000) {
+        return {
+          currentUserMessageId: anchor.id,
+          contentRebind: {
+            mode: 'exact_prompt_content',
+            originalUserMessageId: userMessageId,
+            currentUserMessageId: anchor.id,
+            promptSha256: expectedPromptSha256,
+            baselineMessageCount: baselineMessageIds.length,
+            observedAt: now
+          }
+        };
+      }
+      await sleep(500);
+    }
+    throw new Error('review_content_rebind_unstable');
+  }
+
+  async #waitForReviewAssistant({
+    userMessageId,
+    deadline,
+    identity,
+    currentUserMessageId = userMessageId,
+    contentRebind = null
+  }) {
+    let firstStable = null;
+    while (Date.now() < deadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
+      this.#assertReviewIdentity(snapshot, identity);
+      const { assistant, active } = await this.#reviewAssistantResult({
+        snapshot,
+        userMessageId,
+        currentUserMessageId,
+        contentRebind
+      });
       if (assistant?.id && assistant.text && !active) {
         const textSha256 = crypto.createHash('sha256').update(assistant.text, 'utf8').digest('hex');
         const observation = {
@@ -1489,7 +1644,8 @@ export class ChatGPTController {
             clickedControls: [],
             conversationUrl: snapshot.url,
             conversationId: snapshot.conversationId,
-            modelEvidence: snapshot.modelEvidence
+            modelEvidence: snapshot.modelEvidence,
+            contentRebind
           };
         }
         if (
@@ -1505,6 +1661,47 @@ export class ChatGPTController {
       await sleep(500);
     }
     throw new Error('timeout_waiting_for_response');
+  }
+
+  async #waitForReviewIdentity({
+    expectedUrl,
+    expectedConversationId,
+    expectedModel,
+    allowUnboundRoot = false,
+    deadline
+  }) {
+    const identity = { expectedUrl, expectedConversationId, expectedModel, allowUnboundRoot };
+    const loadDeadline = Math.min(deadline, Date.now() + 30_000);
+    let lastSnapshot = null;
+    while (Date.now() < loadDeadline) {
+      this.#throwIfStopRequested();
+      const snapshot = await this.#reviewSnapshot(expectedModel);
+      lastSnapshot = snapshot;
+      const expectedIdentityVisible =
+        (snapshot.url === expectedUrl && snapshot.conversationId === expectedConversationId) ||
+        (allowUnboundRoot && snapshot.url === expectedUrl && !snapshot.conversationId);
+      if (expectedIdentityVisible) {
+        try {
+          this.#assertReviewIdentity(snapshot, identity);
+          return snapshot;
+        } catch (error) {
+          if (String(error?.message || error) !== 'review_model_mismatch') throw error;
+        }
+      } else {
+        let transitional = snapshot.url === 'about:blank';
+        try {
+          const observed = new URL(snapshot.url);
+          const expected = new URL(expectedUrl);
+          transitional = transitional || (
+            observed.origin === expected.origin && !snapshot.conversationId
+          );
+        } catch {}
+        if (!transitional) this.#assertReviewIdentity(snapshot, identity);
+      }
+      await sleep(200);
+    }
+    this.#assertReviewIdentity(lastSnapshot, identity);
+    return lastSnapshot;
   }
 
   async reviewQuery({
@@ -1525,8 +1722,7 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
-      const before = await this.#reviewSnapshot(expectedModel);
-      this.#assertReviewIdentity(before, identity);
+      const before = await this.#waitForReviewIdentity({ ...identity, deadline });
       const active = !!before.controls?.stop || !!before.controls?.continue || !!before.controls?.retry;
       if (active) {
         const latestUser = [...(before.messages || [])].reverse().find((message) => message.role === 'user' && message.id);
@@ -1571,7 +1767,18 @@ export class ChatGPTController {
     }
   }
 
-  async observeReviewResponse({ expectedUrl, expectedConversationId, expectedModel, userMessageId, timeoutMs }) {
+  async observeReviewResponse({
+    expectedUrl,
+    expectedConversationId,
+    expectedModel,
+    userMessageId,
+    expectedPrompt,
+    expectedPromptSha256,
+    baselineMessageIds,
+    sendCount,
+    sendActionCount,
+    timeoutMs
+  }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
     let identity = { expectedUrl, expectedConversationId, expectedModel };
     while (provisionalChatgptConversationId(identity.expectedConversationId) && Date.now() < deadline) {
@@ -1594,10 +1801,22 @@ export class ChatGPTController {
     if (provisionalChatgptConversationId(identity.expectedConversationId)) {
       throw new Error('review_first_binding_canonical_identity_unreadable');
     }
+    await this.#waitForReviewIdentity({ ...identity, deadline });
+    const anchor = await this.#resolveReviewUserAnchor({
+      userMessageId,
+      deadline,
+      identity,
+      expectedPrompt,
+      expectedPromptSha256,
+      baselineMessageIds,
+      sendCount,
+      sendActionCount
+    });
     return await this.#waitForReviewAssistant({
       userMessageId,
       deadline,
-      identity
+      identity,
+      ...anchor
     });
   }
 

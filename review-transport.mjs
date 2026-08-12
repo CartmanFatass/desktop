@@ -143,7 +143,10 @@ function normalizeRequest(input) {
   const conversationId = requiredText(request.conversationId, 'conversationId', { max: 256 });
   const firstBinding = request.firstBinding === true;
   if (firstBinding) {
-    if (provider !== 'chatgpt' || conversationUrl !== 'https://chatgpt.com/' || conversationId !== '__new__') {
+    const supportedRoot =
+      (provider === 'chatgpt' && conversationUrl === 'https://chatgpt.com/') ||
+      (provider === 'gemini' && conversationUrl === 'https://gemini.google.com/app');
+    if (!supportedRoot || conversationId !== '__new__') {
       fail('review_invalid_request', { field: 'firstBinding' });
     }
   } else {
@@ -279,10 +282,11 @@ function validateResult(result, request, expectedUserMessageId = null) {
     },
     conversationUrl: result.conversationUrl,
     conversationId: result.conversationId,
-    modelEvidence: typeof result.modelEvidence === 'string' && result.modelEvidence.trim()
-      ? result.modelEvidence
-      : request.model,
-    clickedControls: []
+    modelEvidence: requiredText(result.modelEvidence, 'modelEvidence', { max: 256 }),
+    clickedControls: [],
+    contentRebind: result.contentRebind && typeof result.contentRebind === 'object'
+      ? { ...result.contentRebind }
+      : null
   };
 }
 
@@ -292,6 +296,11 @@ async function observePersistedReview({ observeReviewResponse, operation, reques
     expectedConversationId: operation.conversationId,
     expectedModel: request.model,
     userMessageId: operation.userMessageId,
+    expectedPrompt: request.prompt,
+    expectedPromptSha256: operation.promptSha256,
+    baselineMessageIds: operation.baselineMessageIds,
+    sendCount: operation.sendCount,
+    sendActionCount: operation.sendActionCount,
     timeoutMs: request.timeoutMs
   });
 }

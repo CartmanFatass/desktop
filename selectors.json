@@ -5,6 +5,6 @@
   "assistantMessage": "[data-message-author-role=\"assistant\"], model-response, .model-response-text, [data-test-id=\"model-response\"], [data-response-author=\"model\"], article[data-testid*=\"answer\" i], [data-testid*=\"assistant\" i], [data-testid=\"chat-message\"], [data-is-assistant=\"true\"]",
   "reviewUserMessage": "[data-message-author-role=\"user\"]",
   "reviewAssistantMessage": "[data-message-author-role=\"assistant\"]",
-  "reviewModelEvidence": "button[data-testid*=\"model\" i], [role=\"button\"][data-testid*=\"model\" i], button[aria-label*=\"model\" i], [role=\"button\"][aria-label*=\"model\" i]",
+  "reviewModelEvidence": "button[data-testid*=\"model\" i], [role=\"button\"][data-testid*=\"model\" i], button[aria-label*=\"model\" i], [role=\"button\"][aria-label*=\"model\" i], [data-test-id=\"bard-mode-menu-button\"] button, [data-test-id=\"bard-mode-menu-button\"] [role=\"button\"]",
   "composerRoot": "form, main"
 }

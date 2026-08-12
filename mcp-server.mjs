@@ -135,19 +135,21 @@ registerTool(
   'agentify_review_query',
   {
     description:
-      'Strict receipt-bearing ChatGPT Pro review transport. Binds one stable key to one exact conversation/model, submits at most once per idempotency key, never activates Continue/Retry/Answer now, and verifies natural completion from exact message identities.',
+      'Strict receipt-bearing ChatGPT or Gemini review transport. Binds one stable key to one exact conversation/model, submits at most once per idempotency key, never activates Continue/Retry/Answer now, and verifies natural completion from exact message identities.',
     inputSchema: {
       stableKey: z.string().describe('Persistent stable binding key.'),
-      provider: z.literal('chatgpt').describe('Exact provider identity.'),
+      provider: z.enum(['chatgpt', 'gemini']).describe('Exact provider identity.'),
       model: z.string().describe('Exact visible Pro model label expected in the conversation UI.'),
-      conversationUrl: z.string().describe('Exact registered ChatGPT conversation URL.'),
-      conversationId: z.string().describe('Exact conversation identity contained in conversationUrl.'),
+      conversationUrl: z.string().describe('Exact registered conversation URL, or the provider root for first binding.'),
+      conversationId: z.string().describe('Exact conversation identity contained in conversationUrl, or __new__ for first binding.'),
       idempotencyKey: z.string().describe('Immutable operation idempotency key.'),
       prompt: z.string().optional().describe('Exact prompt bytes to submit once. Use either prompt or promptPath.'),
       promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is submitted once. Use either promptPath or prompt.'),
       promptSha256: z.string().describe('Lowercase SHA-256 of the exact UTF-8 prompt.'),
       timeoutMs: z.number().optional().describe('Single absolute operation deadline, maximum 45 minutes.'),
-      verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.')
+      verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.'),
+      firstBinding: z.boolean().optional().describe('Bind a clean provider-root conversation to its concrete identity created by the one send.'),
+      existingTabId: z.string().optional().describe('Adopt this exact already-inspected provider tab for a new operation.')
     }
   },
   async ({
@@ -161,7 +163,9 @@ registerTool(
     promptPath,
     promptSha256,
     timeoutMs,
-    verifyExisting
+    verifyExisting,
+    firstBinding,
+    existingTabId
   }) => {
     const exactPrompt = await prepareReviewPromptInput({ prompt, promptPath, promptSha256 });
     const conn = await getConn();
@@ -179,7 +183,9 @@ registerTool(
         prompt: exactPrompt,
         promptSha256,
         timeoutMs: timeoutMs ?? 45 * 60_000,
-        verifyExisting: verifyExisting === true
+        verifyExisting: verifyExisting === true,
+        firstBinding: firstBinding === true,
+        existingTabId: existingTabId || undefined
       }
     });
     const receipt = data.receipt || null;
