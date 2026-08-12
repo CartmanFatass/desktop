@@ -783,6 +783,7 @@ export function startHttpApi({
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
         const controller = tabs.getControllerById(tabId);
         const conversationUrl = await runExclusive(controller, async () => controller.newConversation());
+        tabs.updateTabUrl(tabId, conversationUrl);
         return sendJson(res, 200, { ok: true, tabId, url: conversationUrl });
       }
       if (url.pathname === '/bundles/list' && req.method === 'GET') {
@@ -852,8 +853,12 @@ export function startHttpApi({
         if (!to) return sendJson(res, 400, { error: 'missing_url' });
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
         const controller = tabs.getControllerById(tabId);
-        await runExclusive(controller, async () => controller.navigate(to));
-        return sendJson(res, 200, { ok: true, tabId, url: await controller.getUrl() });
+        const observedUrl = await runExclusive(controller, async () => {
+          await controller.navigate(to);
+          return await controller.getUrl();
+        });
+        tabs.updateTabUrl(tabId, observedUrl);
+        return sendJson(res, 200, { ok: true, tabId, url: observedUrl });
       }
 
       if (url.pathname === '/ensure-ready' && req.method === 'POST') {
