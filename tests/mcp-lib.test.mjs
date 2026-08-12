@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 import { ensureToken, writeState } from '../state.mjs';
@@ -58,6 +59,50 @@ test('mcp-lib: requestJson throws with status and body', async () => {
       return true;
     }
   );
+});
+
+test('mcp-lib: default loopback client bypasses fetch for delayed headers and body', async () => {
+  const server = http.createServer((req, res) => {
+    assert.equal(req.headers.authorization, 'Bearer t');
+    assert.equal(req.headers['content-type'], 'application/json');
+    if (req.url === '/delayed-headers') {
+      setTimeout(() => {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ ok: true, delayed: 'headers' }));
+      }, 80);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.flushHeaders();
+    setTimeout(() => res.end(JSON.stringify({ ok: true, delayed: 'body' })), 80);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error('default_fetch_must_not_be_called');
+  };
+  try {
+    const { port } = server.address();
+    const delayedHeaders = await requestJson({
+      baseUrl: `http://127.0.0.1:${port}`,
+      token: 't',
+      method: 'POST',
+      path: '/delayed-headers',
+      body: { request: 'long-running' }
+    });
+    const delayedBody = await requestJson({
+      baseUrl: `http://127.0.0.1:${port}`,
+      token: 't',
+      method: 'POST',
+      path: '/delayed-body',
+      body: { request: 'long-running' }
+    });
+    assert.deepEqual(delayedHeaders, { ok: true, delayed: 'headers' });
+    assert.deepEqual(delayedBody, { ok: true, delayed: 'body' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
 
 test('mcp-lib: ensureDesktopRunning uses existing connection when serverId matches', async () => {

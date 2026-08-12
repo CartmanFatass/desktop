@@ -286,6 +286,16 @@ function validateResult(result, request, expectedUserMessageId = null) {
   };
 }
 
+async function observePersistedReview({ observeReviewResponse, operation, request }) {
+  return await observeReviewResponse({
+    expectedUrl: operation.conversationUrl,
+    expectedConversationId: operation.conversationId,
+    expectedModel: request.model,
+    userMessageId: operation.userMessageId,
+    timeoutMs: request.timeoutMs
+  });
+}
+
 export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
   if (!stateDir || !tabs) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
@@ -302,6 +312,10 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     };
     const existing = state.operations[request.idempotencyKey];
     if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+    if (request.verifyExisting) {
+      if (!existing || !existing.userMessageId) fail('review_observation_unavailable');
+      return { existing: true, operation: { ...existing }, binding: binding ? { ...binding } : null };
+    }
     if (request.firstBinding) {
       if (binding && !existing) fail('review_binding_mismatch');
     } else {
@@ -363,6 +377,11 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
   const controller = tabs.getControllerById(tabId);
   const runControllerExclusive = async (fn) =>
     typeof controller.runExclusive === 'function' ? await controller.runExclusive(fn) : await fn();
+  // The verification branch receives only this bound observer capability.  It
+  // cannot reach the controller's send, input, or control-activation methods.
+  const observeReviewResponse = typeof controller?.observeReviewResponse === 'function'
+    ? controller.observeReviewResponse.bind(controller)
+    : null;
 
   const onSubmitted = async (submitted) => {
     const userMessageId = requiredText(submitted?.userMessageId, 'userMessageId', { max: 512 });
@@ -470,7 +489,18 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         });
         return { diagnosticOnly: true, diagnostic };
       }
-      if (currentOperation.status === 'COMPLETE' && !request.verifyExisting) {
+      if (request.verifyExisting) {
+        if (!intake.existing || !currentOperation.userMessageId) {
+          fail('review_observation_unavailable');
+        }
+        if (!observeReviewResponse) fail('review_observation_unavailable');
+        // Explicit verification is a fresh, bounded read-only attempt.  It is
+        // deliberately independent of the original submission deadline, which
+        // may have elapsed while the provider was still producing a response.
+        const result = await observePersistedReview({ observeReviewResponse, operation: currentOperation, request });
+        return { result, expectedUserMessageId: currentOperation.userMessageId };
+      }
+      if (currentOperation.status === 'COMPLETE') {
         return { completedOperation: { ...currentOperation } };
       }
       const remainingMs = Math.floor(currentOperation.deadlineAt - Date.now());
@@ -555,6 +585,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (request.diagnoseExisting) throw error;
     let safeErrorData = sanitizeReviewErrorData(error?.data);
     if (
+      !request.verifyExisting &&
       String(error?.message || error) === 'review_composer_identity_mismatch' &&
       typeof controller?.inspectReviewComposerIdentity === 'function'
     ) {

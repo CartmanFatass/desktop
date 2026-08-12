@@ -175,8 +175,9 @@ unreadable and the durable intent prevents an automatic duplicate submission.
 
 Completion requires the same assistant message identity and response hash in two
 snapshots at least three seconds apart, with no active Stop, Continue, or Retry
-control. The maximum operation deadline is 45 minutes. Ambiguous identity or a crash
-around submission never triggers an automatic second send.
+control. The maximum submission deadline is 45 minutes. An explicit verification of
+a persisted submission uses a new, bounded observation window and never sends again.
+Ambiguous identity or a crash around submission never triggers an automatic second send.
 
 The 2026-07-31 production dependency audit reports 11 advisories (6 moderate,
 5 high, 0 critical). The direct `@modelcontextprotocol/sdk` dependency is

@@ -17,12 +17,13 @@ const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').dige
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, reviewPrompts: [], observe: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
+  const calls = { review: 0, reviewPrompts: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
   let failAfterSubmittedReceipt = false;
   let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
   let reviewFailure = null;
   let sendControlFailure = null;
+  let observeFailure = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
   let fixturePrompt = '';
@@ -130,6 +131,8 @@ async function fixture() {
     },
     async observeReviewResponse(args) {
       calls.observe += 1;
+      calls.observeArgs.push(args);
+      if (observeFailure) throw observeFailure;
       const recoveredUrl = args.expectedConversationId?.startsWith('WEB:')
         ? 'https://chatgpt.com/c/canonical-bound'
         : args.expectedUrl;
@@ -234,6 +237,17 @@ async function fixture() {
     },
     setSendControlFailure(error) {
       sendControlFailure = error;
+    },
+    setObserveFailure(error) {
+      observeFailure = error;
+    },
+    armForbiddenControls() {
+      for (const method of ['reviewQuery', 'send', 'input', 'click', 'Continue', 'Retry', 'Stop', 'answerNow', 'inspectReviewComposerIdentity']) {
+        controller[method] = async () => {
+          calls.forbidden += 1;
+          throw new Error(`forbidden_control_called:${method}`);
+        };
+      }
     },
     setSubmissionDiagnostic(diagnostic) {
       submissionDiagnosticResult = diagnostic;
@@ -658,6 +672,99 @@ test('review transport: restart verification is observe-only and bound to the sa
   assert.equal(verified.responseSha256, first.responseSha256);
   assert.equal(f.calls.review, 1);
   assert.equal(f.calls.observe, 1);
+});
+
+test('review transport: missing verifyExisting is rejected before state, tab, or controller access', async () => {
+  const f = await fixture();
+  f.armForbiddenControls();
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, verifyExisting: true, existingTabId: 'tab-existing' }
+    }),
+    /review_observation_unavailable/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  assert.deepEqual(state.operations, {});
+  assert.deepEqual(state.bindings, {});
+  assert.deepEqual(f.calls.adopt, []);
+  assert.deepEqual(f.calls.ensure, []);
+  assert.equal(f.calls.observe, 0);
+  assert.equal(f.calls.review, 0);
+  assert.equal(f.calls.forbidden, 0);
+});
+
+test('review transport: verifyExisting observes a persisted submission after its original deadline', async () => {
+  const f = await fixture();
+  f.setFailAfterSubmittedReceipt(true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /simulated_crash_after_submitted_receipt/
+  );
+  const expired = await readReviewTransportState(f.stateDir);
+  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
+  await writeReviewTransportState(expired, f.stateDir);
+
+  f.setFailAfterSubmittedReceipt(false);
+  const verified = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(verified.status, 'COMPLETE');
+  assert.equal(verified.sendCount, 1);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+  assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
+});
+
+test('review transport: bounded failed verification preserves its single submitted operation', async () => {
+  const f = await fixture();
+  f.setFailAfterSubmittedReceipt(true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /simulated_crash_after_submitted_receipt/
+  );
+  const expired = await readReviewTransportState(f.stateDir);
+  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
+  await writeReviewTransportState(expired, f.stateDir);
+
+  f.setObserveFailure(new Error('timeout_waiting_for_response'));
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, verifyExisting: true }
+    }),
+    /timeout_waiting_for_response/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  assert.deepEqual(Object.keys(state.operations), [f.request.idempotencyKey]);
+  assert.equal(operation.sendCount, 1);
+  assert.equal(operation.sendActionCount, 1);
+  assert.equal(operation.status, 'BLOCKED');
+  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+  assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
+});
+
+test('review transport: repeated verifyExisting has no send or control capability', async () => {
+  const f = await fixture();
+  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  f.armForbiddenControls();
+  const verified = { ...f.request, verifyExisting: true };
+  const [once, twice] = await Promise.all([
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: verified }),
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: verified })
+  ]);
+  assert.equal(once.operationId, first.operationId);
+  assert.equal(twice.operationId, first.operationId);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 2);
+  assert.equal(f.calls.forbidden, 0);
 });
 
 test('review transport: stable-key mismatch and prompt hash mismatch fail without another send', async () => {

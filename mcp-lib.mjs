@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -66,19 +68,45 @@ async function validateConn({ conn, fetchImpl }) {
   return { ok: true, serverId: healthData?.serverId || null };
 }
 
-export async function requestJson({ baseUrl, token, method, path: pth, body, fetchImpl = fetch }) {
-  const res = await fetchImpl(`${baseUrl}${pth}`, {
-    method,
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${token}`
-    },
-    body: body ? JSON.stringify(body) : undefined
+async function requestJsonNoTimeout({ url, method, headers, body }) {
+  const target = new URL(url);
+  const request = target.protocol === 'https:' ? https.request : http.request;
+  return await new Promise((resolve, reject) => {
+    const req = request(target, { method, headers, timeout: 0 }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('error', reject);
+      res.on('end', () => {
+        let data = {};
+        try {
+          data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        } catch {
+          // Match Response.json() failure handling below: an unreadable payload
+          // is represented as an empty object for normal HTTP error reporting.
+        }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data });
+      });
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data?.error) {
-    const err = new Error(data?.message || data?.error || `http_${res.status}`);
-    err.data = { status: res.status, body: data };
+}
+
+export async function requestJson({ baseUrl, token, method, path: pth, body, fetchImpl }) {
+  const url = `${baseUrl}${pth}`;
+  const headers = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${token}`
+  };
+  const serializedBody = body ? JSON.stringify(body) : undefined;
+  const response = fetchImpl
+    ? await fetchImpl(url, { method, headers, body: serializedBody })
+    : await requestJsonNoTimeout({ url, method, headers, body: serializedBody });
+  const data = 'data' in response ? response.data : await response.json().catch(() => ({}));
+  if (!response.ok || data?.error) {
+    const err = new Error(data?.message || data?.error || `http_${response.status}`);
+    err.data = { status: response.status, body: data };
     throw err;
   }
   return data;
