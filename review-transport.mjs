@@ -71,7 +71,7 @@ export function sanitizeReviewErrorData(value) {
   const output = {};
   for (const field of [
     'ok', 'serializerOk', 'noClickProven', 'initialSerializerOk',
-    'emptyVerified', 'caretVerified', 'recoveredExact'
+    'emptyVerified', 'caretVerified', 'recoveredExact', 'selectionVerified'
   ]) {
     if (typeof data[field] === 'boolean') output[field] = data[field];
   }
@@ -79,7 +79,8 @@ export function sanitizeReviewErrorData(value) {
     'serializerMethod', 'serializerError', 'serializerTag', 'rootTag',
     'predicate', 'failureStage', 'textModel', 'identityMode', 'mismatchClass',
     'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint',
-    'replacementModel', 'composerKind', 'clearMethod', 'caretMethod'
+    'replacementModel', 'composerKind', 'clearMethod', 'caretMethod',
+    'commitmentClass'
   ]) {
     if (data[field] === null) {
       output[field] = null;
@@ -94,7 +95,8 @@ export function sanitizeReviewErrorData(value) {
     'newUserMessageCount', 'sendActionCount', 'expectedRawLength',
     'expectedCanonicalLength', 'observedRawLength', 'observedCanonicalLength',
     'browserSpaceRebalanceCount', 'mismatchCount', 'firstMismatchCodePointIndex',
-    'initialSerializedLength', 'emptySnapshotCount', 'promptInsertCount'
+    'initialSerializedLength', 'emptySnapshotCount', 'promptInsertCount',
+    'deleteKeyCount'
   ]) {
     if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
       output[field] = data[field];
@@ -453,6 +455,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (op.sendActionCount !== 1) fail('review_send_action_receipt_missing');
+      if (op.observedUserMessageId !== userMessageId) {
+        fail('review_observed_user_message_identity_mismatch');
+      }
       op.status = 'SUBMITTED';
       op.sendCount = 1;
       op.userMessageId = userMessageId;
@@ -461,6 +466,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
       op.modelEvidence = submitted?.modelEvidence || null;
+      op.observedConversationUrl = submittedUrl;
+      op.observedConversationId = submittedId;
+      op.observedCommitmentClass = 'turn_exact';
       op.renderedIdentity = {
         textModel: promptIdentity.textModel,
         sourceSha256: request.promptSha256,
@@ -515,6 +523,44 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     });
   };
 
+  const onUserTurnObserved = async (observed) => {
+    const observedUserMessageId = requiredText(observed?.observedUserMessageId, 'observedUserMessageId', { max: 512 });
+    const observedUrl = requiredText(observed?.conversationUrl, 'conversationUrl', { max: 2048 });
+    const observedId = requiredText(observed?.conversationId, 'conversationId', { max: 256 });
+    const observedIdentity = conversationIdentityFromUrl(observedUrl);
+    const allowedClasses = new Set(['turn_exact', 'turn_unreadable', 'turn_content_mismatch']);
+    if (
+      observedIdentity.provider !== request.provider ||
+      observedIdentity.conversationId !== observedId ||
+      !allowedClasses.has(observed?.commitmentClass) ||
+      observed?.newUserMessageCount !== 1
+    ) {
+      fail('review_observed_user_turn_receipt_invalid');
+    }
+    if (!request.firstBinding && (observedUrl !== request.conversationUrl || observedId !== request.conversationId)) {
+      fail('review_conversation_identity_mismatch');
+    }
+    const safeEvidence = sanitizeReviewErrorData(observed);
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.sendActionCount !== 1 || op.sendCount !== 0 || op.userMessageId) {
+        fail('review_operation_state_invalid');
+      }
+      if (op.observedUserMessageId && op.observedUserMessageId !== observedUserMessageId) {
+        fail('review_observed_user_message_identity_mismatch');
+      }
+      op.observedUserMessageId = observedUserMessageId;
+      op.observedUserMessageAt = Number.isFinite(observed?.observedAt) ? observed.observedAt : Date.now();
+      op.observedConversationUrl = observedUrl;
+      op.observedConversationId = observedId;
+      op.observedCommitmentClass = observed.commitmentClass;
+      op.observedTurnEvidence = safeEvidence;
+      op.newUserMessageCount = 1;
+      op.updatedAt = Date.now();
+    });
+  };
+
   const onComposerVerified = async (identity) => {
     if (
       identity?.ok !== true ||
@@ -524,6 +570,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       typeof identity.clearMethod !== 'string' || !identity.clearMethod ||
       identity.emptyVerified !== true ||
       identity.emptySnapshotCount !== 2 ||
+      identity.selectionVerified !== true ||
+      !Number.isInteger(identity.deleteKeyCount) ||
+      identity.deleteKeyCount < 0 || identity.deleteKeyCount > 1 ||
       identity.caretVerified !== true ||
       typeof identity.caretMethod !== 'string' || !identity.caretMethod ||
       identity.promptInsertCount !== 1 ||
@@ -638,6 +687,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           onPrepared,
           onComposerVerified,
           onSendAction,
+          onUserTurnObserved,
           onSubmitted,
           firstBinding: request.firstBinding
         });
@@ -726,12 +776,16 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.status = 'BLOCKED';
       op.terminalState = preSendFailure ? 'IDENTITY_UNREADABLE' : 'SUBMITTED_UNVERIFIED';
       op.error = String(error?.message || error);
+      const newUserMessageCount = Number.isInteger(safeErrorData?.newUserMessageCount)
+        ? safeErrorData.newUserMessageCount
+        : Number.isInteger(op.newUserMessageCount) ? op.newUserMessageCount : 0;
       const mechanicalErrorData = sanitizeReviewErrorData({
         ...(safeErrorData || {}),
         predicate: String(error?.message || error),
         failureStage: op.failureStage,
         sendActionCount: op.sendActionCount || 0,
-        newUserMessageCount: op.newUserMessageCount || 0
+        newUserMessageCount,
+        commitmentClass: safeErrorData?.commitmentClass || op.observedCommitmentClass || null
       });
       if (mechanicalErrorData) op.errorData = mechanicalErrorData;
       op.updatedAt = Date.now();

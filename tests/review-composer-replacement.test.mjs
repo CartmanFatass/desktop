@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  clearReviewComposerElement,
   inspectReviewComposerEmptyElement,
+  prepareReviewComposerClearSelection,
   positionReviewComposerCaret
 } from '../review-composer-replacement.mjs';
 
@@ -21,38 +21,59 @@ function eventWindow() {
 function textareaFixture(value = 'persisted draft') {
   let nativeValue = value;
   const windowRef = eventWindow();
-  windowRef.HTMLTextAreaElement = function HTMLTextAreaElement() {};
-  Object.defineProperty(windowRef.HTMLTextAreaElement.prototype, 'value', {
-    set(next) { nativeValue = String(next); }, configurable: true
-  });
-  const events = [];
   const documentRef = { defaultView: windowRef, activeElement: null };
   const element = {
     tagName: 'TEXTAREA', ownerDocument: documentRef, disabled: false, readOnly: false,
     get value() { return nativeValue; },
-    set value(_) { throw new Error('instance setter must not be used'); },
+    set value(next) { nativeValue = String(next); },
     getAttribute() { return null; },
     matches(selector) { return selector === 'textarea'; },
     focus() { documentRef.activeElement = element; },
-    dispatchEvent(event) { events.push(event.type); return true; },
     setSelectionRange(start, end) { element.selectionStart = start; element.selectionEnd = end; },
     selectionStart: null, selectionEnd: null
   };
-  return { element, events, setNativeValue: (next) => { nativeValue = next; } };
+  return { element, setValue: (next) => { nativeValue = next; } };
 }
 
 function contenteditableFixture(text = 'persisted draft') {
   const windowRef = eventWindow();
-  const events = [];
+  let selectedRange = null;
+  const selection = {
+    rangeCount: 0,
+    isCollapsed: true,
+    anchorNode: null,
+    focusNode: null,
+    removeAllRanges() { selectedRange = null; selection.rangeCount = 0; },
+    addRange(range) {
+      selectedRange = range;
+      selection.rangeCount = 1;
+      selection.isCollapsed = false;
+      selection.anchorNode = element;
+      selection.focusNode = element;
+    },
+    getRangeAt() { return selectedRange; }
+  };
   const documentRef = {
     defaultView: windowRef,
     activeElement: null,
     createRange() {
       return {
-        selectNodeContents() {}, collapse() {}
+        startContainer: null, startOffset: null, endContainer: null, endOffset: null,
+        selectNodeContents(node) {
+          this.startContainer = node;
+          this.startOffset = 0;
+          this.endContainer = node;
+          this.endOffset = node.childNodes.length;
+        },
+        collapse() {
+          selection.isCollapsed = true;
+          this.endContainer = this.startContainer;
+          this.endOffset = this.startOffset;
+        }
       };
     }
   };
+  windowRef.getSelection = () => selection;
   const element = {
     tagName: 'DIV', ownerDocument: documentRef, isContentEditable: true,
     childNodes: text ? [{ nodeType: 3, nodeValue: text }] : [],
@@ -61,10 +82,9 @@ function contenteditableFixture(text = 'persisted draft') {
     matches() { return false; },
     focus() { documentRef.activeElement = element; },
     contains(node) { return node === element; },
-    replaceChildren(...nodes) { element.childNodes = nodes; },
-    dispatchEvent(event) { events.push(event.type); return true; }
+    replaceChildren(...nodes) { element.childNodes = nodes; }
   };
-  return { element, events };
+  return { element, selection };
 }
 
 const serialize = (element) => ({
@@ -72,36 +92,39 @@ const serialize = (element) => ({
   text: element.childNodes.map((node) => String(node.nodeValue || '')).join('')
 });
 
-test('review composer replacement: textarea uses native setter, input event, empty verification, then caret zero', () => {
+test('review composer replacement: textarea verifies a full native selection before one Backspace', () => {
   const fixture = textareaFixture();
-  const cleared = clearReviewComposerElement(fixture.element);
-  assert.deepEqual(cleared, {
+  const prepared = prepareReviewComposerClearSelection(fixture.element, { hasContent: true });
+  assert.deepEqual(prepared, {
     ok: true,
     composerKind: 'textarea',
-    clearMethod: 'native_value_setter',
-    clearRevision: '',
-    inputEventDispatched: true
+    clearMethod: 'verified_selection_backspace',
+    selectionVerified: true,
+    selectedLength: 'persisted draft'.length,
+    deleteKeyRequired: true
   });
-  assert.deepEqual(fixture.events, ['input']);
+  fixture.setValue('');
   assert.equal(inspectReviewComposerEmptyElement(fixture.element, serialize).ok, true);
   assert.deepEqual(positionReviewComposerCaret(fixture.element), {
     ok: true, composerKind: 'textarea', caretMethod: 'native_selection_range'
   });
 });
 
-test('review composer replacement: contenteditable replaceChildren dispatches input and exposes an empty DOM', () => {
+test('review composer replacement: contenteditable verifies a range covering the entire editable root', () => {
   const fixture = contenteditableFixture();
-  const cleared = clearReviewComposerElement(fixture.element);
-  assert.equal(cleared.ok, true);
-  assert.equal(cleared.clearMethod, 'replace_children');
-  assert.equal(cleared.clearRevision, '');
-  assert.deepEqual(fixture.events, ['input']);
+  const prepared = prepareReviewComposerClearSelection(fixture.element, { hasContent: true });
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.clearMethod, 'verified_selection_backspace');
+  assert.equal(prepared.selectionVerified, true);
+  assert.equal(prepared.deleteKeyRequired, true);
+  fixture.element.replaceChildren();
   assert.equal(inspectReviewComposerEmptyElement(fixture.element, serialize).ok, true);
 });
 
 test('review composer replacement: asynchronous draft rehydration is detected by the later empty snapshot', async () => {
   const fixture = contenteditableFixture();
-  assert.equal(clearReviewComposerElement(fixture.element).ok, true);
+  assert.equal(prepareReviewComposerClearSelection(fixture.element, { hasContent: true }).ok, true);
+  fixture.element.replaceChildren();
   assert.equal(inspectReviewComposerEmptyElement(fixture.element, serialize).ok, true);
   await new Promise((resolve) => setTimeout(() => {
     fixture.element.childNodes = [{ nodeType: 3, nodeValue: 'rehydrated draft' }];
@@ -113,11 +136,12 @@ test('review composer replacement: asynchronous draft rehydration is detected by
   assert.equal(second.serializedLength, 'rehydrated draft'.length);
 });
 
-test('review composer replacement: textarea persistence rehydration is detected after native clearing', () => {
+test('review composer replacement: textarea persistence rehydration is detected after verified key clearing', () => {
   const fixture = textareaFixture();
-  assert.equal(clearReviewComposerElement(fixture.element).ok, true);
+  assert.equal(prepareReviewComposerClearSelection(fixture.element, { hasContent: true }).ok, true);
+  fixture.setValue('');
   assert.equal(inspectReviewComposerEmptyElement(fixture.element, serialize).ok, true);
-  fixture.setNativeValue('rehydrated draft');
+  fixture.setValue('rehydrated draft');
   assert.equal(inspectReviewComposerEmptyElement(fixture.element, serialize).ok, false);
 });
 

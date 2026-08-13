@@ -154,6 +154,35 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
     if (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) {
       throw new Error('review_transport_state_invalid');
     }
+    const hasObservedUserTurn = operation.observedUserMessageId !== undefined;
+    if (hasObservedUserTurn) {
+      const observedCommitmentClasses = new Set(['turn_exact', 'turn_unreadable', 'turn_content_mismatch']);
+      if (
+        !nonEmptyString(operation.observedUserMessageId) ||
+        !Number.isFinite(operation.observedUserMessageAt) ||
+        !nonEmptyString(operation.observedConversationUrl) ||
+        !nonEmptyString(operation.observedConversationId) ||
+        !observedCommitmentClasses.has(operation.observedCommitmentClass) ||
+        !operation.observedTurnEvidence ||
+        typeof operation.observedTurnEvidence !== 'object' ||
+        Array.isArray(operation.observedTurnEvidence) ||
+        operation.observedTurnEvidence.commitmentClass !== operation.observedCommitmentClass ||
+        operation.observedTurnEvidence.newUserMessageCount !== 1 ||
+        operation.sendActionCount !== 1 ||
+        operation.newUserMessageCount !== 1 ||
+        (operation.userMessageId !== undefined && operation.userMessageId !== operation.observedUserMessageId)
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
+    } else if (
+      operation.observedUserMessageAt !== undefined ||
+      operation.observedConversationUrl !== undefined ||
+      operation.observedConversationId !== undefined ||
+      operation.observedCommitmentClass !== undefined ||
+      operation.observedTurnEvidence !== undefined
+    ) {
+      throw new Error('review_transport_state_invalid');
+    }
     if (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId)) {
       throw new Error('review_transport_state_invalid');
     }

@@ -140,6 +140,33 @@ test('state: review transport ledger is atomically persisted and defaults cleanl
   await assert.rejects(writeReviewTransportState(missingSendAction, dir), /review_transport_state_invalid/);
 });
 
+test('state: observed user-turn commitment evidence round-trips and incomplete provenance fails closed', async () => {
+  const dir = await tempDir();
+  const value = completeReviewState();
+  const operation = value.operations.smoke;
+  operation.observedUserMessageId = operation.userMessageId;
+  operation.observedUserMessageAt = operation.createdAt + 100;
+  operation.observedConversationUrl = operation.conversationUrl;
+  operation.observedConversationId = operation.conversationId;
+  operation.observedCommitmentClass = 'turn_exact';
+  operation.observedTurnEvidence = {
+    commitmentClass: 'turn_exact',
+    serializerOk: true,
+    newUserMessageCount: 1
+  };
+  operation.newUserMessageCount = 1;
+  await writeReviewTransportState(value, dir);
+  assert.deepEqual(await readReviewTransportState(dir), value);
+
+  const incomplete = structuredClone(value);
+  delete incomplete.operations.smoke.observedUserMessageAt;
+  await assert.rejects(writeReviewTransportState(incomplete, dir), /review_transport_state_invalid/);
+
+  const mismatchedAnchor = structuredClone(value);
+  mismatchedAnchor.operations.smoke.observedUserMessageId = 'different-user';
+  await assert.rejects(writeReviewTransportState(mismatchedAnchor, dir), /review_transport_state_invalid/);
+});
+
 test('state: valid schema v1 COMPLETE migrates sendActionCount with deterministic provenance', async () => {
   const dir = await tempDir();
   const file = path.join(dir, 'review-transport.json');

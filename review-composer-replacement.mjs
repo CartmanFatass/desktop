@@ -1,4 +1,4 @@
-export const REVIEW_COMPOSER_REPLACEMENT_MODEL = 'agentify_review_composer_replace_v1';
+export const REVIEW_COMPOSER_REPLACEMENT_MODEL = 'agentify_review_composer_replace_v2';
 
 export function reviewComposerKind(element) {
   const tag = String(element?.tagName || '').toUpperCase();
@@ -72,64 +72,72 @@ export function locateReviewComposer(selector, documentRef = document, windowRef
   return { element: selectedByPrimary ? element : null, candidateCount: candidates.length, selectedByPrimary };
 }
 
-export function dispatchReviewComposerReplacementInput(element) {
-  const documentRef = element?.ownerDocument;
-  const windowRef = documentRef?.defaultView;
-  let event;
-  try {
-    event = new windowRef.InputEvent('input', {
-      bubbles: true,
-      composed: true,
-      inputType: 'deleteContentBackward',
-      data: null
-    });
-  } catch {
-    event = new windowRef.Event('input', { bubbles: true, composed: true });
-  }
-  element.dispatchEvent(event);
-}
-
-export function clearReviewComposerElement(element) {
+export function prepareReviewComposerClearSelection(element, { hasContent = true } = {}) {
   const composerKind = reviewComposerKind(element);
   if (!composerKind) {
     return { ok: false, error: 'review_composer_kind_unsupported', composerKind: null };
   }
   try {
+    const documentRef = element.ownerDocument;
+    const windowRef = documentRef?.defaultView;
     element.focus();
-    let clearMethod;
-    let clearRevision = null;
-    if (composerKind === 'textarea' || composerKind === 'input') {
-      const windowRef = element.ownerDocument?.defaultView;
-      const prototype = composerKind === 'textarea'
-        ? windowRef?.HTMLTextAreaElement?.prototype
-        : windowRef?.HTMLInputElement?.prototype;
-      const nativeSetter = prototype
-        ? Object.getOwnPropertyDescriptor(prototype, 'value')?.set
-        : null;
-      if (typeof nativeSetter === 'function') {
-        nativeSetter.call(element, '');
-        clearMethod = 'native_value_setter';
-      } else {
-        element.value = '';
-        clearMethod = 'value_assignment';
-      }
-    } else {
-      if (typeof element.replaceChildren === 'function') {
-        element.replaceChildren();
-        clearMethod = 'replace_children';
-      } else {
-        while (element.firstChild) element.removeChild(element.firstChild);
-        clearMethod = 'remove_children';
-      }
-      clearRevision = String(element.innerHTML || '');
+    if (documentRef?.activeElement !== element && !element.contains?.(documentRef?.activeElement)) {
+      return { ok: false, error: 'review_composer_focus_failed', composerKind };
     }
-    dispatchReviewComposerReplacementInput(element);
-    if (composerKind === 'textarea' || composerKind === 'input') {
-      clearRevision = String(element.value ?? '');
+    if (!hasContent) {
+      return {
+        ok: true,
+        composerKind,
+        clearMethod: 'already_empty',
+        selectionVerified: true,
+        deleteKeyRequired: false
+      };
     }
-    return { ok: true, composerKind, clearMethod, clearRevision, inputEventDispatched: true };
+    if (composerKind === 'textarea' || composerKind === 'input') {
+      if (typeof element.setSelectionRange !== 'function') {
+        return { ok: false, error: 'review_composer_selection_unsupported', composerKind };
+      }
+      const length = String(element.value ?? '').length;
+      element.setSelectionRange(0, length);
+      if (element.selectionStart !== 0 || element.selectionEnd !== length) {
+        return { ok: false, error: 'review_composer_selection_failed', composerKind };
+      }
+      return {
+        ok: true,
+        composerKind,
+        clearMethod: 'verified_selection_backspace',
+        selectionVerified: true,
+        selectedLength: length,
+        deleteKeyRequired: true
+      };
+    }
+    const selection = windowRef?.getSelection?.();
+    const range = documentRef?.createRange?.();
+    if (!selection || !range) {
+      return { ok: false, error: 'review_composer_selection_unsupported', composerKind };
+    }
+    range.selectNodeContents(element);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const selected = selection.rangeCount === 1 ? selection.getRangeAt?.(0) : null;
+    const coversRoot = !!selected &&
+      selected.startContainer === element && selected.startOffset === 0 &&
+      selected.endContainer === element && selected.endOffset === element.childNodes.length;
+    const anchorInside = selection.anchorNode === element || element.contains?.(selection.anchorNode);
+    const focusInside = selection.focusNode === element || element.contains?.(selection.focusNode);
+    if (!coversRoot || selection.isCollapsed === true || !anchorInside || !focusInside) {
+      return { ok: false, error: 'review_composer_selection_failed', composerKind };
+    }
+    return {
+      ok: true,
+      composerKind,
+      clearMethod: 'verified_selection_backspace',
+      selectionVerified: true,
+      selectedChildCount: element.childNodes.length,
+      deleteKeyRequired: true
+    };
   } catch {
-    return { ok: false, error: 'review_composer_clear_action_failed', composerKind };
+    return { ok: false, error: 'review_composer_selection_action_failed', composerKind };
   }
 }
 

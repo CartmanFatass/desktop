@@ -11,9 +11,8 @@ import {
 } from './review-text-identity.mjs';
 import {
   REVIEW_COMPOSER_REPLACEMENT_MODEL,
-  clearReviewComposerElement,
-  dispatchReviewComposerReplacementInput,
   locateReviewComposer,
+  prepareReviewComposerClearSelection,
   positionReviewComposerCaret,
   reviewComposerKind
 } from './review-composer-replacement.mjs';
@@ -686,12 +685,11 @@ export class ChatGPTController {
   async #clearReviewComposerOnce() {
     const selector = JSON.stringify(this.selectors.promptTextarea);
     const replacementModel = JSON.stringify(REVIEW_COMPOSER_REPLACEMENT_MODEL);
-    return await this.#eval(`(() => {
+    const prepared = await this.#eval(`(() => {
       const reviewComposerClearMarker = true;
       const locateReviewComposer = ${locateReviewComposer.toString()};
       const reviewComposerKind = ${reviewComposerKind.toString()};
-      const dispatchReviewComposerReplacementInput = ${dispatchReviewComposerReplacementInput.toString()};
-      const clearReviewComposerElement = ${clearReviewComposerElement.toString()};
+      const prepareReviewComposerClearSelection = ${prepareReviewComposerClearSelection.toString()};
       const serializeReviewComposer = ${serializeReviewComposer.toString()};
       const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
       const selected = locateReviewComposer(${selector});
@@ -718,7 +716,24 @@ export class ChatGPTController {
             tagHistogram: { [String(element.tagName || '').toUpperCase() || 'UNKNOWN']: 1 }
           }
         : summarizeReviewComposerStructure(element);
-      const cleared = clearReviewComposerElement(element);
+      if (initial.ok !== true) return {
+        ok: false,
+        error: initial.error || 'review_composer_initial_identity_unreadable',
+        replacementModel: ${replacementModel},
+        composerKind,
+        candidateCount: selected.candidateCount,
+        selectedByPrimary: selected.selectedByPrimary,
+        initialSerializerOk: false,
+        initialSerializedLength: null,
+        serializerMethod: initial.method,
+        serializerError: initial.error || null,
+        serializerTag: initial.tag || null,
+        promptInsertCount: 0,
+        ...structure
+      };
+      const cleared = prepareReviewComposerClearSelection(element, {
+        hasContent: String(initial.text ?? '').length > 0
+      });
       return {
         ...cleared,
         replacementModel: ${replacementModel},
@@ -733,6 +748,11 @@ export class ChatGPTController {
         ...structure
       };
     })()`);
+    if (prepared?.ok === true && prepared.deleteKeyRequired === true) {
+      await this.#sendKey('Backspace');
+      return { ...prepared, deleteKeyCount: 1 };
+    }
+    return { ...prepared, deleteKeyCount: 0 };
   }
 
   async #inspectReviewComposerEmpty() {
@@ -894,7 +914,8 @@ export class ChatGPTController {
       replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
       composerKind: caretReceipt.composerKind,
       clearMethod: clearAction.clearMethod,
-      clearRevision: clearAction.clearRevision,
+      selectionVerified: clearAction.selectionVerified === true,
+      deleteKeyCount: clearAction.deleteKeyCount,
       initialSerializerOk: clearAction.initialSerializerOk,
       initialSerializedLength: clearAction.initialSerializedLength,
       emptyVerified: emptyReceipt.emptyVerified,
@@ -2061,8 +2082,16 @@ export class ChatGPTController {
     return result;
   }
 
-  async #waitForReviewUserMessage({ baselineIds, deadline, identity, expectedPrompt, firstBinding = false }) {
+  async #waitForReviewUserMessage({
+    baselineIds,
+    deadline,
+    identity,
+    expectedPrompt,
+    firstBinding = false,
+    onUserTurnObserved = null
+  }) {
     let submittedUserMessageId = null;
+    let persistedObservedUserMessageId = null;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
@@ -2087,30 +2116,68 @@ export class ChatGPTController {
         submittedUserMessageId ||= newUserMessages.at(-1).id;
         const message = newUserMessages.find((candidate) => candidate.id === submittedUserMessageId);
         if (!message) throw new Error('review_user_message_identity_unreadable');
+        const textIdentity = message.textIdentityReadable === false
+          ? null
+          : safeReviewPlainTextComparison(expectedPrompt, message.text);
+        const commitmentClass = message.textIdentityReadable === false
+          ? 'turn_unreadable'
+          : textIdentity?.ok === true
+            ? 'turn_exact'
+            : 'turn_content_mismatch';
+        const {
+          candidateCount: renderedContentCandidateCount = null,
+          ...renderedContentDiagnostic
+        } = message.textIdentityDiagnostic || {};
+        const observed = {
+          observedUserMessageId: message.id,
+          observedAt: Date.now(),
+          conversationUrl: snapshot.url,
+          conversationId: snapshot.conversationId,
+          modelEvidence: snapshot.modelEvidence || null,
+          commitmentClass,
+          serializerOk: message.textIdentityReadable === true,
+          serializerMethod: 'rendered_user_message_structural',
+          serializerError: message.textIdentityError || (textIdentity?.ok === true ? null : 'review_user_message_content_mismatch'),
+          serializerTag: message.textIdentityTag || null,
+          serializedLength: Number.isFinite(message.textLength) ? message.textLength : null,
+          observedLengths: Number.isFinite(message.textLength) ? [message.textLength] : [],
+          expectedLength: String(expectedPrompt || '').length,
+          newUserMessageCount: 1,
+          readableCandidateCount: message.textIdentityReadable === false ? 0 : 1,
+          exactMatchCount: textIdentity?.ok === true ? 1 : 0,
+          renderedContentCandidateCount,
+          ...(textIdentity || {}),
+          ...renderedContentDiagnostic
+        };
+        if (persistedObservedUserMessageId !== message.id) {
+          await onUserTurnObserved?.(observed);
+          persistedObservedUserMessageId = message.id;
+        }
         if (firstBinding && provisionalChatgptConversationId(snapshot.conversationId)) {
           await sleep(400);
           continue;
         }
-        const textIdentity = message.textIdentityReadable === false
-          ? null
-          : safeReviewPlainTextComparison(expectedPrompt, message.text);
-        if (message.textIdentityReadable === false || textIdentity?.ok !== true) {
+        if (message.textIdentityReadable === false) {
+          const error = new Error('review_user_message_identity_unreadable');
+          error.data = observed;
+          throw error;
+        }
+        if (textIdentity?.ok !== true) {
           const error = new Error('review_user_message_content_mismatch');
-          error.data = {
-            newUserMessageCount: 1,
-            readableCandidateCount: message.textIdentityReadable === false ? 0 : 1,
-            exactMatchCount: textIdentity?.ok === true ? 1 : 0,
-            serializedLength: Number.isFinite(message.textLength) ? message.textLength : null,
-            expectedLength: String(expectedPrompt || '').length,
-            ...(textIdentity || {})
-          };
+          error.data = observed;
           throw error;
         }
         return { snapshot, message, textIdentity };
       }
       await sleep(400);
     }
-    throw new Error('review_user_message_identity_unreadable');
+    const error = new Error('review_user_message_not_observed_after_click');
+    error.data = {
+      commitmentClass: 'click_no_turn',
+      newUserMessageCount: 0,
+      expectedLength: String(expectedPrompt || '').length
+    };
+    throw error;
   }
 
   async #waitForReviewBaseline({ deadline, identity, stableMs = 3_000 }) {
@@ -2380,6 +2447,7 @@ export class ChatGPTController {
     onPrepared,
     onComposerVerified,
     onSendAction,
+    onUserTurnObserved,
     onSubmitted,
     firstBinding = false
   }) {
@@ -2439,7 +2507,14 @@ export class ChatGPTController {
         sendActionAt: Date.now(),
         clickTimeIdentity: clickReceipt?.clickTimeIdentity || null
       });
-      const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity, expectedPrompt: prompt, firstBinding });
+      const submitted = await this.#waitForReviewUserMessage({
+        baselineIds,
+        deadline,
+        identity,
+        expectedPrompt: prompt,
+        firstBinding,
+        onUserTurnObserved
+      });
       const submittedIdentity = {
         expectedUrl: submitted.snapshot.url,
         expectedConversationId: submitted.snapshot.conversationId,

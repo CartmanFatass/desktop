@@ -22,10 +22,12 @@ async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
   const calls = { review: 0, reviewPrompts: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
+  let postClickFailure = null;
   let failAfterSubmittedReceipt = false;
   let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
   let reviewFailure = null;
   let sendControlFailure = null;
+  let observedTurnFailure = null;
   let observeFailure = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
@@ -106,7 +108,9 @@ async function fixture() {
         textModel: REVIEW_PLAIN_TEXT_MODEL,
         replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
         composerKind: 'contenteditable',
-        clearMethod: 'replace_children',
+        clearMethod: 'already_empty',
+        selectionVerified: true,
+        deleteKeyCount: 0,
         initialSerializerOk: true,
         initialSerializedLength: 0,
         emptyVerified: true,
@@ -137,7 +141,28 @@ async function fixture() {
           expectedLength: args.prompt.length
         }
       });
+      if (postClickFailure) throw postClickFailure;
       if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
+      const observedTurn = observedTurnFailure?.receipt || {
+        observedUserMessageId: 'user-1',
+        observedAt: 95,
+        conversationUrl: submittedUrl,
+        conversationId: submittedId,
+        modelEvidence: 'GPT-5.6 Pro',
+        commitmentClass: 'turn_exact',
+        serializerOk: true,
+        serializerMethod: 'rendered_user_message_structural',
+        serializerError: null,
+        serializerTag: null,
+        serializedLength: args.prompt.length,
+        observedLengths: [args.prompt.length],
+        expectedLength: args.prompt.length,
+        newUserMessageCount: 1,
+        readableCandidateCount: 1,
+        exactMatchCount: 1
+      };
+      await args.onUserTurnObserved?.(observedTurn);
+      if (observedTurnFailure) throw observedTurnFailure.error;
       await args.onSubmitted({
         userMessageId: 'user-1',
         submittedAt: 100,
@@ -260,6 +285,9 @@ async function fixture() {
     setFailBeforeSubmittedReceipt(value) {
       failBeforeSubmittedReceipt = !!value;
     },
+    setPostClickFailure(error) {
+      postClickFailure = error;
+    },
     setFailAfterSubmittedReceipt(value) {
       failAfterSubmittedReceipt = !!value;
     },
@@ -272,6 +300,9 @@ async function fixture() {
     },
     setSendControlFailure(error) {
       sendControlFailure = error;
+    },
+    setObservedTurnFailure(error, receipt) {
+      observedTurnFailure = { error, receipt };
     },
     setObserveFailure(error) {
       observeFailure = error;
@@ -547,6 +578,117 @@ test('review transport: deterministic send-control rejection remains an eligible
   assert.equal(operation.errorData.noClickProven, true);
 });
 
+test('review transport: one unreadable visible user turn is durably anchored before terminal failure', async () => {
+  const f = await fixture();
+  const receipt = {
+    observedUserMessageId: 'observed-unreadable-user',
+    observedAt: 101,
+    conversationUrl: f.request.conversationUrl,
+    conversationId: f.request.conversationId,
+    modelEvidence: 'GPT-5.6 Pro',
+    commitmentClass: 'turn_unreadable',
+    serializerOk: false,
+    serializerMethod: 'rendered_user_message_structural',
+    serializerError: 'review_composer_element_unsupported',
+    serializerTag: 'PRE',
+    expectedLength: f.request.prompt.length,
+    newUserMessageCount: 1,
+    readableCandidateCount: 0,
+    exactMatchCount: 0,
+    renderedContentCandidateCount: 4,
+    rootTag: 'PRE',
+    elementCount: 2,
+    textNodeCount: 1,
+    otherNodeCount: 0,
+    maxDepth: 2,
+    tagHistogram: { CODE: 1, PRE: 1 }
+  };
+  const error = new Error('review_user_message_identity_unreadable');
+  error.data = receipt;
+  f.setObservedTurnFailure(error, receipt);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_identity_unreadable/
+  );
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(operation.status, 'BLOCKED');
+  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(operation.sendActionCount, 1);
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.userMessageId, undefined);
+  assert.equal(operation.observedUserMessageId, 'observed-unreadable-user');
+  assert.equal(operation.observedCommitmentClass, 'turn_unreadable');
+  assert.equal(operation.errorData.commitmentClass, 'turn_unreadable');
+  assert.equal(operation.errorData.newUserMessageCount, 1);
+  assert.equal(operation.errorData.serializerTag, 'PRE');
+  assert.deepEqual(operation.errorData.tagHistogram, { CODE: 1, PRE: 1 });
+});
+
+test('review transport: readable content mismatch persists the observed anchor and safe fingerprint', async () => {
+  const f = await fixture();
+  const receipt = {
+    observedUserMessageId: 'observed-mismatch-user',
+    observedAt: 102,
+    conversationUrl: f.request.conversationUrl,
+    conversationId: f.request.conversationId,
+    modelEvidence: 'GPT-5.6 Pro',
+    commitmentClass: 'turn_content_mismatch',
+    serializerOk: true,
+    serializerMethod: 'rendered_user_message_structural',
+    serializerError: 'review_user_message_content_mismatch',
+    serializedLength: 15,
+    observedLengths: [15],
+    expectedLength: f.request.prompt.length,
+    newUserMessageCount: 1,
+    readableCandidateCount: 1,
+    exactMatchCount: 0,
+    textModel: REVIEW_PLAIN_TEXT_MODEL,
+    identityMode: 'mismatch',
+    mismatchClass: 'code_point_length_mismatch',
+    observedRawSha256: sha256('Pasted_text.txt'),
+    observedCanonicalSha256: sha256('Pasted_text.txt')
+  };
+  const error = new Error('review_user_message_content_mismatch');
+  error.data = receipt;
+  f.setObservedTurnFailure(error, receipt);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_content_mismatch/
+  );
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(operation.observedUserMessageId, 'observed-mismatch-user');
+  assert.equal(operation.observedCommitmentClass, 'turn_content_mismatch');
+  assert.equal(operation.errorData.serializedLength, 15);
+  assert.equal(operation.errorData.mismatchClass, 'code_point_length_mismatch');
+  assert.equal(operation.errorData.observedCanonicalSha256, sha256('Pasted_text.txt'));
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_operation_closed_create_fresh/
+  );
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: click with no observed turn remains distinct and has no fabricated anchor', async () => {
+  const f = await fixture();
+  const error = new Error('review_user_message_not_observed_after_click');
+  error.data = {
+    commitmentClass: 'click_no_turn',
+    newUserMessageCount: 0,
+    expectedLength: f.request.prompt.length
+  };
+  f.setPostClickFailure(error);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_not_observed_after_click/
+  );
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(operation.observedUserMessageId, undefined);
+  assert.equal(operation.errorData.commitmentClass, 'click_no_turn');
+  assert.equal(operation.errorData.newUserMessageCount, 0);
+  assert.equal(operation.sendActionCount, 1);
+  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+});
+
 test('review transport: one send persists a complete receipt and duplicate returns it', async () => {
   const f = await fixture();
   const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -555,6 +697,8 @@ test('review transport: one send persists a complete receipt and duplicate retur
   assert.equal(first.promptSha256, sha256(f.request.prompt));
   assert.equal(first.responseSha256, sha256('SMOKE_OK'));
   assert.equal(first.userMessageId, 'user-1');
+  assert.equal(first.observedUserMessageId, 'user-1');
+  assert.equal(first.observedCommitmentClass, 'turn_exact');
   assert.equal(first.assistantMessageId, 'assistant-1');
   assert.equal(first.sendActionCount, 1);
   assert.equal(first.promptTextModel, REVIEW_PLAIN_TEXT_MODEL);
@@ -859,6 +1003,13 @@ test('review transport: observer completion cannot promote a ledger without one 
   operation.status = 'SUBMITTED';
   operation.terminalState = null;
   operation.sendActionCount = 0;
+  delete operation.observedUserMessageId;
+  delete operation.observedUserMessageAt;
+  delete operation.observedConversationUrl;
+  delete operation.observedConversationId;
+  delete operation.observedCommitmentClass;
+  delete operation.observedTurnEvidence;
+  delete operation.newUserMessageCount;
   await writeReviewTransportState(state, f.stateDir);
 
   await assert.rejects(

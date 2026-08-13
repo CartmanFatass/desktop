@@ -34,13 +34,13 @@ function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty =
     evaluate(js) {
       if (js.includes('reviewComposerClearMarker')) {
         const initialSerializedLength = current.length;
-        current = '';
         return {
           ok: true,
           replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
           composerKind: 'contenteditable',
-          clearMethod: 'replace_children',
-          clearRevision: '',
+          clearMethod: initialSerializedLength ? 'verified_selection_backspace' : 'already_empty',
+          selectionVerified: true,
+          deleteKeyRequired: initialSerializedLength > 0,
           initialSerializerOk: true,
           initialSerializedLength,
           inputEventDispatched: true,
@@ -97,6 +97,7 @@ function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty =
       }
       return null;
     },
+    deleteSelection() { current = ''; },
     insert(text) { current += text; },
     replace(text) { current = String(text); },
     get current() { return current; }
@@ -108,8 +109,9 @@ function legacyStrictComposerEval(js) {
     ok: true,
     replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
     composerKind: 'contenteditable',
-    clearMethod: 'replace_children',
-    clearRevision: '',
+    clearMethod: 'already_empty',
+    selectionVerified: true,
+    deleteKeyRequired: false,
     initialSerializerOk: true,
     initialSerializedLength: 0,
     promptInsertCount: 0,
@@ -447,6 +449,7 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
   assert.equal(prompt.length, 7024);
   const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt });
   let inserted = 0;
+  let deleteKeys = 0;
   let clicked = 0;
   const page = {
     async getUrl() { return 'https://chatgpt.com/c/draft-replace'; },
@@ -471,7 +474,9 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
     async insertText(text) { inserted += 1; composer.insert(text); },
-    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+    async sendKey(key) {
+      if (key === 'Backspace') { deleteKeys += 1; composer.deleteSelection(); }
+    }, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
   };
   const controller = new ChatGPTController({
     page,
@@ -487,9 +492,13 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
     onComposerVerified: async (receipt) => { composerReceipt = receipt; }
   });
   assert.equal(inserted, 1);
+  assert.equal(deleteKeys, 1);
   assert.equal(clicked, 1);
   assert.equal(composer.current, prompt);
   assert.equal(composerReceipt.initialSerializedLength, prompt.length);
+  assert.equal(composerReceipt.clearMethod, 'verified_selection_backspace');
+  assert.equal(composerReceipt.selectionVerified, true);
+  assert.equal(composerReceipt.deleteKeyCount, 1);
   assert.equal(composerReceipt.emptyVerified, true);
   assert.equal(composerReceipt.emptySnapshotCount, 2);
   assert.equal(composerReceipt.promptInsertCount, 1);
@@ -515,7 +524,8 @@ test('chatgpt-controller: asynchronously rehydrated draft fails before prompt in
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
     async insertText() { inserted += 1; },
-    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+    async sendKey(key) { if (key === 'Backspace') composer.deleteSelection(); },
+    async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
   };
   const controller = new ChatGPTController({
     page,
@@ -559,7 +569,8 @@ test('chatgpt-controller: failed contenteditable caret binding fails before prom
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
     async insertText() { inserted += 1; },
-    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+    async sendKey(key) { if (key === 'Backspace') composer.deleteSelection(); },
+    async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
   };
   const controller = new ChatGPTController({
     page,
@@ -1615,6 +1626,7 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
   const prompt = 'exact frozen prompt';
   let strictClicks = 0;
   let submitted = false;
+  let observed = null;
   const page = {
     async getUrl() { return url; },
     async evaluate(js) {
@@ -1656,6 +1668,7 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
       expectedConversationId: 'rendered-mismatch',
       expectedModel: 'GPT-5.6 Pro',
       timeoutMs: 5_000,
+      onUserTurnObserved: async (receipt) => { observed = receipt; },
       onSubmitted: async () => { submitted = true; }
     }),
     (error) => {
@@ -1665,6 +1678,9 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
     }
   );
   assert.equal(strictClicks, 1);
+  assert.equal(observed.observedUserMessageId, 'rendered-mismatch-user');
+  assert.equal(observed.commitmentClass, 'turn_content_mismatch');
+  assert.equal(observed.serializerOk, true);
   assert.equal(submitted, false);
 });
 
@@ -1724,6 +1740,7 @@ test('chatgpt-controller: post-send unreadable rendered user content is ambiguou
   const prompt = '```text\nsynthetic\n```\n';
   let strictClicks = 0;
   let submittedReceipt = null;
+  let observedReceipt = null;
   const page = {
     async navigate() {},
     async getUrl() { return url; },
@@ -1794,10 +1811,61 @@ test('chatgpt-controller: post-send unreadable rendered user content is ambiguou
       expectedConversationId: 'conversation-rendered',
       expectedModel: 'GPT-5.6 Pro',
       timeoutMs: 8_000,
+      onUserTurnObserved: async (receipt) => { observedReceipt = receipt; },
       onSubmitted: async (receipt) => { submittedReceipt = receipt; }
-    }), /review_user_message_content_mismatch/);
+    }), /review_user_message_identity_unreadable/);
   assert.equal(strictClicks, 1);
+  assert.equal(observedReceipt.observedUserMessageId, 'user-rendered');
+  assert.equal(observedReceipt.commitmentClass, 'turn_unreadable');
+  assert.equal(observedReceipt.serializerError, 'review_composer_element_unsupported');
+  assert.equal(observedReceipt.serializerTag, 'PRE');
+  assert.equal(observedReceipt.renderedContentCandidateCount, 4);
   assert.equal(submittedReceipt, null);
+});
+
+test('chatgpt-controller: click with no visible new user turn has a distinct terminal classification', async () => {
+  const url = 'https://chatgpt.com/c/no-turn-after-click';
+  let strictClicks = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return { ok: true, serializerOk: true, serializedLength: 6, expectedLength: 6 };
+      }
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async sendKey() {}, async insertText() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  await assert.rejects(controller.reviewQuery({
+    prompt: 'frozen',
+    expectedUrl: url,
+    expectedConversationId: 'no-turn-after-click',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 3_700
+  }), (error) => {
+    assert.equal(error.message, 'review_user_message_not_observed_after_click');
+    assert.equal(error.data.commitmentClass, 'click_no_turn');
+    assert.equal(error.data.newUserMessageCount, 0);
+    return true;
+  });
+  assert.equal(strictClicks, 1);
 });
 
 test('chatgpt-controller: fresh strict review fails busy on an active prior turn', async () => {
