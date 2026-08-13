@@ -1143,6 +1143,7 @@ export class ChatGPTController {
         const canonicalizeReviewPlainText = ${canonicalizeReviewPlainText.toString()};
         const browserSpaceRebalanceSite = ${browserSpaceRebalanceSite.toString()};
         const compareReviewPlainText = ${compareReviewPlainText.toString()};
+        const locateReviewComposer = ${locateReviewComposer.toString()};
         const serializeReviewComposer = ${serializeReviewComposer.toString()};
         const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
         const sha256Hex = async (value) => {
@@ -1150,52 +1151,14 @@ export class ChatGPTController {
           const digest = await crypto.subtle.digest('SHA-256', bytes);
           return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
         };
-        const visible = (n) => {
-          const r = n.getBoundingClientRect();
-          const style = window.getComputedStyle(n);
-          return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-        };
-        const editable = (n) => {
-          if (!n || !visible(n)) return false;
-          if (n.matches('textarea')) return !n.disabled && !n.readOnly;
-          if (n.matches('input')) return !n.disabled && !n.readOnly && !/password|search|email|url|number|tel/i.test(String(n.type || 'text'));
-          return !!n.isContentEditable || n.getAttribute('contenteditable') === 'true' || n.getAttribute('role') === 'textbox';
-        };
-        const score = (n) => {
-          const r = n.getBoundingClientRect();
-          const label = [
-            n.getAttribute('aria-label') || '',
-            n.getAttribute('placeholder') || '',
-            n.getAttribute('name') || '',
-            n.getAttribute('id') || '',
-            n.getAttribute('data-testid') || ''
-          ].join(' ').toLowerCase();
-          let s = 0;
-          if (/prompt|message|ask|chat|query|input/.test(label)) s += 80;
-          if (n.matches('textarea')) s += 50;
-          if (n.isContentEditable || n.getAttribute('contenteditable') === 'true') s += 35;
-          if (n.getAttribute('role') === 'textbox') s += 25;
-          if (r.width >= 260 && r.height >= 26) s += 20;
-          s += Math.min(180, Math.max(0, (r.width * r.height) / 2500));
-          s += Math.max(0, r.y / 8);
-          return s;
-        };
-        const base = Array.from(document.querySelectorAll(${sel}));
-        const fallback = Array.from(document.querySelectorAll('main textarea, main [role="textbox"], main [contenteditable="true"], textarea, [role="textbox"], [contenteditable="true"]'));
-        const candidates = [];
-        const seen = new Set();
-        for (const n of [...base, ...fallback]) {
-          if (!n || seen.has(n)) continue;
-          seen.add(n);
-          if (editable(n)) candidates.push(n);
-        }
-        candidates.sort((a, b) => score(b) - score(a));
-        const el = candidates[0] || null;
+        const selected = locateReviewComposer(${sel});
+        const el = selected.element;
         if (!el) {
           return {
             ok: false,
             error: 'missing_prompt_textarea',
-            candidateCount: candidates.length,
+            candidateCount: selected.candidateCount,
+            selectedByPrimary: selected.selectedByPrimary,
             expectedLength: expected.length
           };
         }
@@ -1234,7 +1197,8 @@ export class ChatGPTController {
           canonicalPromptSha256 === observedCanonicalSha256;
         return {
           ok: exactIdentity,
-          candidateCount: candidates.length,
+          candidateCount: selected.candidateCount,
+          selectedByPrimary: selected.selectedByPrimary,
           serializerOk: serialized.ok === true,
           serializerMethod: serialized.method,
           serializerError: serialized.error || null,
