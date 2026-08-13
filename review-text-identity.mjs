@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 export const REVIEW_PLAIN_TEXT_MODEL = 'agentify_review_plain_text_v1';
+export const REVIEW_CAUSAL_SUBMISSION_MODEL = 'agentify_review_causal_submission_v1';
 
 // Browser editing surfaces expose line breaks as LF even when the source uses
 // CRLF or a lone CR. No other whitespace or Unicode normalization is applied.
@@ -133,6 +134,30 @@ export function reviewPlainTextIdentity(value) {
     canonicalLength: canonical.length,
     lineEndingCanonicalized: raw !== canonical
   };
+}
+
+// A strict submission is causally bound to the exact composer text at the
+// unique Send boundary.  The persisted baseline digest prevents a recovery
+// observer from silently widening that boundary to an arbitrary visible turn.
+export function reviewBaselineMessageIdsSha256(messageIds) {
+  if (!Array.isArray(messageIds) || messageIds.some((id) => typeof id !== 'string' || !id)) return null;
+  return sha256(JSON.stringify(messageIds));
+}
+
+export function validateReviewCausalSubmissionReceipt(receipt, { prompt, baselineMessageIds } = {}) {
+  const identity = reviewPlainTextIdentity(prompt);
+  const baselineMessageIdsSha256 = reviewBaselineMessageIdsSha256(baselineMessageIds);
+  return !!receipt &&
+    receipt.ok === true &&
+    receipt.persisted === true &&
+    receipt.identityModel === REVIEW_CAUSAL_SUBMISSION_MODEL &&
+    typeof receipt.operationId === 'string' && receipt.operationId.length > 0 &&
+    receipt.sendActionCount === 1 &&
+    receipt.clickCount === 1 &&
+    receipt.sourceSha256 === identity.sourceSha256 &&
+    receipt.canonicalPromptSha256 === identity.canonicalSha256 &&
+    baselineMessageIdsSha256 !== null &&
+    receipt.baselineMessageIdsSha256 === baselineMessageIdsSha256;
 }
 
 export function compareReviewPlainTextIdentity(expectedRaw, observedRaw, sha256Fn = sha256) {

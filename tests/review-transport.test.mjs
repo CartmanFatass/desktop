@@ -13,7 +13,11 @@ import {
   sanitizeReviewErrorData
 } from '../review-transport.mjs';
 import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
-import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
+import {
+  REVIEW_CAUSAL_SUBMISSION_MODEL,
+  REVIEW_PLAIN_TEXT_MODEL,
+  reviewPlainTextIdentity
+} from '../review-text-identity.mjs';
 import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
@@ -31,6 +35,7 @@ async function fixture() {
   let observeFailure = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
+  let renderedDisplayFidelity = 'exact';
   let fixturePrompt = '';
   const composerIdentityFields = () => ({
     composerPromptSha256: sha256(fixturePrompt),
@@ -125,7 +130,7 @@ async function fixture() {
       });
       if (reviewFailure) throw reviewFailure;
       if (sendControlFailure) throw sendControlFailure;
-      await args.onSendAction({
+      const causalSubmissionReceipt = await args.onSendAction({
         clickCount: 1,
         sendActionCount: 1,
         sendActionAt: 90,
@@ -143,14 +148,21 @@ async function fixture() {
       });
       if (postClickFailure) throw postClickFailure;
       if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
+      const commitmentClass = renderedDisplayFidelity === 'exact'
+        ? 'turn_exact'
+        : renderedDisplayFidelity === 'unreadable'
+          ? 'turn_causal_exact_rendered_unreadable'
+          : 'turn_causal_exact_rendered_mismatch';
       const observedTurn = observedTurnFailure?.receipt || {
         observedUserMessageId: 'user-1',
         observedAt: 95,
         conversationUrl: submittedUrl,
         conversationId: submittedId,
         modelEvidence: 'GPT-5.6 Pro',
-        commitmentClass: 'turn_exact',
-        serializerOk: true,
+        commitmentClass,
+        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        renderedDisplayFidelity,
+        serializerOk: renderedDisplayFidelity !== 'unreadable',
         serializerMethod: 'rendered_user_message_structural',
         serializerError: null,
         serializerTag: null,
@@ -159,7 +171,7 @@ async function fixture() {
         expectedLength: args.prompt.length,
         newUserMessageCount: 1,
         readableCandidateCount: 1,
-        exactMatchCount: 1
+        exactMatchCount: renderedDisplayFidelity === 'exact' ? 1 : 0
       };
       await args.onUserTurnObserved?.(observedTurn);
       if (observedTurnFailure) throw observedTurnFailure.error;
@@ -171,7 +183,11 @@ async function fixture() {
         modelEvidence: 'GPT-5.6 Pro',
         sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        renderedIdentityMode: 'canonical_exact',
+        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        causalSubmissionReceipt,
+        renderedDisplayFidelity,
+        renderedDisplayEvidence: observedTurn,
+        renderedIdentityMode: renderedDisplayFidelity === 'exact' ? 'canonical_exact' : null,
         ...exactIdentityFields()
       });
       if (failAfterSubmittedReceipt) throw new Error('simulated_crash_after_submitted_receipt');
@@ -216,7 +232,7 @@ async function fixture() {
     async recoverReviewSubmission(args) {
       calls.recover += 1;
       assert.deepEqual(args.baselineMessageIds, ['historical-user-1']);
-      assert.equal(args.exactComposerCausalBinding, true);
+      assert.equal(args.causalSubmissionReceipt?.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
       await args.onRecovered({
         userMessageId: 'user-1',
         submittedAt: 100,
@@ -317,6 +333,9 @@ async function fixture() {
     },
     setSubmissionDiagnostic(diagnostic) {
       submissionDiagnosticResult = diagnostic;
+    },
+    setRenderedDisplayFidelity(value) {
+      renderedDisplayFidelity = value;
     }
   };
 }
@@ -790,6 +809,21 @@ test('review transport: Gemini uses the same strict receipt lifecycle with provi
   assert.equal(f.calls.review, 1);
 });
 
+test('review transport: causal exact submission completes with lossy rendered Markdown stored only as display evidence', async () => {
+  const f = await fixture();
+  f.setRenderedDisplayFidelity('lossy_mismatch');
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(receipt.status, 'COMPLETE');
+  assert.equal(receipt.sendActionCount, 1);
+  assert.equal(receipt.sendCount, 1);
+  assert.equal(receipt.observedCommitmentClass, 'turn_causal_exact_rendered_mismatch');
+  assert.equal(receipt.submissionIdentity.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
+  assert.equal(receipt.submissionIdentity.sourceSha256, f.request.promptSha256);
+  assert.equal(receipt.submissionIdentity.userMessageId, 'user-1');
+  assert.equal(receipt.renderedDisplay.fidelity, 'lossy_mismatch');
+  assert.equal(receipt.renderedIdentity.identityMode, 'display_not_source_identity');
+});
+
 test('review transport: composer replacement receipt is mandatory before strict submission', async () => {
   const f = await fixture();
   const originalReviewQuery = f.tabs.getControllerById().reviewQuery;
@@ -1003,6 +1037,9 @@ test('review transport: observer completion cannot promote a ledger without one 
   operation.status = 'SUBMITTED';
   operation.terminalState = null;
   operation.sendActionCount = 0;
+  delete operation.causalSendReceipt;
+  delete operation.submissionIdentity;
+  delete operation.renderedDisplay;
   delete operation.observedUserMessageId;
   delete operation.observedUserMessageAt;
   delete operation.observedConversationUrl;

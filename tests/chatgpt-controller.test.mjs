@@ -17,8 +17,10 @@ import {
   summarizeReviewComposerStructure
 } from '../chatgpt-controller.mjs';
 import {
+  REVIEW_CAUSAL_SUBMISSION_MODEL,
   REVIEW_PLAIN_TEXT_MODEL,
   compareReviewPlainText,
+  reviewBaselineMessageIdsSha256,
   reviewPlainTextIdentity,
   safeReviewPlainTextComparison
 } from '../review-text-identity.mjs';
@@ -26,6 +28,17 @@ import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacemen
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
+const causalReceipt = (prompt, baselineMessageIds = [], operationId = 'test-operation') => ({
+  ok: true,
+  persisted: true,
+  identityModel: REVIEW_CAUSAL_SUBMISSION_MODEL,
+  operationId,
+  sendActionCount: 1,
+  clickCount: 1,
+  sourceSha256: reviewPlainTextIdentity(prompt).sourceSha256,
+  canonicalPromptSha256: reviewPlainTextIdentity(prompt).canonicalSha256,
+  baselineMessageIdsSha256: reviewBaselineMessageIdsSha256(baselineMessageIds)
+});
 
 function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty = false, failCaret = false } = {}) {
   let current = String(existingDraft);
@@ -1755,6 +1768,94 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
   assert.equal(submitted, false);
 });
 
+test('chatgpt-controller: exact click-bound submission binds one Markdown-rendered turn while display fidelity remains lossy', async () => {
+  let currentUrl = 'https://chatgpt.com/';
+  const canonicalUrl = 'https://chatgpt.com/c/rendered-markdown-loss';
+  const prompt = [
+    '# Synthetic rendered-identity canary',
+    '',
+    '- outer',
+    '  - inner',
+    '',
+    '```text',
+    'line \u2014 exact',
+    '```',
+    '',
+    'Return exactly `PRECODE_CG_OK` and nothing else.',
+    ''
+  ].join('\n');
+  const rendered = prompt.replace('```text\n', '\n\n').replace('```\n', '\n\n');
+  assert.equal(prompt.length, 132);
+  assert.equal(rendered.length, 124);
+  let strictClicks = 0;
+  let postClickSnapshots = 0;
+  let submitted = null;
+  let observed = null;
+  const receipt = causalReceipt(prompt, [], 'rendered-markdown-loss-operation');
+  const page = {
+    async getUrl() { return currentUrl; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return { ok: true, serializerOk: true, serializedLength: prompt.length, expectedLength: prompt.length };
+      }
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        currentUrl = 'https://chatgpt.com/c/WEB:rendered-markdown-loss';
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        if (strictClicks && ++postClickSnapshots >= 2) currentUrl = canonicalUrl;
+        return {
+        messages: strictClicks ? [
+          {
+            order: 0,
+            role: 'user',
+            id: 'rendered-markdown-user',
+            text: rendered,
+            textLength: rendered.length,
+            textIdentityReadable: true,
+            textIdentityDiagnostic: { candidateCount: 1, rootTag: 'DIV', tagHistogram: { CODE: 2, DIV: 1, PRE: 1 } }
+          },
+          { order: 1, role: 'assistant', id: 'rendered-markdown-assistant', text: 'PRECODE_CG_OK' }
+        ] : [],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() {}, async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/',
+    expectedConversationId: '__new__',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000,
+    firstBinding: true,
+    onSendAction: async () => receipt,
+    onUserTurnObserved: async (value) => { observed = value; },
+    onSubmitted: async (value) => { submitted = value; }
+  });
+  assert.equal(strictClicks, 1);
+  assert.equal(observed.commitmentClass, 'turn_causal_exact_rendered_mismatch');
+  assert.equal(observed.renderedDisplayFidelity, 'lossy_mismatch');
+  assert.equal(submitted.submissionIdentityMode, REVIEW_CAUSAL_SUBMISSION_MODEL);
+  assert.equal(submitted.causalSubmissionReceipt, receipt);
+  assert.equal(submitted.renderedDisplayFidelity, 'lossy_mismatch');
+  assert.equal(submitted.conversationUrl, canonicalUrl);
+  assert.equal(result.userMessageId, 'rendered-markdown-user');
+  assert.equal(result.text, 'PRECODE_CG_OK');
+});
+
 test('chatgpt-controller: ambiguous send control fails before a click', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let sendEvaluationReached = false;
@@ -2024,7 +2125,7 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
     expectedConversationId: 'conversation-1',
     expectedModel: 'GPT-5.6 Pro',
     timeoutMs: 5_000,
-    exactComposerCausalBinding: true,
+    causalSubmissionReceipt: causalReceipt(prompt, ['historical-user', 'historical-assistant']),
     onRecovered: async ({ userMessageId }) => {
       recoveredId = userMessageId;
     }
@@ -2072,10 +2173,10 @@ test('chatgpt-controller: crash recovery accepts one attachment-backed message u
     expectedConversationId: 'conversation-attachment',
     expectedModel: 'GPT-5.6 Pro',
     timeoutMs: 5_000,
-    exactComposerCausalBinding: true,
+    causalSubmissionReceipt: causalReceipt(prompt),
     onRecovered: async (value) => { receipt = value; }
   });
-  assert.equal(receipt.identityMode, 'exact_composer_causal_binding');
+  assert.equal(receipt.identityMode, REVIEW_CAUSAL_SUBMISSION_MODEL);
   assert.equal(receipt.newUserMessageCount, 1);
   assert.equal(receipt.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
   assert.equal(result.userMessageId, 'attachment-user');
@@ -2115,12 +2216,12 @@ test('chatgpt-controller: crash recovery rejects missing causal receipt and ambi
   await assert.rejects(controller.recoverReviewSubmission(base), /review_composer_causal_binding_missing/);
   messageCount = 0;
   await assert.rejects(
-    controller.recoverReviewSubmission({ ...base, exactComposerCausalBinding: true }),
+    controller.recoverReviewSubmission({ ...base, causalSubmissionReceipt: causalReceipt(base.prompt) }),
     /review_user_message_identity_unreadable/
   );
   messageCount = 2;
   await assert.rejects(
-    controller.recoverReviewSubmission({ ...base, exactComposerCausalBinding: true }),
+    controller.recoverReviewSubmission({ ...base, causalSubmissionReceipt: causalReceipt(base.prompt) }),
     /review_user_message_identity_unreadable/
   );
 });

@@ -3,7 +3,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { readReviewTransportState, writeReviewTransportState } from './state.mjs';
-import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from './review-text-identity.mjs';
+import {
+  REVIEW_CAUSAL_SUBMISSION_MODEL,
+  REVIEW_PLAIN_TEXT_MODEL,
+  reviewBaselineMessageIdsSha256,
+  reviewPlainTextIdentity,
+  validateReviewCausalSubmissionReceipt
+} from './review-text-identity.mjs';
 import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from './review-composer-replacement.mjs';
 
 const MAX_REVIEW_TIMEOUT_MS = 45 * 60_000;
@@ -80,7 +86,7 @@ export function sanitizeReviewErrorData(value) {
     'predicate', 'failureStage', 'textModel', 'identityMode', 'mismatchClass',
     'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint',
     'replacementModel', 'composerKind', 'clearMethod', 'caretMethod',
-    'commitmentClass'
+    'commitmentClass', 'submissionIdentityMode', 'renderedDisplayFidelity', 'identityModel'
   ]) {
     if (data[field] === null) {
       output[field] = null;
@@ -103,7 +109,8 @@ export function sanitizeReviewErrorData(value) {
     }
   }
   for (const field of [
-    'sourceSha256', 'canonicalPromptSha256', 'observedRawSha256', 'observedCanonicalSha256'
+    'sourceSha256', 'canonicalPromptSha256', 'observedRawSha256', 'observedCanonicalSha256',
+    'baselineMessageIdsSha256'
   ]) {
     if (/^[0-9a-f]{64}$/.test(String(data[field] || ''))) output[field] = data[field];
   }
@@ -339,6 +346,7 @@ async function observePersistedReview({ observeReviewResponse, operation, reques
     baselineMessageIds: operation.baselineMessageIds,
     sendCount: operation.sendCount,
     sendActionCount: operation.sendActionCount,
+    renderedDisplayFidelity: operation.renderedDisplay?.fidelity || 'exact',
     timeoutMs: request.timeoutMs
   });
 }
@@ -444,19 +452,47 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (!request.firstBinding && (submittedUrl !== request.conversationUrl || submittedId !== request.conversationId)) {
       fail('review_conversation_identity_mismatch');
     }
+    const renderedDisplayFidelities = new Set(['exact', 'lossy_mismatch', 'unreadable']);
     if (
       submitted?.sourcePromptSha256 !== request.promptSha256 ||
       submitted?.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
-      !['canonical_exact', 'browser_space_rebalanced'].includes(submitted?.renderedIdentityMode)
+      submitted?.submissionIdentityMode !== REVIEW_CAUSAL_SUBMISSION_MODEL ||
+      !renderedDisplayFidelities.has(submitted?.renderedDisplayFidelity)
     ) {
       fail('review_user_message_identity_receipt_invalid');
     }
+    const safeRenderedDisplay = sanitizeReviewErrorData(submitted?.renderedDisplayEvidence);
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (op.sendActionCount !== 1) fail('review_send_action_receipt_missing');
+      if (
+        !validateReviewCausalSubmissionReceipt(submitted?.causalSubmissionReceipt, {
+          prompt: request.prompt,
+          baselineMessageIds: op.baselineMessageIds
+        }) ||
+        !op.causalSendReceipt ||
+        op.causalSendReceipt.operationId !== op.operationId ||
+        submitted.causalSubmissionReceipt.operationId !== op.operationId ||
+        JSON.stringify(submitted.causalSubmissionReceipt) !== JSON.stringify(op.causalSendReceipt)
+      ) {
+        fail('review_causal_submission_receipt_mismatch');
+      }
       if (op.observedUserMessageId !== userMessageId) {
         fail('review_observed_user_message_identity_mismatch');
+      }
+      const expectedCommitmentClass = submitted.renderedDisplayFidelity === 'exact'
+        ? 'turn_exact'
+        : submitted.renderedDisplayFidelity === 'unreadable'
+          ? 'turn_causal_exact_rendered_unreadable'
+          : 'turn_causal_exact_rendered_mismatch';
+      if (
+        op.observedCommitmentClass !== expectedCommitmentClass ||
+        op.observedConversationUrl !== submittedUrl ||
+        op.observedConversationId !== submittedId ||
+        op.newUserMessageCount !== 1
+      ) {
+        fail('review_observed_user_turn_receipt_invalid');
       }
       op.status = 'SUBMITTED';
       op.sendCount = 1;
@@ -468,12 +504,28 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.modelEvidence = submitted?.modelEvidence || null;
       op.observedConversationUrl = submittedUrl;
       op.observedConversationId = submittedId;
-      op.observedCommitmentClass = 'turn_exact';
+      op.submissionIdentity = {
+        identityModel: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        sourceSha256: request.promptSha256,
+        canonicalPromptSha256: promptIdentity.canonicalSha256,
+        baselineMessageIdsSha256: op.causalSendReceipt.baselineMessageIdsSha256,
+        sendActionCount: 1,
+        clickCount: 1,
+        userMessageId,
+        conversationUrl: submittedUrl,
+        conversationId: submittedId
+      };
+      op.renderedDisplay = {
+        fidelity: submitted.renderedDisplayFidelity,
+        ...(safeRenderedDisplay || {})
+      };
       op.renderedIdentity = {
         textModel: promptIdentity.textModel,
         sourceSha256: request.promptSha256,
         canonicalPromptSha256: promptIdentity.canonicalSha256,
-        identityMode: submitted.renderedIdentityMode
+        identityMode: submitted.renderedDisplayFidelity === 'exact'
+          ? submitted.renderedIdentityMode
+          : 'display_not_source_identity'
       };
       op.updatedAt = Date.now();
       if (request.firstBinding) {
@@ -508,18 +560,33 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       fail('review_send_action_receipt_invalid');
     }
     const safeClickTimeIdentity = sanitizeReviewErrorData(clickTimeIdentity);
-    await mutateState(stateDir, async (state) => {
+    return await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (!['PREPARED', 'SEND_INTENT'].includes(op.status) || op.sendActionCount !== 0 || op.userMessageId) {
         fail('review_operation_state_invalid');
       }
+      const baselineMessageIdsSha256 = reviewBaselineMessageIdsSha256(op.baselineMessageIds);
+      if (!baselineMessageIdsSha256) fail('review_submission_baseline_missing');
+      const causalSendReceipt = {
+        ok: true,
+        persisted: true,
+        identityModel: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        operationId: op.operationId,
+        sendActionCount: 1,
+        clickCount: 1,
+        sourceSha256: request.promptSha256,
+        canonicalPromptSha256: promptIdentity.canonicalSha256,
+        baselineMessageIdsSha256
+      };
       op.status = 'SEND_INTENT';
       op.sendActionCount = 1;
       op.clickCount = 1;
       op.clickTimeIdentity = safeClickTimeIdentity;
+      op.causalSendReceipt = causalSendReceipt;
       op.sendActionAt = action?.sendActionAt || Date.now();
       op.updatedAt = Date.now();
+      return { ...causalSendReceipt };
     });
   };
 
@@ -528,12 +595,20 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     const observedUrl = requiredText(observed?.conversationUrl, 'conversationUrl', { max: 2048 });
     const observedId = requiredText(observed?.conversationId, 'conversationId', { max: 256 });
     const observedIdentity = conversationIdentityFromUrl(observedUrl);
-    const allowedClasses = new Set(['turn_exact', 'turn_unreadable', 'turn_content_mismatch']);
+    const allowedClasses = new Set([
+      'turn_exact',
+      'turn_unreadable',
+      'turn_content_mismatch',
+      'turn_causal_exact_rendered_unreadable',
+      'turn_causal_exact_rendered_mismatch'
+    ]);
     if (
       observedIdentity.provider !== request.provider ||
       observedIdentity.conversationId !== observedId ||
       !allowedClasses.has(observed?.commitmentClass) ||
-      observed?.newUserMessageCount !== 1
+      observed?.newUserMessageCount !== 1 ||
+      (observed?.commitmentClass.startsWith('turn_causal_exact_') &&
+        observed?.submissionIdentityMode !== REVIEW_CAUSAL_SUBMISSION_MODEL)
     ) {
       fail('review_observed_user_turn_receipt_invalid');
     }
@@ -546,6 +621,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
       if (op.sendActionCount !== 1 || op.sendCount !== 0 || op.userMessageId) {
         fail('review_operation_state_invalid');
+      }
+      if (observed.commitmentClass.startsWith('turn_causal_exact_') && !op.causalSendReceipt) {
+        fail('review_causal_submission_receipt_missing');
       }
       if (op.observedUserMessageId && op.observedUserMessageId !== observedUserMessageId) {
         fail('review_observed_user_message_identity_mismatch');
@@ -673,10 +751,16 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           ? await controller.observeReviewResponse({
           expectedUrl: currentOperation.conversationUrl,
           expectedConversationId: currentOperation.conversationId,
-          expectedModel: request.model,
-          userMessageId: currentOperation.userMessageId,
-          timeoutMs: remainingMs
-        })
+           expectedModel: request.model,
+           userMessageId: currentOperation.userMessageId,
+           expectedPrompt: request.prompt,
+           expectedPromptSha256: currentOperation.promptSha256,
+           baselineMessageIds: currentOperation.baselineMessageIds,
+           sendCount: currentOperation.sendCount,
+           sendActionCount: currentOperation.sendActionCount,
+           renderedDisplayFidelity: currentOperation.renderedDisplay?.fidelity || 'exact',
+           timeoutMs: remainingMs
+         })
           : fail('review_operation_closed_create_fresh')
         : await controller.reviewQuery({
           prompt: request.prompt,
@@ -733,6 +817,14 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         completedAt: Date.now(),
         updatedAt: Date.now()
       });
+      if (op.submissionIdentity) {
+        op.submissionIdentity = {
+          ...op.submissionIdentity,
+          userMessageId: validated.userMessageId,
+          conversationUrl: validated.conversationUrl,
+          conversationId: validated.conversationId
+        };
+      }
       if (request.firstBinding && provisionalChatgptConversationId(state.bindings[request.stableKey]?.conversationId)) {
         const binding = state.bindings[request.stableKey];
         if (!binding || binding.provider !== request.provider || binding.model !== request.model) {

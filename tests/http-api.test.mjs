@@ -6,7 +6,12 @@ import fs from 'node:fs/promises';
 
 import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
 import { readReviewTransportState } from '../state.mjs';
-import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
+import {
+  REVIEW_CAUSAL_SUBMISSION_MODEL,
+  REVIEW_PLAIN_TEXT_MODEL,
+  reviewPlainTextIdentity
+} from '../review-text-identity.mjs';
+import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
 
 test('http-api: strict pre-send busy and post-send identity ambiguity are conflicts', () => {
   assert.equal(mapErrorToHttp(new Error('review_tab_busy')).code, 409);
@@ -89,12 +94,44 @@ test('http-api: strict review query returns a durable receipt and does not dupli
       await args.onComposerVerified?.({
         ok: true,
         textModel: REVIEW_PLAIN_TEXT_MODEL,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerKind: 'contenteditable',
+        clearMethod: 'already_empty',
+        selectionVerified: true,
+        deleteKeyCount: 0,
+        emptyVerified: true,
+        emptySnapshotCount: 2,
+        caretVerified: true,
+        caretMethod: 'contenteditable_collapsed_range',
+        promptInsertCount: 1,
         sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         identityMode: 'canonical_exact'
       });
-      await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
+      const causalSubmissionReceipt = await args.onSendAction({
+        clickCount: 1,
+        sendActionCount: 1,
+        clickTimeIdentity: {
+          ok: true,
+          recoveredExact: true,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: 'canonical_exact',
+          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
+        }
+      });
+      const observedTurn = {
+        observedUserMessageId: 'user-http-1',
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        commitmentClass: 'turn_exact',
+        newUserMessageCount: 1,
+        serializerOk: true,
+        renderedDisplayFidelity: 'exact'
+      };
+      await args.onUserTurnObserved(observedTurn);
       await args.onSubmitted({
         userMessageId: 'user-http-1',
         conversationUrl: args.expectedUrl,
@@ -102,6 +139,10 @@ test('http-api: strict review query returns a durable receipt and does not dupli
         modelEvidence: 'GPT-5.6 Pro',
         sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        causalSubmissionReceipt,
+        renderedDisplayFidelity: 'exact',
+        renderedDisplayEvidence: observedTurn,
         renderedIdentityMode: 'canonical_exact'
       });
       return {
@@ -2835,12 +2876,44 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
       await args.onComposerVerified?.({
         ok: true,
         textModel: REVIEW_PLAIN_TEXT_MODEL,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerKind: 'contenteditable',
+        clearMethod: 'already_empty',
+        selectionVerified: true,
+        deleteKeyCount: 0,
+        emptyVerified: true,
+        emptySnapshotCount: 2,
+        caretVerified: true,
+        caretMethod: 'contenteditable_collapsed_range',
+        promptInsertCount: 1,
         sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         identityMode: 'canonical_exact'
       });
-      await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
+      const causalSubmissionReceipt = await args.onSendAction({
+        clickCount: 1,
+        sendActionCount: 1,
+        clickTimeIdentity: {
+          ok: true,
+          recoveredExact: true,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: 'canonical_exact',
+          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
+        }
+      });
+      const observedTurn = {
+        observedUserMessageId: strictResult.userMessageId,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        commitmentClass: 'turn_exact',
+        newUserMessageCount: 1,
+        serializerOk: true,
+        renderedDisplayFidelity: 'exact'
+      };
+      await args.onUserTurnObserved(observedTurn);
       await args.onSubmitted({
         userMessageId: strictResult.userMessageId,
         conversationUrl: args.expectedUrl,
@@ -2848,6 +2921,10 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
         modelEvidence: 'GPT-5.6 Pro',
         sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+        causalSubmissionReceipt,
+        renderedDisplayFidelity: 'exact',
+        renderedDisplayEvidence: observedTurn,
         renderedIdentityMode: 'canonical_exact'
       });
       strictStarted += 1;

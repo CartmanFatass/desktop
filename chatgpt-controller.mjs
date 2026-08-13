@@ -2,12 +2,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {
+  REVIEW_CAUSAL_SUBMISSION_MODEL,
   REVIEW_PLAIN_TEXT_MODEL,
   browserSpaceRebalanceSite,
   canonicalizeReviewPlainText,
   compareReviewPlainText,
   reviewPlainTextIdentity,
-  safeReviewPlainTextComparison
+  safeReviewPlainTextComparison,
+  validateReviewCausalSubmissionReceipt
 } from './review-text-identity.mjs';
 import {
   REVIEW_COMPOSER_REPLACEMENT_MODEL,
@@ -2138,14 +2140,20 @@ export class ChatGPTController {
 
   async #waitForReviewUserMessage({
     baselineIds,
+    baselineMessageIds,
     deadline,
     identity,
     expectedPrompt,
     firstBinding = false,
-    onUserTurnObserved = null
+    onUserTurnObserved = null,
+    causalSubmissionReceipt = null
   }) {
     let submittedUserMessageId = null;
-    let persistedObservedUserMessageId = null;
+    let persistedObservedKey = null;
+    const causalSubmissionAccepted = validateReviewCausalSubmissionReceipt(causalSubmissionReceipt, {
+      prompt: expectedPrompt,
+      baselineMessageIds
+    });
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       const snapshot = await this.#reviewSnapshot(identity?.expectedModel);
@@ -2173,11 +2181,20 @@ export class ChatGPTController {
         const textIdentity = message.textIdentityReadable === false
           ? null
           : safeReviewPlainTextComparison(expectedPrompt, message.text);
-        const commitmentClass = message.textIdentityReadable === false
-          ? 'turn_unreadable'
+        const renderedDisplayFidelity = message.textIdentityReadable === false
+          ? 'unreadable'
           : textIdentity?.ok === true
-            ? 'turn_exact'
-            : 'turn_content_mismatch';
+            ? 'exact'
+            : 'lossy_mismatch';
+        const commitmentClass = renderedDisplayFidelity === 'exact'
+          ? 'turn_exact'
+          : causalSubmissionAccepted
+            ? renderedDisplayFidelity === 'unreadable'
+              ? 'turn_causal_exact_rendered_unreadable'
+              : 'turn_causal_exact_rendered_mismatch'
+            : renderedDisplayFidelity === 'unreadable'
+              ? 'turn_unreadable'
+              : 'turn_content_mismatch';
         const {
           candidateCount: renderedContentCandidateCount = null,
           ...renderedContentDiagnostic
@@ -2189,6 +2206,8 @@ export class ChatGPTController {
           conversationId: snapshot.conversationId,
           modelEvidence: snapshot.modelEvidence || null,
           commitmentClass,
+          submissionIdentityMode: causalSubmissionAccepted ? REVIEW_CAUSAL_SUBMISSION_MODEL : null,
+          renderedDisplayFidelity,
           serializerOk: message.textIdentityReadable === true,
           serializerMethod: 'rendered_user_message_structural',
           serializerError: message.textIdentityError || (textIdentity?.ok === true ? null : 'review_user_message_content_mismatch'),
@@ -2203,25 +2222,34 @@ export class ChatGPTController {
           ...(textIdentity || {}),
           ...renderedContentDiagnostic
         };
-        if (persistedObservedUserMessageId !== message.id) {
+        const observedKey = `${message.id}\u0000${snapshot.url}\u0000${snapshot.conversationId}\u0000${commitmentClass}`;
+        if (persistedObservedKey !== observedKey) {
           await onUserTurnObserved?.(observed);
-          persistedObservedUserMessageId = message.id;
+          persistedObservedKey = observedKey;
         }
         if (firstBinding && provisionalChatgptConversationId(snapshot.conversationId)) {
           await sleep(400);
           continue;
         }
-        if (message.textIdentityReadable === false) {
+        if (message.textIdentityReadable === false && !causalSubmissionAccepted) {
           const error = new Error('review_user_message_identity_unreadable');
           error.data = observed;
           throw error;
         }
-        if (textIdentity?.ok !== true) {
+        if (textIdentity?.ok !== true && !causalSubmissionAccepted) {
           const error = new Error('review_user_message_content_mismatch');
           error.data = observed;
           throw error;
         }
-        return { snapshot, message, textIdentity };
+        return {
+          snapshot,
+          message,
+          textIdentity,
+          causalSubmissionReceipt: causalSubmissionAccepted ? causalSubmissionReceipt : null,
+          submissionIdentityMode: causalSubmissionAccepted ? REVIEW_CAUSAL_SUBMISSION_MODEL : 'rendered_exact',
+          renderedDisplayFidelity,
+          renderedDisplayEvidence: observed
+        };
       }
       await sleep(400);
     }
@@ -2290,7 +2318,8 @@ export class ChatGPTController {
     expectedPromptSha256,
     baselineMessageIds,
     sendCount,
-    sendActionCount
+    sendActionCount,
+    renderedDisplayFidelity = 'exact'
   }) {
     const originalIdDeadline = Math.min(deadline, Date.now() + 5_000);
     while (Date.now() < originalIdDeadline) {
@@ -2312,6 +2341,9 @@ export class ChatGPTController {
       sendActionCount !== 1
     ) {
       throw new Error('review_content_rebind_receipt_invalid');
+    }
+    if (renderedDisplayFidelity !== 'exact') {
+      throw new Error('review_content_rebind_unavailable_for_lossy_rendering');
     }
 
     let firstStable = null;
@@ -2555,7 +2587,7 @@ export class ChatGPTController {
         sourcePromptSha256: promptIdentity.sourceSha256,
         canonicalPromptSha256: promptIdentity.canonicalSha256
       });
-      await onSendAction?.({
+      const causalSubmissionReceipt = await onSendAction?.({
         clickCount: clickReceipt?.clickCount || 0,
         sendActionCount: 1,
         sendActionAt: Date.now(),
@@ -2563,11 +2595,13 @@ export class ChatGPTController {
       });
       const submitted = await this.#waitForReviewUserMessage({
         baselineIds,
+        baselineMessageIds: [...baselineIds],
         deadline,
         identity,
         expectedPrompt: prompt,
         firstBinding,
-        onUserTurnObserved
+        onUserTurnObserved,
+        causalSubmissionReceipt
       });
       const submittedIdentity = {
         expectedUrl: submitted.snapshot.url,
@@ -2580,8 +2614,12 @@ export class ChatGPTController {
         conversationUrl: submitted.snapshot.url,
         conversationId: submitted.snapshot.conversationId,
         modelEvidence: submitted.snapshot.modelEvidence,
-        sourcePromptSha256: submitted.textIdentity?.sourceSha256 || reviewPlainTextIdentity(prompt).sourceSha256,
-        canonicalPromptSha256: submitted.textIdentity?.canonicalPromptSha256 || reviewPlainTextIdentity(prompt).canonicalSha256,
+        sourcePromptSha256: reviewPlainTextIdentity(prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(prompt).canonicalSha256,
+        submissionIdentityMode: submitted.submissionIdentityMode,
+        causalSubmissionReceipt: submitted.causalSubmissionReceipt,
+        renderedDisplayFidelity: submitted.renderedDisplayFidelity,
+        renderedDisplayEvidence: submitted.renderedDisplayEvidence,
         renderedIdentityMode: submitted.textIdentity?.identityMode || null
       });
       return await this.#waitForReviewAssistant({
@@ -2604,6 +2642,7 @@ export class ChatGPTController {
     baselineMessageIds,
     sendCount,
     sendActionCount,
+    renderedDisplayFidelity = 'exact',
     timeoutMs
   }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
@@ -2637,7 +2676,8 @@ export class ChatGPTController {
       expectedPromptSha256,
       baselineMessageIds,
       sendCount,
-      sendActionCount
+      sendActionCount,
+      renderedDisplayFidelity
     });
     return await this.#waitForReviewAssistant({
       userMessageId,
@@ -2696,7 +2736,7 @@ export class ChatGPTController {
     expectedConversationId,
     expectedModel,
     timeoutMs,
-    exactComposerCausalBinding,
+    causalSubmissionReceipt,
     onRecovered
   }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
@@ -2708,7 +2748,9 @@ export class ChatGPTController {
     const newUserMessages = (snapshot.messages || []).filter(
       (message) => message.role === 'user' && !baselineIds.has(message.id)
     );
-    if (exactComposerCausalBinding !== true) throw new Error('review_composer_causal_binding_missing');
+    if (!validateReviewCausalSubmissionReceipt(causalSubmissionReceipt, { prompt, baselineMessageIds })) {
+      throw new Error('review_composer_causal_binding_missing');
+    }
     if (newUserMessages.length !== 1) {
       const message = newUserMessages.length === 1 ? newUserMessages[0] : null;
       const error = new Error('review_user_message_identity_unreadable');
@@ -2740,7 +2782,11 @@ export class ChatGPTController {
       conversationUrl: snapshot.url,
       conversationId: snapshot.conversationId,
       modelEvidence: snapshot.modelEvidence,
-      identityMode: renderedExact ? 'rendered_exact' : 'exact_composer_causal_binding',
+      identityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+      renderedDisplayFidelity: message.textIdentityReadable === false
+        ? 'unreadable'
+        : renderedExact ? 'exact' : 'lossy_mismatch',
+      causalSubmissionReceipt,
       composerPromptSha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
       renderedIdentityDiagnostic: {
         newUserMessageCount: newUserMessages.length,

@@ -156,7 +156,13 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
     }
     const hasObservedUserTurn = operation.observedUserMessageId !== undefined;
     if (hasObservedUserTurn) {
-      const observedCommitmentClasses = new Set(['turn_exact', 'turn_unreadable', 'turn_content_mismatch']);
+      const observedCommitmentClasses = new Set([
+        'turn_exact',
+        'turn_unreadable',
+        'turn_content_mismatch',
+        'turn_causal_exact_rendered_unreadable',
+        'turn_causal_exact_rendered_mismatch'
+      ]);
       if (
         !nonEmptyString(operation.observedUserMessageId) ||
         !Number.isFinite(operation.observedUserMessageAt) ||
@@ -170,6 +176,7 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
         operation.observedTurnEvidence.newUserMessageCount !== 1 ||
         operation.sendActionCount !== 1 ||
         operation.newUserMessageCount !== 1 ||
+        (operation.observedCommitmentClass.startsWith('turn_causal_exact_') && !operation.causalSendReceipt) ||
         (operation.userMessageId !== undefined && operation.userMessageId !== operation.observedUserMessageId)
       ) {
         throw new Error('review_transport_state_invalid');
@@ -182,6 +189,50 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
       operation.observedTurnEvidence !== undefined
     ) {
       throw new Error('review_transport_state_invalid');
+    }
+    if (operation.causalSendReceipt !== undefined) {
+      const receipt = operation.causalSendReceipt;
+      if (
+        !receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
+        receipt.ok !== true || receipt.persisted !== true ||
+        receipt.identityModel !== 'agentify_review_causal_submission_v1' ||
+        receipt.operationId !== operation.operationId ||
+        receipt.sendActionCount !== 1 || receipt.clickCount !== 1 ||
+        receipt.sourceSha256 !== operation.promptSha256 ||
+        !/^[0-9a-f]{64}$/.test(String(receipt.canonicalPromptSha256 || '')) ||
+        !/^[0-9a-f]{64}$/.test(String(receipt.baselineMessageIdsSha256 || '')) ||
+        operation.sendActionCount !== 1
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
+    }
+    if (operation.submissionIdentity !== undefined) {
+      const identity = operation.submissionIdentity;
+      if (
+        !identity || typeof identity !== 'object' || Array.isArray(identity) ||
+        identity.identityModel !== 'agentify_review_causal_submission_v1' ||
+        identity.sourceSha256 !== operation.promptSha256 ||
+        !/^[0-9a-f]{64}$/.test(String(identity.canonicalPromptSha256 || '')) ||
+        !/^[0-9a-f]{64}$/.test(String(identity.baselineMessageIdsSha256 || '')) ||
+        identity.sendActionCount !== 1 || identity.clickCount !== 1 ||
+        identity.userMessageId !== operation.userMessageId ||
+        identity.conversationUrl !== operation.conversationUrl ||
+        identity.conversationId !== operation.conversationId ||
+        operation.sendCount !== 1 || operation.sendActionCount !== 1 ||
+        !operation.causalSendReceipt
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
+    }
+    if (operation.renderedDisplay !== undefined) {
+      const display = operation.renderedDisplay;
+      if (
+        !display || typeof display !== 'object' || Array.isArray(display) ||
+        !new Set(['exact', 'lossy_mismatch', 'unreadable']).has(display.fidelity) ||
+        !operation.submissionIdentity
+      ) {
+        throw new Error('review_transport_state_invalid');
+      }
     }
     if (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId)) {
       throw new Error('review_transport_state_invalid');

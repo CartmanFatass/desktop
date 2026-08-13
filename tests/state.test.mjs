@@ -167,6 +167,58 @@ test('state: observed user-turn commitment evidence round-trips and incomplete p
   await assert.rejects(writeReviewTransportState(mismatchedAnchor, dir), /review_transport_state_invalid/);
 });
 
+test('state: causal submission identity and lossy display evidence round-trip without becoming interchangeable', async () => {
+  const dir = await tempDir();
+  const value = completeReviewState();
+  const operation = value.operations.smoke;
+  operation.baselineMessageIds = ['historical-user'];
+  const baselineMessageIdsSha256 = crypto.createHash('sha256')
+    .update(JSON.stringify(operation.baselineMessageIds), 'utf8')
+    .digest('hex');
+  const canonicalPromptSha256 = 'b'.repeat(64);
+  operation.causalSendReceipt = {
+    ok: true,
+    persisted: true,
+    identityModel: 'agentify_review_causal_submission_v1',
+    operationId: operation.operationId,
+    sendActionCount: 1,
+    clickCount: 1,
+    sourceSha256: operation.promptSha256,
+    canonicalPromptSha256,
+    baselineMessageIdsSha256
+  };
+  operation.observedUserMessageId = operation.userMessageId;
+  operation.observedUserMessageAt = operation.createdAt + 100;
+  operation.observedConversationUrl = operation.conversationUrl;
+  operation.observedConversationId = operation.conversationId;
+  operation.observedCommitmentClass = 'turn_causal_exact_rendered_mismatch';
+  operation.observedTurnEvidence = {
+    commitmentClass: operation.observedCommitmentClass,
+    submissionIdentityMode: 'agentify_review_causal_submission_v1',
+    renderedDisplayFidelity: 'lossy_mismatch',
+    newUserMessageCount: 1
+  };
+  operation.newUserMessageCount = 1;
+  operation.submissionIdentity = {
+    identityModel: 'agentify_review_causal_submission_v1',
+    sourceSha256: operation.promptSha256,
+    canonicalPromptSha256,
+    baselineMessageIdsSha256,
+    sendActionCount: 1,
+    clickCount: 1,
+    userMessageId: operation.userMessageId,
+    conversationUrl: operation.conversationUrl,
+    conversationId: operation.conversationId
+  };
+  operation.renderedDisplay = { fidelity: 'lossy_mismatch', serializedLength: 124, expectedLength: 132 };
+  await writeReviewTransportState(value, dir);
+  assert.deepEqual(await readReviewTransportState(dir), value);
+
+  const conflated = structuredClone(value);
+  conflated.operations.smoke.submissionIdentity.sourceSha256 = 'c'.repeat(64);
+  await assert.rejects(writeReviewTransportState(conflated, dir), /review_transport_state_invalid/);
+});
+
 test('state: valid schema v1 COMPLETE migrates sendActionCount with deterministic provenance', async () => {
   const dir = await tempDir();
   const file = path.join(dir, 'review-transport.json');
