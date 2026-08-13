@@ -30,6 +30,7 @@
     "orchestrator.mjs",
     "orchestrator/",
     "popup-policy.mjs",
+    "review-text-identity.mjs",
     "review-transport.mjs",
     "selectors.json",
     "shutdown.mjs",

@@ -16,6 +16,12 @@ import {
   serializeReviewUserMessage,
   summarizeReviewComposerStructure
 } from '../chatgpt-controller.mjs';
+import {
+  REVIEW_PLAIN_TEXT_MODEL,
+  compareReviewPlainText,
+  reviewPlainTextIdentity,
+  safeReviewPlainTextComparison
+} from '../review-text-identity.mjs';
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
@@ -107,6 +113,89 @@ test('chatgpt-controller: structural composer serialization preserves exact mult
     ok: true,
     text: 'alpha beta\n\ngamma\ndelta'
   });
+});
+
+test('chatgpt-controller: review plain-text model recovers only reversible browser line endings and space rebalance', () => {
+  const source = [
+    '# Synthetic 7024-shape fixture',
+    '',
+    '- list item',
+    '1. ordered item',
+    '  nested two-space item',
+    '   nested three-space item',
+    '',
+    '```text',
+    'combining=e\u0301 astral=\u{1f680} zero=\u200b',
+    '```',
+    ''
+  ].join('\r\n');
+  const browser = source
+    .replace(/\r\n/g, '\n')
+    .replace('  nested', '\u00a0 nested')
+    .replace('   nested', '\u00a0  nested');
+  const result = compareReviewPlainText(source, browser);
+  assert.equal(result.ok, true);
+  assert.equal(result.identityMode, 'browser_space_rebalanced');
+  assert.equal(result.browserSpaceRebalanceCount, 2);
+  assert.equal(result.lineEndingCanonicalized, true);
+  const identity = reviewPlainTextIdentity(source);
+  assert.equal(identity.textModel, REVIEW_PLAIN_TEXT_MODEL);
+  assert.notEqual(identity.sourceSha256, identity.canonicalSha256);
+  assert.equal(safeReviewPlainTextComparison(source, browser).observedCanonicalSha256, identity.canonicalSha256);
+});
+
+test('chatgpt-controller: review plain-text model preserves meaningful Unicode and whitespace distinctions', () => {
+  const exactPairs = [
+    ['line\r\n\r\nnext', 'line\n\nnext'],
+    ['```text\r\ncode\r\n```\r\n', '```text\ncode\n```\n'],
+    ['e\u0301 \u{1f680} \u200b', 'e\u0301 \u{1f680} \u200b']
+  ];
+  for (const [source, browser] of exactPairs) assert.equal(compareReviewPlainText(source, browser).ok, true);
+  for (const [source, corrupted] of [
+    ['e\u0301', '\u00e9'],
+    ['\u{1f680}', '\u{1f681}'],
+    ['a\u200bb', 'ab'],
+    ['a b', 'a\u00a0b'],
+    ['  ', '\u00a0 '],
+    ['a\u00a0b', 'a b'],
+    ['a  b', 'a b '],
+    ['a\n\nb', 'a\nb\n']
+  ]) {
+    const result = compareReviewPlainText(source, corrupted);
+    assert.equal(result.ok, false, `${JSON.stringify(source)} must differ from ${JSON.stringify(corrupted)}`);
+    assert.ok(result.mismatchClass);
+  }
+});
+
+test('chatgpt-controller: 7024-character structural fixture remains collision-resistant without science content', () => {
+  const skeleton = [
+    '# Synthetic revision', '', '## Audit', '', '- item', '', '1. first',
+    '  branch', '   subbranch', '', '```text', 'x=1', '```', ''
+  ].join('\n');
+  const pad = 'x'.repeat(7024 - skeleton.length);
+  const source = `${skeleton}${pad}`;
+  assert.equal(source.length, 7024);
+  const browser = source.replace('  branch', '\u00a0 branch').replace('   subbranch', '\u00a0  subbranch');
+  const accepted = safeReviewPlainTextComparison(source, browser);
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.canonicalPromptSha256, accepted.observedCanonicalSha256);
+  const corrupted = `${browser.slice(0, -1)}y`;
+  const rejected = safeReviewPlainTextComparison(source, corrupted);
+  assert.equal(rejected.ok, false);
+  assert.notEqual(rejected.canonicalPromptSha256, rejected.observedCanonicalSha256);
+});
+
+test('chatgpt-controller: content-rebind receipt accepts browser space rebalance only under the same canonical hash', () => {
+  const expected = '  branch\n   nested\n';
+  const rendered = '\u00a0 branch\n\u00a0  nested\n';
+  const receipt = safeReviewPlainTextComparison(expected, rendered);
+  assert.equal(receipt.ok, true);
+  assert.equal(receipt.identityMode, 'browser_space_rebalanced');
+  assert.equal(receipt.canonicalPromptSha256, receipt.observedCanonicalSha256);
+
+  const corrupted = safeReviewPlainTextComparison(expected, `${rendered.slice(0, -2)}x\n`);
+  assert.equal(corrupted.ok, false);
+  assert.notEqual(corrupted.canonicalPromptSha256, corrupted.observedCanonicalSha256);
 });
 
 test('chatgpt-controller: fenced-block shape preserves blank lines and one trailing LF', () => {
@@ -205,6 +294,42 @@ test('chatgpt-controller: composer diagnosis is observe-only and returns metadat
   assert.equal(JSON.stringify(result).includes('not returned'), false);
   assert.equal(evaluateCalls, 1);
   assert.equal(actionCalls, 0);
+});
+
+test('chatgpt-controller: composer mismatch diagnostics identify the first code-point class without content', async () => {
+  const expectedPrompt = '  synthetic\u200b';
+  const observedPrompt = '\u00a0 syntheticx';
+  const page = {
+    async evaluate(js) {
+      const document = {
+        querySelectorAll() { return [element]; }
+      };
+      const crypto = globalThis.crypto;
+      const TextEncoder = globalThis.TextEncoder;
+      const element = {
+        nodeType: 1,
+        tagName: 'DIV',
+        childNodes: [textNode(observedPrompt)],
+        isContentEditable: true,
+        innerText: observedPrompt,
+        textContent: observedPrompt,
+        matches() { return false; },
+        getAttribute(name) { return name === 'contenteditable' ? 'true' : null; },
+        getBoundingClientRect() { return { width: 500, height: 60, y: 600 }; }
+      };
+      const window = { getComputedStyle() { return { visibility: 'visible', display: 'block' }; } };
+      return await Function('document', 'window', 'crypto', 'TextEncoder', `return ${js}`)(document, window, crypto, TextEncoder);
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt' } });
+  const result = await controller.inspectReviewComposerIdentity({ expectedPrompt });
+  assert.equal(result.ok, false);
+  assert.equal(result.browserSpaceRebalanceCount, 1);
+  assert.equal(result.mismatchClass, 'non_reversible_code_point_mismatch');
+  assert.equal(result.firstMismatchExpectedCodePoint, 'U+200B');
+  assert.equal(result.firstMismatchObservedCodePoint, 'U+0078');
+  assert.notEqual(result.canonicalPromptSha256, result.observedCanonicalSha256);
+  assert.equal(JSON.stringify(result).includes('synthetic'), false);
 });
 
 test('chatgpt-controller: submission diagnosis injects the structure summarizer dependency', async () => {

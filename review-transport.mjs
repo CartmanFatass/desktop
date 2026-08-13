@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { readReviewTransportState, writeReviewTransportState } from './state.mjs';
+import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from './review-text-identity.mjs';
 
 const MAX_REVIEW_TIMEOUT_MS = 45 * 60_000;
 const MIN_REVIEW_TIMEOUT_MS = 1_000;
@@ -72,7 +73,8 @@ export function sanitizeReviewErrorData(value) {
   }
   for (const field of [
     'serializerMethod', 'serializerError', 'serializerTag', 'rootTag',
-    'predicate', 'failureStage'
+    'predicate', 'failureStage', 'textModel', 'identityMode', 'mismatchClass',
+    'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint'
   ]) {
     if (data[field] === null) {
       output[field] = null;
@@ -84,11 +86,21 @@ export function sanitizeReviewErrorData(value) {
     'serializedLength', 'expectedLength', 'candidateCount', 'elementCount',
     'textNodeCount', 'otherNodeCount', 'maxDepth', 'exactMatchCount',
     'readableCandidateCount', 'renderedContentCandidateCount',
-    'newUserMessageCount', 'sendActionCount'
+    'newUserMessageCount', 'sendActionCount', 'expectedRawLength',
+    'expectedCanonicalLength', 'observedRawLength', 'observedCanonicalLength',
+    'browserSpaceRebalanceCount', 'mismatchCount', 'firstMismatchCodePointIndex'
   ]) {
     if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
       output[field] = data[field];
     }
+  }
+  for (const field of [
+    'sourceSha256', 'canonicalPromptSha256', 'observedRawSha256', 'observedCanonicalSha256'
+  ]) {
+    if (/^[0-9a-f]{64}$/.test(String(data[field] || ''))) output[field] = data[field];
+  }
+  if (typeof data.lineEndingCanonicalized === 'boolean') {
+    output.lineEndingCanonicalized = data.lineEndingCanonicalized;
   }
   if (
     Array.isArray(data.observedLengths) &&
@@ -327,6 +339,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
   if (!stateDir || !tabs) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
   const fingerprint = requestFingerprint(request);
+  const promptIdentity = reviewPlainTextIdentity(request.prompt);
   const intake = await mutateState(stateDir, async (state) => {
     const now = Date.now();
     const binding = state.bindings[request.stableKey];
@@ -371,6 +384,8 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       conversationUrl: request.conversationUrl,
       conversationId: request.conversationId,
       promptSha256: request.promptSha256,
+      promptTextModel: promptIdentity.textModel,
+      canonicalPromptSha256: promptIdentity.canonicalSha256,
       timeoutMs: request.timeoutMs,
       deadlineAt: now + request.timeoutMs,
       status: 'SEND_INTENT',
@@ -421,6 +436,13 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (!request.firstBinding && (submittedUrl !== request.conversationUrl || submittedId !== request.conversationId)) {
       fail('review_conversation_identity_mismatch');
     }
+    if (
+      submitted?.sourcePromptSha256 !== request.promptSha256 ||
+      submitted?.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
+      !['canonical_exact', 'browser_space_rebalanced'].includes(submitted?.renderedIdentityMode)
+    ) {
+      fail('review_user_message_identity_receipt_invalid');
+    }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
@@ -433,6 +455,12 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
       op.modelEvidence = submitted?.modelEvidence || null;
+      op.renderedIdentity = {
+        textModel: promptIdentity.textModel,
+        sourceSha256: request.promptSha256,
+        canonicalPromptSha256: promptIdentity.canonicalSha256,
+        identityMode: submitted.renderedIdentityMode
+      };
       op.updatedAt = Date.now();
       if (request.firstBinding) {
         const now = Date.now();
@@ -464,6 +492,38 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.sendActionCount = 1;
       op.clickCount = 1;
       op.sendActionAt = action?.sendActionAt || Date.now();
+      op.updatedAt = Date.now();
+    });
+  };
+
+  const onComposerVerified = async (identity) => {
+    if (
+      identity?.ok !== true ||
+      identity.textModel !== REVIEW_PLAIN_TEXT_MODEL ||
+      identity.sourceSha256 !== request.promptSha256 ||
+      identity.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
+      identity.observedCanonicalSha256 !== promptIdentity.canonicalSha256
+    ) {
+      fail('review_composer_identity_receipt_invalid');
+    }
+    const safeIdentity = sanitizeReviewErrorData(identity);
+    const allowedIdentityModes = new Set(['canonical_exact', 'browser_space_rebalanced']);
+    const verifiedIdentity = {
+      ...(safeIdentity || {}),
+      ok: true,
+      textModel: REVIEW_PLAIN_TEXT_MODEL,
+      identityMode: allowedIdentityModes.has(identity.identityMode) ? identity.identityMode : 'canonical_exact',
+      sourceSha256: request.promptSha256,
+      canonicalPromptSha256: promptIdentity.canonicalSha256,
+      observedCanonicalSha256: promptIdentity.canonicalSha256
+    };
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.sendCount !== 0 || op.sendActionCount !== 0 || op.userMessageId) {
+        fail('review_operation_state_invalid');
+      }
+      op.composerIdentity = { ...verifiedIdentity, verified: true, verifiedAt: Date.now() };
       op.updatedAt = Date.now();
     });
   };
@@ -549,6 +609,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           expectedModel: request.model,
           timeoutMs: remainingMs,
           onPrepared,
+          onComposerVerified,
           onSendAction,
           onSubmitted,
           firstBinding: request.firstBinding

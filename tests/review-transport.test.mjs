@@ -13,6 +13,7 @@ import {
   sanitizeReviewErrorData
 } from '../review-transport.mjs';
 import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
+import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 
@@ -99,6 +100,14 @@ async function fixture() {
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
       });
+      await args.onComposerVerified?.({
+        ok: true,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        identityMode: 'canonical_exact'
+      });
       if (reviewFailure) throw reviewFailure;
       if (sendControlFailure) throw sendControlFailure;
       await args.onSendAction({
@@ -113,6 +122,9 @@ async function fixture() {
         conversationUrl: submittedUrl,
         conversationId: submittedId,
         modelEvidence: 'GPT-5.6 Pro',
+        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        renderedIdentityMode: 'canonical_exact',
         ...exactIdentityFields()
       });
       if (failAfterSubmittedReceipt) throw new Error('simulated_crash_after_submitted_receipt');
@@ -523,6 +535,11 @@ test('review transport: one send persists a complete receipt and duplicate retur
   assert.equal(first.userMessageId, 'user-1');
   assert.equal(first.assistantMessageId, 'assistant-1');
   assert.equal(first.sendActionCount, 1);
+  assert.equal(first.promptTextModel, REVIEW_PLAIN_TEXT_MODEL);
+  assert.equal(first.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
+  assert.equal(first.composerIdentity.verified, true);
+  assert.equal(first.composerIdentity.sourceSha256, f.request.promptSha256);
+  assert.equal(first.renderedIdentity.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
   assert.equal('submissionIdentityMode' in first, false);
   assert.equal('composerPromptSha256' in first, false);
   assert.equal(f.calls.review, 1);

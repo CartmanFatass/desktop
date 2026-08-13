@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 
 import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
 import { readReviewTransportState } from '../state.mjs';
+import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
 
 test('http-api: strict pre-send busy and post-send identity ambiguity are conflicts', () => {
   assert.equal(mapErrorToHttp(new Error('review_tab_busy')).code, 409);
@@ -85,12 +86,23 @@ test('http-api: strict review query returns a durable receipt and does not dupli
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
       });
+      await args.onComposerVerified?.({
+        ok: true,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        identityMode: 'canonical_exact'
+      });
       await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
       await args.onSubmitted({
         userMessageId: 'user-http-1',
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
+        modelEvidence: 'GPT-5.6 Pro',
+        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        renderedIdentityMode: 'canonical_exact'
       });
       return {
         userMessageId: 'user-http-1',
@@ -2820,8 +2832,24 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
     runExclusive: async (fn) => await fn(),
     reviewQuery: async (args) => {
       await args.onPrepared({ baselineMessageIds: [], conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
+      await args.onComposerVerified?.({
+        ok: true,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        identityMode: 'canonical_exact'
+      });
       await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
-      await args.onSubmitted({ userMessageId: strictResult.userMessageId, conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
+      await args.onSubmitted({
+        userMessageId: strictResult.userMessageId,
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro',
+        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        renderedIdentityMode: 'canonical_exact'
+      });
       strictStarted += 1;
       await strictGate;
       return strictResult;

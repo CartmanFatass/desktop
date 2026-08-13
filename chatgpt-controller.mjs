@@ -1,6 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {
+  REVIEW_PLAIN_TEXT_MODEL,
+  browserSpaceRebalanceSite,
+  canonicalizeReviewPlainText,
+  compareReviewPlainText,
+  reviewPlainTextIdentity,
+  safeReviewPlainTextComparison
+} from './review-text-identity.mjs';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -768,11 +776,21 @@ export class ChatGPTController {
     if (typeof expectedPrompt !== 'string') throw new Error('review_composer_expected_prompt_invalid');
     const sel = JSON.stringify(this.selectors.promptTextarea);
     const expected = JSON.stringify(expectedPrompt);
-    return await this.#eval(`(() => {
+    const textModel = JSON.stringify(REVIEW_PLAIN_TEXT_MODEL);
+    return await this.#eval(`(async () => {
         const reviewComposerDiagnosticMarker = true;
         const expected = ${expected};
+        const REVIEW_PLAIN_TEXT_MODEL = ${textModel};
+        const canonicalizeReviewPlainText = ${canonicalizeReviewPlainText.toString()};
+        const browserSpaceRebalanceSite = ${browserSpaceRebalanceSite.toString()};
+        const compareReviewPlainText = ${compareReviewPlainText.toString()};
         const serializeReviewComposer = ${serializeReviewComposer.toString()};
         const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
+        const sha256Hex = async (value) => {
+          const bytes = new TextEncoder().encode(String(value ?? ''));
+          const digest = await crypto.subtle.digest('SHA-256', bytes);
+          return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+        };
         const visible = (n) => {
           const r = n.getBoundingClientRect();
           const style = window.getComputedStyle(n);
@@ -838,8 +856,25 @@ export class ChatGPTController {
         const observed = el.matches('textarea, input')
           ? [String(el.value || '')]
           : [String(el.innerText || ''), String(el.textContent || '')];
+        const digestCache = new Map();
+        const digest = async (value) => {
+          const key = String(value ?? '');
+          if (!digestCache.has(key)) digestCache.set(key, await sha256Hex(key));
+          return digestCache.get(key);
+        };
+        const comparison = serialized.ok === true
+          ? compareReviewPlainText(expected, serialized.text)
+          : null;
+        const sourceSha256 = await digest(expected);
+        const canonicalPromptSha256 = await digest(canonicalizeReviewPlainText(expected));
+        const observedRawSha256 = await digest(serialized.ok === true ? serialized.text : '');
+        const observedCanonicalSha256 = await digest(comparison?.canonicalObservedText || '');
+        const exactIdentity =
+          serialized.ok === true &&
+          comparison?.ok === true &&
+          canonicalPromptSha256 === observedCanonicalSha256;
         return {
-          ok: serialized.ok === true && serialized.text === expected,
+          ok: exactIdentity,
           candidateCount: candidates.length,
           serializerOk: serialized.ok === true,
           serializerMethod: serialized.method,
@@ -848,6 +883,18 @@ export class ChatGPTController {
           serializedLength: String(serialized.text || '').length,
           observedLengths: observed.map(value => value.length),
           expectedLength: expected.length,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: comparison?.identityMode || 'unreadable',
+          sourceSha256,
+          canonicalPromptSha256,
+          observedRawSha256,
+          observedCanonicalSha256,
+          browserSpaceRebalanceCount: comparison?.browserSpaceRebalanceCount || 0,
+          mismatchCount: comparison?.mismatchCount || 0,
+          mismatchClass: comparison?.mismatchClass || null,
+          firstMismatchCodePointIndex: comparison?.firstMismatchCodePointIndex ?? null,
+          firstMismatchExpectedCodePoint: comparison?.firstMismatchExpectedCodePoint || null,
+          firstMismatchObservedCodePoint: comparison?.firstMismatchObservedCodePoint || null,
           ...structure
         };
       })()`);
@@ -1735,18 +1782,22 @@ export class ChatGPTController {
           await sleep(400);
           continue;
         }
-        if (message.textIdentityReadable === false || message.text !== expectedPrompt) {
+        const textIdentity = message.textIdentityReadable === false
+          ? null
+          : safeReviewPlainTextComparison(expectedPrompt, message.text);
+        if (message.textIdentityReadable === false || textIdentity?.ok !== true) {
           const error = new Error('review_user_message_content_mismatch');
           error.data = {
             newUserMessageCount: 1,
             readableCandidateCount: message.textIdentityReadable === false ? 0 : 1,
-            exactMatchCount: message.text === expectedPrompt ? 1 : 0,
+            exactMatchCount: textIdentity?.ok === true ? 1 : 0,
             serializedLength: Number.isFinite(message.textLength) ? message.textLength : null,
-            expectedLength: String(expectedPrompt || '').length
+            expectedLength: String(expectedPrompt || '').length,
+            ...(textIdentity || {})
           };
           throw error;
         }
-        return { snapshot, message };
+        return { snapshot, message, textIdentity };
       }
       await sleep(400);
     }
@@ -1850,12 +1901,15 @@ export class ChatGPTController {
       if (users.some((message) => message.textIdentityReadable !== true)) {
         throw new Error('review_content_rebind_user_content_unreadable');
       }
-      const matches = users.filter((message) =>
-        message.text === expectedPrompt &&
-        crypto.createHash('sha256').update(message.text, 'utf8').digest('hex') === expectedPromptSha256
+      const matches = users.map((message) => ({
+        message,
+        identity: safeReviewPlainTextComparison(expectedPrompt, message.text)
+      })).filter(({ identity }) =>
+        identity.ok === true &&
+        identity.canonicalPromptSha256 === identity.observedCanonicalSha256
       );
       if (matches.length !== 1) throw new Error('review_content_rebind_user_match_ambiguous');
-      const anchor = matches[0];
+      const { message: anchor, identity: anchorIdentity } = matches[0];
       if (!anchor.id) throw new Error('review_content_rebind_anchor_unreadable');
       if (baselineMessageIds.includes(anchor.id)) throw new Error('review_content_rebind_baseline_collision');
       const turn = await this.#reviewAssistantResult({
@@ -1890,6 +1944,9 @@ export class ChatGPTController {
             originalUserMessageId: userMessageId,
             currentUserMessageId: anchor.id,
             promptSha256: expectedPromptSha256,
+            promptTextModel: anchorIdentity.textModel,
+            canonicalPromptSha256: anchorIdentity.canonicalPromptSha256,
+            renderedIdentityMode: anchorIdentity.identityMode,
             baselineMessageCount: baselineMessageIds.length,
             observedAt: now
           }
@@ -2012,6 +2069,7 @@ export class ChatGPTController {
     expectedModel,
     timeoutMs,
     onPrepared,
+    onComposerVerified,
     onSendAction,
     onSubmitted,
     firstBinding = false
@@ -2047,7 +2105,8 @@ export class ChatGPTController {
         conversationId: before.conversationId,
         modelEvidence: before.modelEvidence
       });
-      await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      const composerIdentity = await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      await onComposerVerified?.(composerIdentity);
       const clickReceipt = await this.#clickReviewSendOnce();
       await onSendAction?.({
         clickCount: clickReceipt?.clickCount || 0,
@@ -2065,7 +2124,10 @@ export class ChatGPTController {
         submittedAt: Date.now(),
         conversationUrl: submitted.snapshot.url,
         conversationId: submitted.snapshot.conversationId,
-        modelEvidence: submitted.snapshot.modelEvidence
+        modelEvidence: submitted.snapshot.modelEvidence,
+        sourcePromptSha256: submitted.textIdentity?.sourceSha256 || reviewPlainTextIdentity(prompt).sourceSha256,
+        canonicalPromptSha256: submitted.textIdentity?.canonicalPromptSha256 || reviewPlainTextIdentity(prompt).canonicalSha256,
+        renderedIdentityMode: submitted.textIdentity?.identityMode || null
       });
       return await this.#waitForReviewAssistant({
         userMessageId: submitted.message.id,
@@ -2139,19 +2201,25 @@ export class ChatGPTController {
     const newUserMessages = (snapshot.messages || []).filter(
       (message) => message.role === 'user' && !baselineIds.has(message.id)
     );
-    const exactMatches = newUserMessages.filter((message) => message.text === prompt);
+    const comparisons = new Map(newUserMessages.map((message) => [
+      message,
+      message.textIdentityReadable === false ? null : safeReviewPlainTextComparison(prompt, message.text)
+    ]));
+    const exactMatches = newUserMessages.filter((message) => comparisons.get(message)?.ok === true);
     const readableCandidateCount = newUserMessages.filter((message) => message.textIdentityReadable === true).length;
     const message = newUserMessages.length ? newUserMessages[newUserMessages.length - 1] : null;
     const {
       candidateCount: renderedContentCandidateCount = null,
       ...renderedContentDiagnostic
     } = message?.textIdentityDiagnostic || {};
+    const textIdentity = message ? comparisons.get(message) : null;
+    const comparisonDiagnostic = newUserMessages.length === 1 ? textIdentity || {} : {};
     return {
       ok: exactMatches.length === 1 && newUserMessages.length === 1,
       serializerOk: message?.textIdentityReadable === true,
       serializerMethod: 'rendered_user_message_structural',
       serializerError: message
-        ? message.textIdentityError || (message.text === prompt ? null : 'review_user_message_content_mismatch')
+        ? message.textIdentityError || (textIdentity?.ok === true ? null : 'review_user_message_content_mismatch')
         : 'review_user_message_count_mismatch',
       serializerTag: message?.textIdentityTag || null,
       serializedLength: Number.isInteger(message?.textLength) ? message.textLength : 0,
@@ -2161,6 +2229,7 @@ export class ChatGPTController {
       renderedContentCandidateCount,
       exactMatchCount: exactMatches.length,
       readableCandidateCount,
+      ...comparisonDiagnostic,
       ...renderedContentDiagnostic
     };
   }
@@ -2201,7 +2270,10 @@ export class ChatGPTController {
       throw error;
     }
     const message = newUserMessages[0];
-    const renderedExact = message.text === prompt;
+    const renderedIdentity = message.textIdentityReadable === false
+      ? null
+      : safeReviewPlainTextComparison(prompt, message.text);
+    const renderedExact = renderedIdentity?.ok === true;
     const {
       candidateCount: renderedContentCandidateCount = null,
       ...renderedContentDiagnostic
@@ -2220,6 +2292,7 @@ export class ChatGPTController {
         renderedContentCandidateCount,
         exactMatchCount: renderedExact ? 1 : 0,
         readableCandidateCount: message.textIdentityReadable === true ? 1 : 0,
+        ...(renderedIdentity || {}),
         ...renderedContentDiagnostic
       }
     });
