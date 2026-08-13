@@ -22,9 +22,118 @@ import {
   reviewPlainTextIdentity,
   safeReviewPlainTextComparison
 } from '../review-text-identity.mjs';
+import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
+
+function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty = false, failCaret = false } = {}) {
+  let current = String(existingDraft);
+  let emptyReads = 0;
+  return {
+    evaluate(js) {
+      if (js.includes('reviewComposerClearMarker')) {
+        const initialSerializedLength = current.length;
+        current = '';
+        return {
+          ok: true,
+          replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+          composerKind: 'contenteditable',
+          clearMethod: 'replace_children',
+          clearRevision: '',
+          initialSerializerOk: true,
+          initialSerializedLength,
+          inputEventDispatched: true,
+          promptInsertCount: 0,
+          candidateCount: 1
+        };
+      }
+      if (js.includes('reviewComposerEmptyMarker')) {
+        emptyReads += 1;
+        if (failEmpty && emptyReads === 2) current = existingDraft || 'rehydrated';
+        return {
+          ok: current === '',
+          replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+          composerKind: 'contenteditable',
+          serializerOk: true,
+          serializerMethod: 'contenteditable_structural',
+          serializerError: current === '' ? null : 'review_composer_not_empty',
+          serializedLength: current.length,
+          candidateCount: 1
+        };
+      }
+      if (js.includes('reviewComposerCaretMarker')) {
+        return failCaret
+          ? {
+              ok: false,
+              error: 'review_composer_selection_failed',
+              replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+              composerKind: 'contenteditable',
+              serializedLength: 0,
+              candidateCount: 1
+            }
+          : {
+              ok: true,
+              replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+              composerKind: 'contenteditable',
+              caretMethod: 'contenteditable_collapsed_range',
+              serializedLength: 0,
+              candidateCount: 1
+            };
+      }
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return {
+          ok: current === prompt,
+          serializerOk: true,
+          serializerMethod: 'contenteditable_structural',
+          serializedLength: current.length,
+          expectedLength: prompt.length,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: 'canonical_exact',
+          sourceSha256: reviewPlainTextIdentity(prompt).sourceSha256,
+          canonicalPromptSha256: reviewPlainTextIdentity(prompt).canonicalSha256,
+          observedCanonicalSha256: reviewPlainTextIdentity(current).canonicalSha256
+        };
+      }
+      return null;
+    },
+    insert(text) { current += text; },
+    replace(text) { current = String(text); },
+    get current() { return current; }
+  };
+}
+
+function legacyStrictComposerEval(js) {
+  if (js.includes('reviewComposerClearMarker')) return {
+    ok: true,
+    replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+    composerKind: 'contenteditable',
+    clearMethod: 'replace_children',
+    clearRevision: '',
+    initialSerializerOk: true,
+    initialSerializedLength: 0,
+    promptInsertCount: 0,
+    candidateCount: 1
+  };
+  if (js.includes('reviewComposerEmptyMarker')) return {
+    ok: true,
+    replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+    composerKind: 'contenteditable',
+    serializerOk: true,
+    serializerMethod: 'contenteditable_structural',
+    serializedLength: 0,
+    candidateCount: 1
+  };
+  if (js.includes('reviewComposerCaretMarker')) return {
+    ok: true,
+    replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+    composerKind: 'contenteditable',
+    caretMethod: 'contenteditable_collapsed_range',
+    serializedLength: 0,
+    candidateCount: 1
+  };
+  return null;
+}
 
 test('chatgpt-controller: Gemini nested selectors canonicalize to one node per turn and role', () => {
   const turn = (id) => ({ getAttribute: (name) => name === 'data-turn-id' ? id : null });
@@ -330,6 +439,264 @@ test('chatgpt-controller: composer mismatch diagnostics identify the first code-
   assert.equal(result.firstMismatchObservedCodePoint, 'U+0078');
   assert.notEqual(result.canonicalPromptSha256, result.observedCanonicalSha256);
   assert.equal(JSON.stringify(result).includes('synthetic'), false);
+});
+
+test('chatgpt-controller: strict persisted draft is cleared, verified empty twice, then inserted exactly once', async () => {
+  const skeleton = '# Synthetic revision\n\n- item\n\n1. first\n  branch\n```text\nx=1\n```\n';
+  const prompt = `${skeleton}${'x'.repeat(7024 - skeleton.length)}`;
+  assert.equal(prompt.length, 7024);
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt });
+  let inserted = 0;
+  let clicked = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/draft-replace'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewSendOnceMarker')) {
+        clicked += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: clicked ? [
+            { order: 0, role: 'user', id: 'draft-user', text: prompt, textIdentityReadable: true },
+            { order: 1, role: 'assistant', id: 'draft-assistant', text: 'DONE' }
+          ] : [],
+          modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [], selectorStop: false, sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { inserted += 1; composer.insert(text); },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  let composerReceipt = null;
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/c/draft-replace',
+    expectedConversationId: 'draft-replace',
+    expectedModel: 'GPT-5.6 Pro',
+    timeoutMs: 8_000,
+    onComposerVerified: async (receipt) => { composerReceipt = receipt; }
+  });
+  assert.equal(inserted, 1);
+  assert.equal(clicked, 1);
+  assert.equal(composer.current, prompt);
+  assert.equal(composerReceipt.initialSerializedLength, prompt.length);
+  assert.equal(composerReceipt.emptyVerified, true);
+  assert.equal(composerReceipt.emptySnapshotCount, 2);
+  assert.equal(composerReceipt.promptInsertCount, 1);
+  assert.equal(result.text, 'DONE');
+});
+
+test('chatgpt-controller: asynchronously rehydrated draft fails before prompt insertion or Send', async () => {
+  const prompt = 'frozen prompt';
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt, failEmpty: true });
+  let inserted = 0;
+  let clicked = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/draft-rehydrate'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { inserted += 1; },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt,
+      expectedUrl: 'https://chatgpt.com/c/draft-rehydrate',
+      expectedConversationId: 'draft-rehydrate',
+      expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000
+    }),
+    (error) => {
+      assert.equal(error.message, 'review_composer_clear_failed');
+      assert.equal(error.data.noClickProven, true);
+      assert.equal(error.data.promptInsertCount, 0);
+      assert.equal(error.data.serializedLength, prompt.length);
+      return true;
+    }
+  );
+  assert.equal(inserted, 0);
+  assert.equal(clicked, 0);
+});
+
+test('chatgpt-controller: failed contenteditable caret binding fails before prompt insertion or Send', async () => {
+  const prompt = 'frozen prompt';
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt, failCaret: true });
+  let inserted = 0;
+  let clicked = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/caret-fail'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { inserted += 1; },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt,
+      expectedUrl: 'https://chatgpt.com/c/caret-fail',
+      expectedConversationId: 'caret-fail',
+      expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000
+    }),
+    (error) => {
+      assert.equal(error.message, 'review_composer_caret_unavailable');
+      assert.equal(error.data.noClickProven, true);
+      assert.equal(error.data.promptInsertCount, 0);
+      return true;
+    }
+  );
+  assert.equal(inserted, 0);
+  assert.equal(clicked, 0);
+});
+
+test('chatgpt-controller: click-time composer mutation is rejected atomically with zero click', async () => {
+  const prompt = 'frozen prompt';
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: '' });
+  let clicked = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/click-time-mutation'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewSendOnceMarker')) {
+        assert.equal(js.includes('compareReviewPlainText'), true);
+        if (composer.current !== prompt) return {
+          ok: false,
+          error: 'review_composer_identity_mismatch_at_send',
+          noClickProven: true,
+          serializedLength: composer.current.length,
+          expectedLength: prompt.length,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: 'mismatch',
+          mismatchClass: 'code_point_length_mismatch'
+        };
+        clicked += 1;
+        return { ok: true, clickCount: 1 };
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { composer.insert(text); },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt,
+      expectedUrl: 'https://chatgpt.com/c/click-time-mutation',
+      expectedConversationId: 'click-time-mutation', expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000,
+      onComposerVerified: async () => { composer.replace(`${prompt}${prompt}`); }
+    }),
+    (error) => {
+      assert.equal(error.message, 'review_composer_identity_mismatch_at_send');
+      assert.equal(error.data.noClickProven, true);
+      return true;
+    }
+  );
+  assert.equal(clicked, 0);
+});
+
+test('chatgpt-controller: click-time reversible NBSP receipt performs exactly one click', async () => {
+  const prompt = '  frozen prompt';
+  const browserPrompt = '\u00a0 frozen prompt';
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: '' });
+  let clicked = 0;
+  const identity = reviewPlainTextIdentity(prompt);
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/click-time-nbsp'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewSendOnceMarker')) {
+        assert.equal(js.includes('browserSpaceRebalanceSite'), true);
+        assert.equal(safeReviewPlainTextComparison(prompt, browserPrompt).ok, true);
+        clicked += 1;
+        return {
+          ok: true,
+          clickCount: 1,
+          label: 'Send prompt',
+          clickTimeIdentity: {
+            ok: true,
+            recoveredExact: true,
+            textModel: REVIEW_PLAIN_TEXT_MODEL,
+            identityMode: 'browser_space_rebalanced',
+            sourceSha256: identity.sourceSha256,
+            canonicalPromptSha256: identity.canonicalSha256,
+            observedCanonicalSha256: identity.canonicalSha256,
+            serializedLength: browserPrompt.length,
+            expectedLength: prompt.length,
+            browserSpaceRebalanceCount: 1,
+            mismatchCount: 1
+          }
+        };
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: clicked ? [
+          { order: 0, role: 'user', id: 'nbsp-user', text: browserPrompt, textIdentityReadable: true },
+          { order: 1, role: 'assistant', id: 'nbsp-assistant', text: 'DONE' }
+        ] : [],
+        modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { composer.insert(text); },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/c/click-time-nbsp',
+    expectedConversationId: 'click-time-nbsp', expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000,
+    onComposerVerified: async () => { composer.replace(browserPrompt); }
+  });
+  assert.equal(clicked, 1);
+  assert.equal(result.text, 'DONE');
 });
 
 test('chatgpt-controller: submission diagnosis injects the structure summarizer dependency', async () => {
@@ -822,6 +1189,8 @@ test('chatgpt-controller: strict review submits with one send control and return
     },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) {
         return { ok: insertedPrompt === prompt, observedLengths: [insertedPrompt.length], expectedLength: prompt.length };
       }
@@ -913,6 +1282,8 @@ test('chatgpt-controller: first binding pastes once and follows the created Chat
     async getUrl() { return currentUrl; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) return { ok: true, observedLengths: [prompt.length], expectedLength: prompt.length };
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
@@ -999,6 +1370,8 @@ test('chatgpt-controller: Gemini strict review inserts once and completes on the
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) return { ok: true, observedLengths: [prompt.length], expectedLength: prompt.length };
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
@@ -1054,6 +1427,8 @@ test('chatgpt-controller: Gemini strict preflight selects model and Extended thi
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('agentifyGeminiModelStateMarker')) {
         return {
           matched: selectedModel && selectedThinking,
@@ -1121,6 +1496,8 @@ test('chatgpt-controller: strict review accepts structural exactness when browse
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) {
         return {
           ok: true,
@@ -1181,6 +1558,8 @@ test('chatgpt-controller: strict review rejects a non-exact composer before its 
     },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) return { ok: false, observedLengths: [7], expectedLength: 8 };
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
@@ -1240,6 +1619,8 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('reviewComposerDiagnosticMarker')) {
         return { ok: true, serializerOk: true, serializedLength: prompt.length, expectedLength: prompt.length };
       }
@@ -1297,6 +1678,8 @@ test('chatgpt-controller: ambiguous send control fails before a click', async ()
     },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) return { ok: true, observedLengths: [4], expectedLength: 4 };
       if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
       if (js.includes('reviewSendOnceMarker')) {
@@ -1346,6 +1729,8 @@ test('chatgpt-controller: post-send unreadable rendered user content is ambiguou
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      const legacyComposer = legacyStrictComposerEval(js);
+      if (legacyComposer) return legacyComposer;
       if (js.includes('reviewComposerDiagnosticMarker')) {
         return {
           ok: true,

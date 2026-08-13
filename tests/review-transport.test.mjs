@@ -14,6 +14,7 @@ import {
 } from '../review-transport.mjs';
 import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
 import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
+import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
 
 const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 
@@ -103,6 +104,16 @@ async function fixture() {
       await args.onComposerVerified?.({
         ok: true,
         textModel: REVIEW_PLAIN_TEXT_MODEL,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerKind: 'contenteditable',
+        clearMethod: 'replace_children',
+        initialSerializerOk: true,
+        initialSerializedLength: 0,
+        emptyVerified: true,
+        emptySnapshotCount: 2,
+        caretVerified: true,
+        caretMethod: 'contenteditable_collapsed_range',
+        promptInsertCount: 1,
         sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
@@ -113,7 +124,18 @@ async function fixture() {
       await args.onSendAction({
         clickCount: 1,
         sendActionCount: 1,
-        sendActionAt: 90
+        sendActionAt: 90,
+        clickTimeIdentity: {
+          ok: true,
+          recoveredExact: true,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: 'canonical_exact',
+          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+          serializedLength: args.prompt.length,
+          expectedLength: args.prompt.length
+        }
       });
       if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
       await args.onSubmitted({
@@ -540,6 +562,8 @@ test('review transport: one send persists a complete receipt and duplicate retur
   assert.equal(first.composerIdentity.verified, true);
   assert.equal(first.composerIdentity.sourceSha256, f.request.promptSha256);
   assert.equal(first.renderedIdentity.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
+  assert.equal(first.clickTimeIdentity.recoveredExact, true);
+  assert.equal(first.clickTimeIdentity.sourceSha256, f.request.promptSha256);
   assert.equal('submissionIdentityMode' in first, false);
   assert.equal('composerPromptSha256' in first, false);
   assert.equal(f.calls.review, 1);
@@ -620,6 +644,37 @@ test('review transport: Gemini uses the same strict receipt lifecycle with provi
   assert.equal(receipt.conversationId, 'gemini-conversation');
   assert.equal(f.calls.ensure[0].vendorName, 'Gemini');
   assert.equal(f.calls.review, 1);
+});
+
+test('review transport: composer replacement receipt is mandatory before strict submission', async () => {
+  const f = await fixture();
+  const originalReviewQuery = f.tabs.getControllerById().reviewQuery;
+  f.tabs.getControllerById().reviewQuery = async (args) => {
+    await args.onPrepared({
+      baselineMessageIds: [], preparedAt: 50,
+      conversationUrl: args.expectedUrl,
+      conversationId: args.expectedConversationId,
+      modelEvidence: 'GPT-5.6 Pro'
+    });
+    await args.onComposerVerified({
+      ok: true,
+      textModel: REVIEW_PLAIN_TEXT_MODEL,
+      sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+      canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+      observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+      identityMode: 'canonical_exact'
+    });
+    return await originalReviewQuery(args);
+  };
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_composer_identity_receipt_invalid/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.failureStage, 'before_send_click');
 });
 
 test('review transport: admission distinguishes a fresh send from exact existing observation', async () => {

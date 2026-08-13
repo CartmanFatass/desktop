@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { readReviewTransportState, writeReviewTransportState } from './state.mjs';
 import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from './review-text-identity.mjs';
+import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from './review-composer-replacement.mjs';
 
 const MAX_REVIEW_TIMEOUT_MS = 45 * 60_000;
 const MIN_REVIEW_TIMEOUT_MS = 1_000;
@@ -68,13 +69,17 @@ export function sanitizeReviewErrorData(value) {
   const data = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
   if (!data) return null;
   const output = {};
-  for (const field of ['ok', 'serializerOk', 'noClickProven']) {
+  for (const field of [
+    'ok', 'serializerOk', 'noClickProven', 'initialSerializerOk',
+    'emptyVerified', 'caretVerified', 'recoveredExact'
+  ]) {
     if (typeof data[field] === 'boolean') output[field] = data[field];
   }
   for (const field of [
     'serializerMethod', 'serializerError', 'serializerTag', 'rootTag',
     'predicate', 'failureStage', 'textModel', 'identityMode', 'mismatchClass',
-    'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint'
+    'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint',
+    'replacementModel', 'composerKind', 'clearMethod', 'caretMethod'
   ]) {
     if (data[field] === null) {
       output[field] = null;
@@ -88,7 +93,8 @@ export function sanitizeReviewErrorData(value) {
     'readableCandidateCount', 'renderedContentCandidateCount',
     'newUserMessageCount', 'sendActionCount', 'expectedRawLength',
     'expectedCanonicalLength', 'observedRawLength', 'observedCanonicalLength',
-    'browserSpaceRebalanceCount', 'mismatchCount', 'firstMismatchCodePointIndex'
+    'browserSpaceRebalanceCount', 'mismatchCount', 'firstMismatchCodePointIndex',
+    'initialSerializedLength', 'emptySnapshotCount', 'promptInsertCount'
   ]) {
     if (Number.isInteger(data[field]) && data[field] >= 0 && data[field] <= 10_000_000) {
       output[field] = data[field];
@@ -479,9 +485,21 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
   };
 
   const onSendAction = async (action) => {
-    if (Number(action?.clickCount) !== 1 || Number(action?.sendActionCount) !== 1) {
+    const clickTimeIdentity = action?.clickTimeIdentity;
+    if (
+      Number(action?.clickCount) !== 1 ||
+      Number(action?.sendActionCount) !== 1 ||
+      clickTimeIdentity?.ok !== true ||
+      clickTimeIdentity.recoveredExact !== true ||
+      clickTimeIdentity.textModel !== REVIEW_PLAIN_TEXT_MODEL ||
+      !['canonical_exact', 'browser_space_rebalanced'].includes(clickTimeIdentity.identityMode) ||
+      clickTimeIdentity.sourceSha256 !== request.promptSha256 ||
+      clickTimeIdentity.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
+      clickTimeIdentity.observedCanonicalSha256 !== promptIdentity.canonicalSha256
+    ) {
       fail('review_send_action_receipt_invalid');
     }
+    const safeClickTimeIdentity = sanitizeReviewErrorData(clickTimeIdentity);
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
@@ -491,6 +509,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       op.status = 'SEND_INTENT';
       op.sendActionCount = 1;
       op.clickCount = 1;
+      op.clickTimeIdentity = safeClickTimeIdentity;
       op.sendActionAt = action?.sendActionAt || Date.now();
       op.updatedAt = Date.now();
     });
@@ -500,6 +519,14 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (
       identity?.ok !== true ||
       identity.textModel !== REVIEW_PLAIN_TEXT_MODEL ||
+      identity.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
+      !['contenteditable', 'textarea', 'input'].includes(identity.composerKind) ||
+      typeof identity.clearMethod !== 'string' || !identity.clearMethod ||
+      identity.emptyVerified !== true ||
+      identity.emptySnapshotCount !== 2 ||
+      identity.caretVerified !== true ||
+      typeof identity.caretMethod !== 'string' || !identity.caretMethod ||
+      identity.promptInsertCount !== 1 ||
       identity.sourceSha256 !== request.promptSha256 ||
       identity.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
       identity.observedCanonicalSha256 !== promptIdentity.canonicalSha256

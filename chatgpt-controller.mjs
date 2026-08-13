@@ -9,6 +9,14 @@ import {
   reviewPlainTextIdentity,
   safeReviewPlainTextComparison
 } from './review-text-identity.mjs';
+import {
+  REVIEW_COMPOSER_REPLACEMENT_MODEL,
+  clearReviewComposerElement,
+  dispatchReviewComposerReplacementInput,
+  locateReviewComposer,
+  positionReviewComposerCaret,
+  reviewComposerKind
+} from './review-composer-replacement.mjs';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -673,6 +681,240 @@ export class ChatGPTController {
     await this.page.mouseDown(x, y, { button: 'left', clickCount: 1 });
     await sleep(jitter(20, 60));
     await this.page.mouseUp(x, y, { button: 'left', clickCount: 1 });
+  }
+
+  async #clearReviewComposerOnce() {
+    const selector = JSON.stringify(this.selectors.promptTextarea);
+    const replacementModel = JSON.stringify(REVIEW_COMPOSER_REPLACEMENT_MODEL);
+    return await this.#eval(`(() => {
+      const reviewComposerClearMarker = true;
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const reviewComposerKind = ${reviewComposerKind.toString()};
+      const dispatchReviewComposerReplacementInput = ${dispatchReviewComposerReplacementInput.toString()};
+      const clearReviewComposerElement = ${clearReviewComposerElement.toString()};
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
+      const selected = locateReviewComposer(${selector});
+      const element = selected.element;
+      if (!element) return {
+        ok: false,
+        error: 'missing_prompt_textarea',
+        replacementModel: ${replacementModel},
+        candidateCount: selected.candidateCount,
+        selectedByPrimary: selected.selectedByPrimary,
+        promptInsertCount: 0
+      };
+      const composerKind = reviewComposerKind(element);
+      const initial = composerKind === 'textarea' || composerKind === 'input'
+        ? { ok: true, text: String(element.value ?? ''), method: 'value' }
+        : { ...serializeReviewComposer(element), method: 'contenteditable_structural' };
+      const structure = composerKind === 'textarea' || composerKind === 'input'
+        ? {
+            rootTag: String(element.tagName || '').toUpperCase() || null,
+            elementCount: 1,
+            textNodeCount: 0,
+            otherNodeCount: 0,
+            maxDepth: 0,
+            tagHistogram: { [String(element.tagName || '').toUpperCase() || 'UNKNOWN']: 1 }
+          }
+        : summarizeReviewComposerStructure(element);
+      const cleared = clearReviewComposerElement(element);
+      return {
+        ...cleared,
+        replacementModel: ${replacementModel},
+        candidateCount: selected.candidateCount,
+        selectedByPrimary: selected.selectedByPrimary,
+        initialSerializerOk: initial.ok === true,
+        initialSerializedLength: initial.ok === true ? String(initial.text ?? '').length : null,
+        serializerMethod: initial.method,
+        serializerError: initial.error || null,
+        serializerTag: initial.tag || null,
+        promptInsertCount: 0,
+        ...structure
+      };
+    })()`);
+  }
+
+  async #inspectReviewComposerEmpty() {
+    const selector = JSON.stringify(this.selectors.promptTextarea);
+    const replacementModel = JSON.stringify(REVIEW_COMPOSER_REPLACEMENT_MODEL);
+    return await this.#eval(`(() => {
+      const reviewComposerEmptyMarker = true;
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const reviewComposerKind = ${reviewComposerKind.toString()};
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
+      const selected = locateReviewComposer(${selector});
+      const element = selected.element;
+      if (!element) return {
+        ok: false,
+        error: 'missing_prompt_textarea',
+        replacementModel: ${replacementModel},
+        candidateCount: selected.candidateCount,
+        selectedByPrimary: selected.selectedByPrimary,
+        serializedLength: 0
+      };
+      const composerKind = reviewComposerKind(element);
+      const serialized = composerKind === 'textarea' || composerKind === 'input'
+        ? { ok: true, text: String(element.value ?? ''), method: 'value' }
+        : { ...serializeReviewComposer(element), method: 'contenteditable_structural' };
+      const structure = composerKind === 'textarea' || composerKind === 'input'
+        ? {
+            rootTag: String(element.tagName || '').toUpperCase() || null,
+            elementCount: 1,
+            textNodeCount: 0,
+            otherNodeCount: 0,
+            maxDepth: 0,
+            tagHistogram: { [String(element.tagName || '').toUpperCase() || 'UNKNOWN']: 1 }
+          }
+        : summarizeReviewComposerStructure(element);
+      return {
+        ok: serialized.ok === true && serialized.text === '',
+        replacementModel: ${replacementModel},
+        composerKind,
+        candidateCount: selected.candidateCount,
+        serializerOk: serialized.ok === true,
+        serializerMethod: serialized.method,
+        serializerError: serialized.error || (serialized.text === '' ? null : 'review_composer_not_empty'),
+        serializerTag: serialized.tag || null,
+        serializedLength: serialized.ok === true ? String(serialized.text ?? '').length : 0,
+        ...structure
+      };
+    })()`);
+  }
+
+  #composerReplacementError(code, receipt, extra = {}) {
+    const error = new Error(code);
+    error.data = {
+      ...(receipt || {}),
+      ...extra,
+      ok: false,
+      noClickProven: true,
+      failureStage: 'before_prompt_insert',
+      promptInsertCount: 0
+    };
+    return error;
+  }
+
+  async #verifyReviewComposerEmpty() {
+    let last = null;
+    for (let index = 0; index < 2; index += 1) {
+      if (index > 0) await sleep(75);
+      last = await this.#inspectReviewComposerEmpty();
+      if (
+        last?.ok !== true ||
+        last.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
+        last.serializedLength !== 0
+      ) {
+        throw this.#composerReplacementError('review_composer_clear_failed', last, {
+          predicate: last?.error || last?.serializerError || 'review_composer_not_empty',
+          emptyVerified: false,
+          emptySnapshotCount: index
+        });
+      }
+    }
+    return {
+      emptyVerified: true,
+      emptySnapshotCount: 2,
+      composerKind: last.composerKind,
+      emptySerializerMethod: last.serializerMethod
+    };
+  }
+
+  async #prepareReviewComposerInsertion() {
+    const selector = JSON.stringify(this.selectors.promptTextarea);
+    const replacementModel = JSON.stringify(REVIEW_COMPOSER_REPLACEMENT_MODEL);
+    return await this.#eval(`(() => {
+      const reviewComposerCaretMarker = true;
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const reviewComposerKind = ${reviewComposerKind.toString()};
+      const positionReviewComposerCaret = ${positionReviewComposerCaret.toString()};
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const selected = locateReviewComposer(${selector});
+      const element = selected.element;
+      if (!element) return {
+        ok: false,
+        error: 'missing_prompt_textarea',
+        replacementModel: ${replacementModel},
+        candidateCount: selected.candidateCount,
+        serializedLength: 0
+      };
+      const composerKind = reviewComposerKind(element);
+      const serialized = composerKind === 'textarea' || composerKind === 'input'
+        ? { ok: true, text: String(element.value ?? '') }
+        : serializeReviewComposer(element);
+      if (serialized.ok !== true || serialized.text !== '') return {
+        ok: false,
+        error: serialized.error || 'review_composer_not_empty_before_insert',
+        replacementModel: ${replacementModel},
+        composerKind,
+        candidateCount: selected.candidateCount,
+        serializerOk: serialized.ok === true,
+        serializedLength: serialized.ok === true ? String(serialized.text ?? '').length : 0
+      };
+      return {
+        ...positionReviewComposerCaret(element),
+        replacementModel: ${replacementModel},
+        candidateCount: selected.candidateCount,
+        serializedLength: 0
+      };
+    })()`);
+  }
+
+  async #replacePrompt(prompt, { human = true, verifyExact = false } = {}) {
+    await this.#emitProgress({ phase: 'typing_prompt' });
+    const clearAction = await this.#clearReviewComposerOnce();
+    if (clearAction?.ok !== true || clearAction.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL) {
+      throw this.#composerReplacementError('review_composer_clear_failed', clearAction, {
+        predicate: clearAction?.error || 'review_composer_clear_action_failed',
+        emptyVerified: false,
+        emptySnapshotCount: 0
+      });
+    }
+    const emptyReceipt = await this.#verifyReviewComposerEmpty();
+    const caretReceipt = await this.#prepareReviewComposerInsertion();
+    if (
+      caretReceipt?.ok !== true ||
+      caretReceipt.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
+      caretReceipt.serializedLength !== 0
+    ) {
+      throw this.#composerReplacementError('review_composer_caret_unavailable', caretReceipt, {
+        predicate: caretReceipt?.error || 'review_composer_caret_unavailable',
+        ...emptyReceipt
+      });
+    }
+
+    if (human) {
+      await this.#typeHuman(prompt);
+    } else {
+      await this.page.insertText(prompt);
+    }
+    const promptInsertCount = human ? Array.from(String(prompt)).length : 1;
+    const replacementReceipt = {
+      replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+      composerKind: caretReceipt.composerKind,
+      clearMethod: clearAction.clearMethod,
+      clearRevision: clearAction.clearRevision,
+      initialSerializerOk: clearAction.initialSerializerOk,
+      initialSerializedLength: clearAction.initialSerializedLength,
+      emptyVerified: emptyReceipt.emptyVerified,
+      emptySnapshotCount: emptyReceipt.emptySnapshotCount,
+      caretVerified: true,
+      caretMethod: caretReceipt.caretMethod,
+      promptInsertCount
+    };
+
+    let identityReceipt = replacementReceipt;
+    if (verifyExact) {
+      const verification = await this.inspectReviewComposerIdentity({ expectedPrompt: prompt });
+      if (!verification?.ok) {
+        const error = new Error('review_composer_identity_mismatch');
+        error.data = { ...(verification || {}), ...replacementReceipt };
+        throw error;
+      }
+      identityReceipt = { ...verification, ...replacementReceipt };
+    }
+    return identityReceipt;
   }
 
   async #typePrompt(prompt, { human = true, verifyExact = false } = {}) {
@@ -1713,10 +1955,60 @@ export class ChatGPTController {
     }
   }
 
-  async #clickReviewSendOnce() {
+  async #clickReviewSendOnce({ expectedPrompt, sourcePromptSha256, canonicalPromptSha256 }) {
     const sendSel = JSON.stringify(this.selectors.sendButton);
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const expected = JSON.stringify(expectedPrompt);
+    const sourceSha = JSON.stringify(sourcePromptSha256);
+    const canonicalSha = JSON.stringify(canonicalPromptSha256);
+    const textModel = JSON.stringify(REVIEW_PLAIN_TEXT_MODEL);
     const result = await this.#eval(`(() => {
       const reviewSendOnceMarker = true;
+      const expected = ${expected};
+      const REVIEW_PLAIN_TEXT_MODEL = ${textModel};
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const canonicalizeReviewPlainText = ${canonicalizeReviewPlainText.toString()};
+      const browserSpaceRebalanceSite = ${browserSpaceRebalanceSite.toString()};
+      const compareReviewPlainText = ${compareReviewPlainText.toString()};
+      const serializeReviewComposer = ${serializeReviewComposer.toString()};
+      const selected = locateReviewComposer(${promptSel});
+      const composer = selected.element;
+      if (!composer) return {
+        ok: false,
+        error: 'review_composer_identity_unreadable_at_send',
+        noClickProven: true,
+        candidateCount: selected.candidateCount
+      };
+      const serialized = composer.matches('textarea, input')
+        ? { ok: true, text: String(composer.value ?? ''), method: 'value' }
+        : { ...serializeReviewComposer(composer), method: 'contenteditable_structural' };
+      const comparison = serialized.ok === true
+        ? compareReviewPlainText(expected, serialized.text)
+        : null;
+      const recoveredExact =
+        serialized.ok === true &&
+        comparison?.ok === true &&
+        comparison.canonicalExpectedText === comparison.canonicalObservedText &&
+        comparison.canonicalExpectedText === canonicalizeReviewPlainText(expected);
+      if (!recoveredExact) return {
+        ok: false,
+        error: 'review_composer_identity_mismatch_at_send',
+        noClickProven: true,
+        serializerOk: serialized.ok === true,
+        serializerMethod: serialized.method,
+        serializerError: serialized.error || null,
+        serializerTag: serialized.tag || null,
+        serializedLength: serialized.ok === true ? String(serialized.text ?? '').length : 0,
+        expectedLength: expected.length,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        identityMode: comparison?.identityMode || 'unreadable',
+        mismatchClass: comparison?.mismatchClass || null,
+        firstMismatchCodePointIndex: comparison?.firstMismatchCodePointIndex ?? null,
+        firstMismatchExpectedCodePoint: comparison?.firstMismatchExpectedCodePoint || null,
+        firstMismatchObservedCodePoint: comparison?.firstMismatchObservedCodePoint || null,
+        browserSpaceRebalanceCount: comparison?.browserSpaceRebalanceCount || 0,
+        mismatchCount: comparison?.mismatchCount || 0
+      };
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -1738,9 +2030,26 @@ export class ChatGPTController {
         return /^(send|发送)$/i.test(aria) || /^send-button$/i.test(dataTestId);
       };
       const candidates = isGemini ? allCandidates.filter(geminiSend) : allCandidates;
-      if (candidates.length !== 1) return { ok: false, error: 'review_send_control_ambiguous', count: candidates.length };
+      if (candidates.length !== 1) return { ok: false, error: 'review_send_control_ambiguous', count: candidates.length, noClickProven: true };
       candidates[0].click();
-      return { ok: true, clickCount: 1, label: label(candidates[0]) };
+      return {
+        ok: true,
+        clickCount: 1,
+        label: label(candidates[0]),
+        clickTimeIdentity: {
+          ok: true,
+          recoveredExact: true,
+          textModel: REVIEW_PLAIN_TEXT_MODEL,
+          identityMode: comparison.identityMode,
+          sourceSha256: ${sourceSha},
+          canonicalPromptSha256: ${canonicalSha},
+          observedCanonicalSha256: ${canonicalSha},
+          serializedLength: String(serialized.text ?? '').length,
+          expectedLength: expected.length,
+          browserSpaceRebalanceCount: comparison.browserSpaceRebalanceCount || 0,
+          mismatchCount: comparison.mismatchCount || 0
+        }
+      };
     })()`);
     if (!result?.ok || result?.clickCount !== 1) {
       const error = new Error(result?.error || 'review_send_control_ambiguous');
@@ -2105,13 +2414,30 @@ export class ChatGPTController {
         conversationId: before.conversationId,
         modelEvidence: before.modelEvidence
       });
-      const composerIdentity = await this.#typePrompt(prompt, { human: false, verifyExact: true });
+      const composerIdentity = await this.#replacePrompt(prompt, { human: false, verifyExact: true });
+      if (
+        composerIdentity?.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
+        composerIdentity.emptyVerified !== true ||
+        composerIdentity.emptySnapshotCount !== 2 ||
+        composerIdentity.caretVerified !== true ||
+        composerIdentity.promptInsertCount !== 1
+      ) {
+        throw this.#composerReplacementError('review_composer_replacement_receipt_invalid', composerIdentity, {
+          predicate: 'review_composer_replacement_receipt_invalid'
+        });
+      }
       await onComposerVerified?.(composerIdentity);
-      const clickReceipt = await this.#clickReviewSendOnce();
+      const promptIdentity = reviewPlainTextIdentity(prompt);
+      const clickReceipt = await this.#clickReviewSendOnce({
+        expectedPrompt: prompt,
+        sourcePromptSha256: promptIdentity.sourceSha256,
+        canonicalPromptSha256: promptIdentity.canonicalSha256
+      });
       await onSendAction?.({
         clickCount: clickReceipt?.clickCount || 0,
         sendActionCount: 1,
-        sendActionAt: Date.now()
+        sendActionAt: Date.now(),
+        clickTimeIdentity: clickReceipt?.clickTimeIdentity || null
       });
       const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity, expectedPrompt: prompt, firstBinding });
       const submittedIdentity = {
