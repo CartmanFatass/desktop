@@ -35,13 +35,62 @@ export function reviewTransportPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, 'review-transport.json');
 }
 
+const REVIEW_TRANSPORT_SCHEMA_VERSION = 2;
+const LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION = 1;
+const LEGACY_SEND_ACTION_MIGRATION_ID = 'review_transport_v1_to_v2_complete_send_action_count';
+const LEGACY_SEND_ACTION_MIGRATION_BASIS = 'validated_complete_send_and_completion_evidence';
+
 export function defaultReviewTransportState() {
-  return { schemaVersion: 1, bindings: {}, operations: {} };
+  return { schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION, bindings: {}, operations: {} };
 }
 
-function normalizeReviewTransportState(value) {
+function validateMigrationHistory(value, nonEmptyString) {
+  if (value.migrationHistory === undefined) return;
+  if (!Array.isArray(value.migrationHistory) || value.migrationHistory.length !== 1) {
+    throw new Error('review_transport_state_invalid');
+  }
+  const migration = value.migrationHistory[0];
+  if (
+    !migration ||
+    typeof migration !== 'object' ||
+    Array.isArray(migration) ||
+    migration.migrationId !== LEGACY_SEND_ACTION_MIGRATION_ID ||
+    migration.fromSchemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION ||
+    migration.toSchemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
+    !Array.isArray(migration.inferredFields)
+  ) {
+    throw new Error('review_transport_state_invalid');
+  }
+  const seen = new Set();
+  for (const inference of migration.inferredFields) {
+    const operation = value.operations?.[inference?.idempotencyKey];
+    if (
+      !inference ||
+      typeof inference !== 'object' ||
+      Array.isArray(inference) ||
+      !nonEmptyString(inference.idempotencyKey) ||
+      !nonEmptyString(inference.operationId) ||
+      inference.field !== 'sendActionCount' ||
+      inference.value !== 1 ||
+      inference.basis !== LEGACY_SEND_ACTION_MIGRATION_BASIS ||
+      seen.has(inference.idempotencyKey) ||
+      !operation ||
+      operation.operationId !== inference.operationId ||
+      operation.status !== 'COMPLETE' ||
+      operation.sendActionCount !== 1
+    ) {
+      throw new Error('review_transport_state_invalid');
+    }
+    seen.add(inference.idempotencyKey);
+  }
+}
+
+function validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount = false } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review_transport_state_invalid');
-  if (value.schemaVersion !== 1) throw new Error('review_transport_state_invalid');
+  const expectedSchemaVersion = allowLegacyCompleteMissingSendActionCount
+    ? LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION
+    : REVIEW_TRANSPORT_SCHEMA_VERSION;
+  if (value.schemaVersion !== expectedSchemaVersion) throw new Error('review_transport_state_invalid');
   if (!value.bindings || typeof value.bindings !== 'object' || Array.isArray(value.bindings)) {
     throw new Error('review_transport_state_invalid');
   }
@@ -121,9 +170,12 @@ function normalizeReviewTransportState(value) {
         : null;
       const snapshots = operation.snapshots;
       const controls = operation.controls;
+      const validSendActionCount = operation.sendActionCount === 1 || (
+        allowLegacyCompleteMissingSendActionCount && operation.sendActionCount === undefined
+      );
       if (
         operation.sendCount !== 1 ||
-        operation.sendActionCount !== 1 ||
+        !validSendActionCount ||
         !operation.userMessageId ||
         !operation.assistantMessageId ||
         operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
@@ -153,7 +205,47 @@ function normalizeReviewTransportState(value) {
       }
     }
   }
+  if (!allowLegacyCompleteMissingSendActionCount) validateMigrationHistory(value, nonEmptyString);
   return value;
+}
+
+function migrateLegacyReviewTransportState(value) {
+  validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount: true });
+  const inferredFields = [];
+  const operations = {};
+  for (const [idempotencyKey, operation] of Object.entries(value.operations)) {
+    const migratedOperation = { ...operation };
+    if (operation.status === 'COMPLETE' && operation.sendActionCount === undefined) {
+      migratedOperation.sendActionCount = 1;
+      inferredFields.push({
+        idempotencyKey,
+        operationId: operation.operationId,
+        field: 'sendActionCount',
+        value: 1,
+        basis: LEGACY_SEND_ACTION_MIGRATION_BASIS
+      });
+    }
+    operations[idempotencyKey] = migratedOperation;
+  }
+  inferredFields.sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey));
+  return validateReviewTransportState({
+    ...value,
+    schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
+    operations,
+    migrationHistory: [{
+      migrationId: LEGACY_SEND_ACTION_MIGRATION_ID,
+      fromSchemaVersion: LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION,
+      toSchemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
+      inferredFields
+    }]
+  });
+}
+
+function normalizeReviewTransportState(value, { migrateLegacy = false } = {}) {
+  if (migrateLegacy && value?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    return migrateLegacyReviewTransportState(value);
+  }
+  return validateReviewTransportState(value);
 }
 
 export function defaultSettings() {
@@ -258,7 +350,16 @@ export async function writeState(state, stateDir = defaultStateDir()) {
 export async function readReviewTransportState(stateDir = defaultStateDir()) {
   try {
     const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
-    return normalizeReviewTransportState(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeReviewTransportState(parsed, { migrateLegacy: true });
+    if (parsed.schemaVersion !== normalized.schemaVersion) {
+      await atomicWriteFile(
+        reviewTransportPath(stateDir),
+        `${JSON.stringify(normalized, null, 2)}\n`,
+        { mode: 0o600 }
+      );
+    }
+    return normalized;
   } catch (error) {
     if (error?.code === 'ENOENT') return defaultReviewTransportState();
     if (String(error?.message || '') === 'review_transport_state_invalid') throw error;
