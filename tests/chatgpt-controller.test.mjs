@@ -808,17 +808,88 @@ test('chatgpt-controller: user-message identity reads the unique content leaf an
   });
 });
 
-test('chatgpt-controller: unreadable rendered user message returns structure without content', () => {
-  const content = elementNode('PRE', elementNode('CODE', textNode('secret-code')));
+test('chatgpt-controller: exact PRE/CODE rendered wrapper preserves the complete structural prompt byte-for-text identity', () => {
+  const prompt = [
+    '# Synthetic transport canary',
+    '',
+    '- outer',
+    '  - inner',
+    '',
+    '```text',
+    'line \u2014 canary',
+    '```',
+    '',
+    'Return exactly `D94_CG_OK` and nothing else.',
+    ''
+  ].join('\n');
+  assert.equal(prompt.length, 121);
+  assert.equal(
+    crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+    '7c357f0bf15e01e8962b5df121d3ee993dd7f97ba0fb75861a46708ceca9fad8'
+  );
+  const content = elementNode('PRE', elementNode('CODE', textNode(prompt)));
+  content.querySelectorAll = () => [];
+  const outer = elementNode('DIV', content);
+  outer.querySelectorAll = () => [content];
+  const result = serializeReviewUserMessage(outer);
+  assert.deepEqual(result, {
+    ok: true,
+    text: prompt,
+    candidateCount: 1,
+    rootTag: 'PRE',
+    elementCount: 2,
+    textNodeCount: 1,
+    otherNodeCount: 0,
+    maxDepth: 2,
+    tagHistogram: { CODE: 1, PRE: 1 }
+  });
+  const accepted = safeReviewPlainTextComparison(prompt, result.text);
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.canonicalPromptSha256, accepted.observedCanonicalSha256);
+  const corrupted = safeReviewPlainTextComparison(prompt, result.text.replace('\u2014', '-'));
+  assert.equal(corrupted.ok, false);
+  assert.equal(corrupted.mismatchClass, 'non_reversible_code_point_mismatch');
+  assert.notEqual(corrupted.canonicalPromptSha256, corrupted.observedCanonicalSha256);
+});
+
+test('chatgpt-controller: outer rendered content candidate cannot be shadowed by a nested PRE selector hit', () => {
+  const prompt = '# Exact\n\n```text\nx\n```\n';
+  const pre = elementNode('PRE', elementNode('CODE', textNode(prompt)));
+  pre.querySelectorAll = () => [];
+  const content = elementNode('DIV', pre);
+  content.querySelectorAll = () => [pre];
+  content.contains = (node) => node === pre;
+  const outer = elementNode('DIV', content);
+  outer.querySelectorAll = () => [content, pre];
+  const result = serializeReviewUserMessage(outer);
+  assert.equal(result.ok, true);
+  assert.equal(result.text, prompt);
+  assert.equal(result.candidateCount, 1);
+  assert.equal(result.rootTag, 'DIV');
+  assert.deepEqual(result.tagHistogram, { CODE: 1, DIV: 1, PRE: 1 });
+});
+
+test('chatgpt-controller: malformed PRE wrapper remains unreadable and diagnostics disclose no content', () => {
+  const content = elementNode(
+    'PRE',
+    elementNode('CODE', textNode('secret-code')),
+    elementNode('BUTTON', textNode('secret-control'))
+  );
   content.querySelectorAll = () => [];
   const outer = elementNode('DIV', content);
   outer.querySelectorAll = () => [content];
   const result = serializeReviewUserMessage(outer);
   assert.equal(result.ok, false);
+  assert.equal(result.error, 'review_pre_code_shape_unsupported');
   assert.equal(result.tag, 'PRE');
   assert.equal(result.rootTag, 'PRE');
-  assert.deepEqual(result.tagHistogram, { CODE: 1, PRE: 1 });
-  assert.equal(JSON.stringify(result).includes('secret-code'), false);
+  assert.deepEqual(result.tagHistogram, { BUTTON: 1, CODE: 1, PRE: 1 });
+  assert.equal(JSON.stringify(result).includes('secret'), false);
+
+  assert.deepEqual(
+    serializeReviewComposer(elementNode('PRE', elementNode('CODE', elementNode('DIV', textNode('secret-nested'))))),
+    { ok: false, error: 'review_pre_code_shape_unsupported', tag: 'DIV' }
+  );
 });
 
 test('chatgpt-controller: user-message identity fails closed on distinct content leaves', () => {

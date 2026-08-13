@@ -181,6 +181,33 @@ export function serializeReviewComposer(root) {
   ]);
   const blockTags = new Set(['DIV', 'P']);
 
+  const serializePreCode = (node, requireCodeRoot = false) => {
+    if (!node || typeof node !== 'object') {
+      return { ok: false, error: 'review_composer_node_unreadable' };
+    }
+    if (Number(node.nodeType) === 3) {
+      return { ok: true, text: String(node.nodeValue ?? '') };
+    }
+    if (Number(node.nodeType) !== 1) {
+      return { ok: false, error: 'review_composer_node_type_unsupported' };
+    }
+    const tag = String(node.tagName || '').toUpperCase();
+    if (requireCodeRoot && tag !== 'CODE') {
+      return { ok: false, error: 'review_pre_code_shape_unsupported', tag };
+    }
+    if (!requireCodeRoot && tag === 'BR') return { ok: true, text: '\n' };
+    if (!requireCodeRoot && !inlineTags.has(tag)) {
+      return { ok: false, error: 'review_pre_code_shape_unsupported', tag };
+    }
+    let text = '';
+    for (const child of Array.from(node.childNodes || [])) {
+      const serialized = serializePreCode(child, false);
+      if (!serialized.ok) return serialized;
+      text += serialized.text;
+    }
+    return { ok: true, text };
+  };
+
   const serializeNode = (node) => {
     if (!node || typeof node !== 'object') {
       return { ok: false, error: 'review_composer_node_unreadable' };
@@ -193,6 +220,19 @@ export function serializeReviewComposer(root) {
     }
     const tag = String(node.tagName || '').toUpperCase();
     if (tag === 'BR') return { ok: true, text: '\n', block: false };
+    if (tag === 'PRE') {
+      const children = Array.from(node.childNodes || []);
+      if (
+        children.length !== 1 ||
+        Number(children[0]?.nodeType) !== 1 ||
+        String(children[0]?.tagName || '').toUpperCase() !== 'CODE'
+      ) {
+        return { ok: false, error: 'review_pre_code_shape_unsupported', tag };
+      }
+      const code = serializePreCode(children[0], true);
+      if (!code.ok) return code;
+      return { ok: true, text: code.text, block: true };
+    }
     if (!inlineTags.has(tag) && !blockTags.has(tag)) {
       return { ok: false, error: 'review_composer_element_unsupported', tag };
     }
@@ -231,6 +271,10 @@ export function serializeReviewComposer(root) {
     return { ok: false, error: 'review_composer_root_unreadable' };
   }
   const rootTag = String(root.tagName || '').toUpperCase();
+  if (rootTag === 'PRE') {
+    const serialized = serializeNode(root);
+    return serialized.ok ? { ok: true, text: serialized.text } : serialized;
+  }
   if (!inlineTags.has(rootTag) && !blockTags.has(rootTag)) {
     return { ok: false, error: 'review_composer_element_unsupported', tag: rootTag };
   }
@@ -275,20 +319,30 @@ export function serializeReviewUserMessage(root) {
     return { ok: false, error: 'review_user_message_root_unreadable' };
   }
   const selector = '[data-message-content], .whitespace-pre-wrap, [class~="whitespace-pre-wrap"]';
-  const discovered = typeof root.querySelectorAll === 'function'
+  const descendants = typeof root.querySelectorAll === 'function'
     ? Array.from(root.querySelectorAll(selector))
     : [];
+  let rootMatches = false;
+  try { rootMatches = root.matches?.(selector) === true; } catch {}
+  const discovered = [...new Set([...(rootMatches ? [root] : []), ...descendants])];
   const isControl = (node) => {
     const tag = String(node?.tagName || '').toUpperCase();
     const role = String(node?.getAttribute?.('role') || '').toLowerCase();
     return tag === 'BUTTON' || tag === 'A' || role === 'button' || !!node?.closest?.('button, [role="button"], a');
   };
+  const contentNodes = discovered.filter((node) => !isControl(node));
+  const containsNode = (outer, inner) => {
+    if (!outer || !inner || outer === inner) return outer === inner;
+    try {
+      if (typeof outer.contains === 'function') return outer.contains(inner);
+    } catch {}
+    for (let parent = inner.parentNode; parent; parent = parent.parentNode) {
+      if (parent === outer) return true;
+    }
+    return false;
+  };
   const candidates = discovered.length
-    ? discovered.filter((node) => {
-      if (isControl(node)) return false;
-      if (typeof node?.querySelectorAll !== 'function') return true;
-      return Array.from(node.querySelectorAll(selector)).length === 0;
-    })
+    ? contentNodes.filter((node) => !contentNodes.some((outer) => outer !== node && containsNode(outer, node)))
     : isControl(root) ? [] : [root];
   if (candidates.length === 0) {
     return { ok: false, error: 'review_user_message_content_missing' };
