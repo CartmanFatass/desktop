@@ -231,6 +231,24 @@ async function readStateLocked(stateDir) {
   return await withStateLock(stateDir, async () => await readReviewTransportState(stateDir));
 }
 
+export async function inspectReviewAdmission({ stateDir, request: rawRequest }) {
+  if (!stateDir) fail('review_transport_misconfigured');
+  const request = normalizeRequest(rawRequest);
+  const fingerprint = requestFingerprint(request);
+  const state = await readStateLocked(stateDir);
+  const existing = state.operations[request.idempotencyKey] || null;
+  if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+  const exactExisting = !!existing;
+  const observationOnly = request.verifyExisting || request.diagnoseExisting || exactExisting;
+  return {
+    idempotencyKey: request.idempotencyKey,
+    requestFingerprint: fingerprint,
+    exactExisting,
+    observationOnly,
+    requiresSendCapacity: !observationOnly
+  };
+}
+
 function sameBinding(binding, request) {
   return (
     binding?.stableKey === request.stableKey &&
@@ -566,8 +584,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     const completed = await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (op.sendCount > 1) fail('review_send_receipt_invalid');
-      op.sendCount = 1;
+      if (op.sendActionCount !== 1 || op.sendCount !== 1 || !op.userMessageId) {
+        fail('review_send_receipt_invalid');
+      }
       op.userMessageId = validated.userMessageId;
       Object.assign(op, validated, {
         status: 'COMPLETE',

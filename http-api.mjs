@@ -8,7 +8,7 @@ import { ensureArtifactsDir, listArtifacts, registerArtifact, artifactsRoot } fr
 import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store.mjs';
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
-import { runReviewQuery } from './review-transport.mjs';
+import { inspectReviewAdmission, runReviewQuery } from './review-transport.mjs';
 
 function isLoopback(remoteAddress) {
   const a = String(remoteAddress || '');
@@ -50,7 +50,7 @@ function authOk(req, token) {
   return hdr.slice('Bearer '.length).trim() === token;
 }
 
-function mapErrorToHttp(error) {
+export function mapErrorToHttp(error) {
   const msg = String(error?.message || '');
   if (msg === 'body_too_large') return { code: 413, body: { error: 'body_too_large' } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
@@ -95,12 +95,16 @@ function mapErrorToHttp(error) {
       'review_identity_unreadable',
       'review_message_identity_unreadable',
       'review_user_message_identity_unreadable',
+      'review_user_message_identity_ambiguous',
+      'review_user_message_content_mismatch',
       'review_user_message_ambiguous',
       'review_assistant_message_ambiguous',
       'review_completion_unstable',
       'review_completion_controls_active',
       'review_control_activation_forbidden',
       'review_send_control_ambiguous',
+      'review_composer_identity_mismatch',
+      'review_tab_busy',
       'key_url_mismatch'
     ].includes(msg)
   ) {
@@ -474,6 +478,7 @@ export function startHttpApi({
   const inflight = { queries: 0 };
   const activeQueries = new Map(); // tabId -> runtime status
   const activeReviewQueries = new Map(); // runtime key -> strict-review status
+  const activeReviewAdmissions = new Map(); // idempotency key -> exact fresh-operation fingerprint
   const activeQueryRuns = new Map(); // tabId -> in-process query promise
   const activeScopes = new Map(); // request scope -> runtime status
   const lastOutcomes = new Map(); // tabId -> last finished outcome
@@ -491,13 +496,22 @@ export function startHttpApi({
     return { maxInflightQueries, maxQueriesPerMinute, minTabGapMs, minGlobalGapMs, showTabsByDefault };
   };
 
-  const checkAndConsumeQueryBudget = ({ tabId, governor }) => {
-    const now = Date.now();
+  const assertInflightCapacity = ({ governor, operationKind }) => {
     if (inflight.queries >= governor.maxInflightQueries) {
       const err = new Error('rate_limited');
-      err.data = { reason: 'max_inflight', retryAfterMs: 250 };
+      err.data = {
+        reason: 'max_inflight',
+        retryAfterMs: 250,
+        operationKind,
+        sendActionCount: 0
+      };
       throw err;
     }
+  };
+
+  const checkAndConsumeQueryBudget = ({ tabId, governor, operationKind = 'query' }) => {
+    const now = Date.now();
+    assertInflightCapacity({ governor, operationKind });
 
     const lastTab = lastQueryAt.get(tabId) || 0;
     const tabWait = governor.minTabGapMs - (now - lastTab);
@@ -627,7 +641,7 @@ export function startHttpApi({
   };
 
   const runtimeSnapshot = () => ({
-    inflightQueries: inflight.queries + activeReviewQueries.size,
+    inflightQueries: inflight.queries,
     activeQueries: [...activeQueries.values(), ...activeReviewQueries.values()]
       .map((item) => ({ ...item }))
       .sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0)),
@@ -876,6 +890,20 @@ export function startHttpApi({
 
       if (url.pathname === '/review-query' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 2_000_000 });
+        const admission = await inspectReviewAdmission({ stateDir, request: body });
+        const activeAdmission = activeReviewAdmissions.get(admission.idempotencyKey) || null;
+        if (activeAdmission && activeAdmission.requestFingerprint !== admission.requestFingerprint) {
+          throw new Error('review_idempotency_conflict');
+        }
+        const joinsExactActiveOperation = !!activeAdmission;
+        const reserveSendCapacity = admission.requiresSendCapacity && !joinsExactActiveOperation;
+        if (reserveSendCapacity) {
+          assertInflightCapacity({ governor, operationKind: 'strict-review' });
+          inflight.queries += 1;
+          activeReviewAdmissions.set(admission.idempotencyKey, {
+            requestFingerprint: admission.requestFingerprint
+          });
+        }
         const runtimeKey = `review:${crypto.randomUUID()}`;
         const startedAt = Date.now();
         const reviewRun = {
@@ -921,6 +949,12 @@ export function startHttpApi({
           throw error;
         } finally {
           activeReviewQueries.delete(runtimeKey);
+          if (reserveSendCapacity) {
+            if (activeReviewAdmissions.get(admission.idempotencyKey)?.requestFingerprint === admission.requestFingerprint) {
+              activeReviewAdmissions.delete(admission.idempotencyKey);
+            }
+            inflight.queries = Math.max(0, inflight.queries - 1);
+          }
           emitRuntimeChanged();
         }
       }
@@ -955,6 +989,7 @@ export function startHttpApi({
         };
         reserveScope(scope, op);
         let tabId = null;
+        let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           assertTabNotBusy(tabId);
@@ -993,8 +1028,9 @@ export function startHttpApi({
               maxInlineFiles: effectiveBudget.maxInlineFiles,
               maxAttachmentFiles: effectiveBudget.maxAttachmentFiles
             });
-            checkAndConsumeQueryBudget({ tabId, governor });
+            checkAndConsumeQueryBudget({ tabId, governor, operationKind: 'query' });
             inflight.queries += 1;
+            inflightReserved = true;
             const controller = tabs.getControllerById(tabId);
             const queryPromise = runExclusive(controller, async () =>
               controller.query({
@@ -1032,7 +1068,7 @@ export function startHttpApi({
           } finally {
             if (activeQueryRuns.get(tabId)?.id === op.id) activeQueryRuns.delete(tabId);
             clearActiveQuery(tabId, op.id);
-            inflight.queries = Math.max(0, inflight.queries - 1);
+            if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
           }
         } finally {
           clearScope(scope, op.id);
@@ -1065,13 +1101,15 @@ export function startHttpApi({
         };
         reserveScope(scope, op);
         let tabId = null;
+        let inflightReserved = false;
         try {
           tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: true, vendors });
           assertTabNotBusy(tabId);
           op.tabId = tabId;
           setActiveQuery(tabId, op);
-          checkAndConsumeQueryBudget({ tabId, governor });
+          checkAndConsumeQueryBudget({ tabId, governor, operationKind: 'send' });
           inflight.queries += 1;
+          inflightReserved = true;
           const controller = tabs.getControllerById(tabId);
           const result = await runExclusive(controller, async () =>
             controller.send({
@@ -1097,7 +1135,7 @@ export function startHttpApi({
         } finally {
           if (tabId) clearActiveQuery(tabId, op.id);
           clearScope(scope, op.id);
-          inflight.queries = Math.max(0, inflight.queries - 1);
+          if (inflightReserved) inflight.queries = Math.max(0, inflight.queries - 1);
         }
       }
 

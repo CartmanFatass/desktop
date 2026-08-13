@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import { TabManager } from '../tab-manager.mjs';
 
@@ -128,6 +129,26 @@ test('tab-manager: first binding updates the stable tab to the created conversat
     url: 'https://chatgpt.com/c/new-conversation',
     exactUrl: true
   }), tabId);
+});
+
+test('tab-manager: scoped live URL reconciliation updates only same-origin provider navigation', async () => {
+  const browserBackend = {
+    async createSession() {
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({ key: 'gemini-live', vendorId: 'gemini', url: 'https://gemini.google.com/app' });
+  assert.equal(manager.reconcileLiveTabUrl(tabId, 'https://gemini.google.com/app/conversation-live'), true);
+  assert.equal(manager.listTabs()[0].url, 'https://gemini.google.com/app/conversation-live');
+  assert.equal(manager.reconcileLiveTabUrl(tabId, 'https://chatgpt.com/c/wrong-provider'), false);
+  assert.equal(manager.reconcileLiveTabUrl(tabId, 'not-a-url'), false);
+  assert.equal(manager.listTabs()[0].url, 'https://gemini.google.com/app/conversation-live');
+});
+
+test('tab-manager: scoped status wires its successful live URL read into reconciliation', () => {
+  const source = readFileSync(new URL('../main.mjs', import.meta.url), 'utf8');
+  assert.match(source, /if \(url\) tabs\.reconcileLiveTabUrl\(resolvedTabId, url\)/);
 });
 
 test('tab-manager: adopts the exact default tab without creating or navigating', async () => {

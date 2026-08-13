@@ -109,6 +109,7 @@ test('state: review transport ledger is atomically persisted and defaults cleanl
         status: 'COMPLETE',
         terminalState: 'NATURAL_COMPLETION_VERIFIED',
         sendCount: 1,
+        sendActionCount: 1,
         userMessageId: 'user-1',
         assistantMessageId: 'assistant-1',
         responseText,
@@ -129,6 +130,9 @@ test('state: review transport ledger is atomically persisted and defaults cleanl
   };
   await writeReviewTransportState(value, dir);
   assert.deepEqual(await readReviewTransportState(dir), value);
+  const missingSendAction = structuredClone(value);
+  delete missingSendAction.operations.smoke.sendActionCount;
+  await assert.rejects(writeReviewTransportState(missingSendAction, dir), /review_transport_state_invalid/);
 });
 
 test('state: corrupt review transport ledger fails closed', async () => {

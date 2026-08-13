@@ -637,12 +637,14 @@ async function main() {
           emitTabsChanged();
         },
         getStatus: async ({ tabId }) => {
-          const controller = tabId ? tabs.getControllerById(tabId) : tabs.getControllerById(defaultTabId);
+          const resolvedTabId = tabId || defaultTabId;
+          const controller = tabs.getControllerById(resolvedTabId);
           const url = await controller.getUrl().catch(() => '');
+          if (url) tabs.reconcileLiveTabUrl(resolvedTabId, url);
           const challenge = await controller.detectChallenge().catch(() => null);
           return {
             ok: true,
-            tabId: tabId || defaultTabId,
+            tabId: resolvedTabId,
             url,
             blocked: !!challenge?.blocked,
             promptVisible: !!challenge?.promptVisible,

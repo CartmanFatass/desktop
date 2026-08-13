@@ -160,6 +160,25 @@ export class TabManager {
     this.onChanged?.();
   }
 
+  reconcileLiveTabUrl(id, url) {
+    const tab = this.tabs.get(id);
+    if (!tab) throw new Error('tab_not_found');
+    let current;
+    let observed;
+    try {
+      current = new URL(String(tab.url || ''));
+      observed = new URL(String(url || ''));
+    } catch {
+      return false;
+    }
+    if (!['http:', 'https:'].includes(observed.protocol) || current.origin !== observed.origin) return false;
+    if (tab.url === observed.href) return true;
+    tab.url = observed.href;
+    tab.lastUsedAt = Date.now();
+    this.onChanged?.();
+    return true;
+  }
+
   listTabs() {
     const out = [];
     for (const t of this.tabs.values()) {

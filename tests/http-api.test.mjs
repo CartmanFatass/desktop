@@ -4,7 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { startHttpApi } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
+import { readReviewTransportState } from '../state.mjs';
+
+test('http-api: strict pre-send busy and post-send identity ambiguity are conflicts', () => {
+  assert.equal(mapErrorToHttp(new Error('review_tab_busy')).code, 409);
+  assert.equal(mapErrorToHttp(new Error('review_composer_identity_mismatch')).code, 409);
+  assert.equal(mapErrorToHttp(new Error('review_user_message_content_mismatch')).code, 409);
+});
 
 async function req({ port, token, method, pth, body, headers = {} }) {
   const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
@@ -2713,10 +2720,170 @@ test('http-api: query returns 429 when maxInflightQueries exceeded', async (t) =
   assert.equal(q2.res.status, 429);
   assert.equal(q2.data.error, 'rate_limited');
   assert.equal(q2.data.reason, 'max_inflight');
+  const q3 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q2', prompt: 'still blocked' } });
+  assert.equal(q3.res.status, 429);
+  assert.equal(q3.data.reason, 'max_inflight');
 
   release();
   const q1r = await q1;
   assert.equal(q1r.res.status, 200);
+});
+
+test('http-api: shared max inflight blocks a fresh strict send behind an ordinary query before ledger creation', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-shared-governor-'));
+  let ordinaryStarted = 0;
+  let releaseOrdinary;
+  const ordinaryGate = new Promise((resolve) => { releaseOrdinary = resolve; });
+  const ordinaryController = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      ordinaryStarted += 1;
+      await ordinaryGate;
+      return { text: 'ordinary done' };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'ordinary-tab', key: 'ordinary' }],
+    ensureTab: async () => 'ordinary-tab',
+    getControllerById: () => ordinaryController
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'ordinary-tab',
+    serverId: 'sid-shared-governor-ordinary-first',
+    stateDir,
+    getStatus: async () => ({ ok: true }),
+    getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary', prompt: 'hold capacity' } });
+  for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const prompt = 'strict should not send';
+  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  const strict = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/review-query',
+    body: {
+      stableKey: 'strict-blocked-by-ordinary',
+      provider: 'chatgpt',
+      model: 'GPT-5.6 Pro',
+      conversationUrl: 'https://chatgpt.com/c/shared-governor',
+      conversationId: 'shared-governor',
+      idempotencyKey: 'strict-blocked-by-ordinary-op',
+      prompt,
+      promptSha256,
+      timeoutMs: 60_000
+    }
+  });
+  assert.equal(strict.res.status, 429);
+  assert.equal(strict.data.reason, 'max_inflight');
+  assert.equal(strict.data.operationKind, 'strict-review');
+  assert.equal(strict.data.sendActionCount, 0);
+  assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
+
+  releaseOrdinary();
+  assert.equal((await ordinary).res.status, 200);
+});
+
+test('http-api: fresh strict reserves shared capacity while exact verifyExisting bypasses send admission', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-strict-governor-'));
+  const response = 'STRICT_GOVERNOR_OK';
+  const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
+  const prompt = 'strict governor prompt';
+  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  let strictStarted = 0;
+  let releaseStrict;
+  const strictGate = new Promise((resolve) => { releaseStrict = resolve; });
+  let ordinaryStarted = 0;
+  let releaseOrdinary;
+  const ordinaryGate = new Promise((resolve) => { releaseOrdinary = resolve; });
+  const strictResult = {
+    userMessageId: 'strict-governor-user',
+    assistantMessageId: 'strict-governor-assistant',
+    text: response,
+    snapshots: [
+      { observedAt: 1000, assistantMessageId: 'strict-governor-assistant', textSha256: responseSha256 },
+      { observedAt: 4100, assistantMessageId: 'strict-governor-assistant', textSha256: responseSha256 }
+    ],
+    controls: { stop: false, continue: false, retry: false, answerNow: false },
+    conversationUrl: 'https://chatgpt.com/c/strict-governor',
+    conversationId: 'strict-governor',
+    modelEvidence: 'GPT-5.6 Pro'
+  };
+  const strictController = {
+    runExclusive: async (fn) => await fn(),
+    reviewQuery: async (args) => {
+      await args.onPrepared({ baselineMessageIds: [], conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
+      await args.onSendAction({ clickCount: 1, sendActionCount: 1 });
+      await args.onSubmitted({ userMessageId: strictResult.userMessageId, conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
+      strictStarted += 1;
+      await strictGate;
+      return strictResult;
+    },
+    observeReviewResponse: async () => strictResult
+  };
+  const ordinaryController = {
+    runExclusive: async (fn) => await fn(),
+    query: async () => {
+      ordinaryStarted += 1;
+      await ordinaryGate;
+      return { text: 'ordinary done' };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'strict-tab', key: 'strict-governor-key' }, { id: 'ordinary-tab', key: 'ordinary-after-strict' }],
+    ensureTab: async ({ key }) => key === 'strict-governor-key' ? 'strict-tab' : 'ordinary-tab',
+    getControllerById: (id) => id === 'strict-tab' ? strictController : ordinaryController
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'ordinary-tab',
+    serverId: 'sid-shared-governor-strict-first',
+    stateDir,
+    getStatus: async () => ({ ok: true }),
+    getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const strictBody = {
+    stableKey: 'strict-governor-key',
+    provider: 'chatgpt',
+    model: 'GPT-5.6 Pro',
+    conversationUrl: strictResult.conversationUrl,
+    conversationId: strictResult.conversationId,
+    idempotencyKey: 'strict-governor-op',
+    prompt,
+    promptSha256,
+    timeoutMs: 60_000
+  };
+  const strict = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: strictBody });
+  for (let i = 0; i < 50 && strictStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const ordinaryBlocked = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'blocked by strict' } });
+  assert.equal(ordinaryBlocked.res.status, 429);
+  assert.equal(ordinaryBlocked.data.reason, 'max_inflight');
+  const activeVerified = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } });
+  assert.equal(activeVerified.res.status, 200);
+  assert.equal(activeVerified.data.receipt.userMessageId, strictResult.userMessageId);
+
+  releaseStrict();
+  assert.equal((await strict).res.status, 200);
+
+  const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'hold while observing' } });
+  for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const verified = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } });
+  assert.equal(verified.res.status, 200);
+  assert.equal(verified.data.receipt.operationId, (await readReviewTransportState(stateDir)).operations[strictBody.idempotencyKey].operationId);
+
+  releaseOrdinary();
+  assert.equal((await ordinary).res.status, 200);
 });
 
 test('http-api: query pacing returns 429 with retryAfterMs when max wait is 0', async (t) => {

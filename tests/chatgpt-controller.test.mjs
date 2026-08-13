@@ -6,6 +6,8 @@ import { readFileSync } from 'node:fs';
 import {
   ChatGPTController,
   canonicalizeGeminiReviewMessageNodes,
+  canonicalizeGeminiModelEvidence,
+  classifyBlockedSignals,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
   looksLikeBlockedPage,
@@ -44,10 +46,54 @@ test('chatgpt-controller: ordinary verify wording is not an access block', () =>
   assert.equal(looksLikeBlockedPage('Please verify the estimator before reporting. Prompt visible.'), false);
   assert.equal(looksLikeBlockedPage('403 Forbidden'), true);
   assert.equal(looksLikeBlockedPage('Access denied'), true);
-  assert.equal(looksLikeBlockedPage('Forbidden'), true);
+  assert.equal(looksLikeBlockedPage('Forbidden'), false);
+  assert.equal(looksLikeBlockedPage('The estimator returned 403 samples'), false);
   assert.equal(looksLikeBlockedPage('Unusual traffic'), true);
   assert.equal(looksLikeBlockedPage('Verify you are human'), true);
   assert.equal(looksLikeBlockedPage('Human verification'), true);
+});
+
+test('chatgpt-controller: access-error wording does not block a usable composer', () => {
+  assert.deepEqual(classifyBlockedSignals({ looks403: true, promptVisible: true }), {
+    blocked: false,
+    kind: null,
+    accessBlocked: false
+  });
+  assert.deepEqual(classifyBlockedSignals({ looks403: true, promptVisible: false }), {
+    blocked: true,
+    kind: 'blocked',
+    accessBlocked: true
+  });
+});
+
+test('chatgpt-controller: Gemini canonical model evidence requires two visible scoped selected controls', () => {
+  const expected = 'Gemini 3.1 Pro extended';
+  const valid = canonicalizeGeminiModelEvidence([
+    { label: '3.1 Pro', visible: true, scoped: true, selected: true, source: 'menu' },
+    { label: 'Extended thinking', visible: true, scoped: true, selected: true, source: 'menu' }
+  ], expected);
+  assert.equal(valid.matched, true);
+  assert.equal(valid.matchedLabel, expected);
+  assert.equal(valid.modelLabel, '3.1 Pro');
+  assert.equal(valid.thinkingMode, 'Extended thinking');
+
+  for (const invalid of [
+    [
+      { label: '3.1 Pro', visible: false, scoped: true, selected: true, source: 'menu' },
+      { label: 'Extended thinking', visible: false, scoped: true, selected: true, source: 'menu' }
+    ],
+    [
+      { label: '3.1 Pro', visible: true, scoped: false, selected: true, source: 'menu' },
+      { label: 'Extended thinking', visible: true, scoped: false, selected: true, source: 'menu' }
+    ],
+    [
+      { label: 'Pro', visible: true, scoped: true, selected: true, source: 'menu' },
+      { label: 'Extended thinking', visible: true, scoped: true, selected: true, source: 'menu' }
+    ],
+    [{ label: expected, visible: true, scoped: true, selected: true, source: 'trigger' }]
+  ]) {
+    assert.equal(canonicalizeGeminiModelEvidence(invalid, expected).matched, false);
+  }
 });
 
 test('chatgpt-controller: structural composer serialization preserves exact multiline plain text', () => {
@@ -661,7 +707,7 @@ test('chatgpt-controller: strict review submits with one send control and return
       }
       if (js.includes('reviewSnapshotMarker')) {
         reviewSnapshotCalls += 1;
-        const historyReady = strictClicks > 0 || reviewSnapshotCalls > 1;
+        const historyReady = reviewSnapshotCalls > 0;
         const historical = historyReady
           ? [{ order: 0, role: 'user', id: 'historical-user-1', text: 'historical' }]
           : [];
@@ -676,7 +722,7 @@ test('chatgpt-controller: strict review submits with one send control and return
           messages,
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
-          controlText: ['Answer now'],
+          controlText: [],
           selectorStop: false,
           sendVisible: true
         };
@@ -711,7 +757,7 @@ test('chatgpt-controller: strict review submits with one send control and return
     timeoutMs: 8_000,
     onPrepared: async ({ baselineMessageIds }) => {
       prepared += 1;
-      assert.deepEqual(baselineMessageIds, []);
+      assert.deepEqual(baselineMessageIds, ['historical-user-1']);
     },
     onSubmitted: async () => {
       submitted += 1;
@@ -729,7 +775,7 @@ test('chatgpt-controller: strict review submits with one send control and return
   assert.ok(result.snapshots[1].observedAt - result.snapshots[0].observedAt >= 3_000);
   assert.equal(result.snapshots[0].textSha256, crypto.createHash('sha256').update(response).digest('hex'));
   assert.deepEqual(result.clickedControls, []);
-  assert.equal(result.controls.answerNow, true);
+  assert.equal(result.controls.answerNow, false);
 });
 
 test('chatgpt-controller: first binding pastes once and follows the created ChatGPT conversation', async () => {
@@ -870,6 +916,77 @@ test('chatgpt-controller: Gemini strict review inserts once and completes on the
   assert.equal(result.text, 'GEMINI_OK');
 });
 
+test('chatgpt-controller: Gemini strict preflight selects model and Extended thinking through the shared adapter', async () => {
+  const url = 'https://gemini.google.com/app/gemini-composite';
+  const expectedModel = 'Gemini 3.1 Pro extended';
+  const prompt = 'exact question';
+  let selectedModel = false;
+  let selectedThinking = false;
+  let pendingSelection = null;
+  let strictClicks = 0;
+  const selectionOrder = [];
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyGeminiModelStateMarker')) {
+        return {
+          matched: selectedModel && selectedThinking,
+          labels: [selectedModel ? '3.1 Pro' : '2.5 Pro', ...(selectedThinking ? ['Extended thinking'] : [])],
+          matchedLabel: selectedModel && selectedThinking ? expectedModel : null,
+          modelLabel: selectedModel ? '3.1 Pro' : null,
+          thinkingMode: selectedThinking ? 'Extended thinking' : null
+        };
+      }
+      if (js.includes('agentifyGeminiChooseModelPartMarker')) {
+        pendingSelection = js.includes('"thinking" === \'thinking\'') ? 'thinking' : 'model';
+        return { ok: true, labels: ['3.1 Pro', 'Extended thinking'], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return { ok: true, serializerOk: true, serializedLength: prompt.length, expectedLength: prompt.length };
+      }
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: strictClicks ? [
+            { order: 0, role: 'user', id: 'gemini-composite-user', text: prompt, textIdentityReadable: true },
+            { order: 1, role: 'assistant', id: 'gemini-composite-assistant', text: 'DONE' }
+          ] : [],
+          modelEvidence: expectedModel,
+          modelEvidenceCandidates: [expectedModel],
+          controlText: [], selectorStop: false, sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { assert.equal(text, prompt); },
+    async sendKey() {},
+    async moveMouse() {},
+    async mouseDown() {
+      if (pendingSelection === 'model') selectedModel = true;
+      if (pendingSelection === 'thinking') selectedThinking = true;
+      if (pendingSelection) selectionOrder.push(pendingSelection);
+      pendingSelection = null;
+    },
+    async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: url,
+    expectedConversationId: 'gemini-composite',
+    expectedModel,
+    timeoutMs: 10_000
+  });
+  assert.deepEqual(selectionOrder, ['model', 'thinking']);
+  assert.equal(strictClicks, 1);
+  assert.equal(result.modelEvidence, expectedModel);
+});
+
 test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
   const url = 'https://chatgpt.com/c/conversation-structural';
   const prompt = 'alpha\n\nbeta';
@@ -928,7 +1045,7 @@ test('chatgpt-controller: strict review accepts structural exactness when browse
   assert.equal(result.userMessageId, 'user-structural');
 });
 
-test('chatgpt-controller: review send does not gate on a rendered composer projection', async () => {
+test('chatgpt-controller: strict review rejects a non-exact composer before its send boundary', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let strictClicks = 0;
   let insertCalls = 0;
@@ -978,16 +1095,71 @@ test('chatgpt-controller: review send does not gate on a rendered composer proje
       assistantMessage: '[data-message-author-role="assistant"]'
     }
   });
-  const result = await controller.reviewQuery({
-    prompt: 'mismatch',
-    expectedUrl: url,
-    expectedConversationId: 'conversation-1',
-    expectedModel: 'GPT-5.6 Pro',
-    timeoutMs: 8_000
-  });
+  await assert.rejects(controller.reviewQuery({
+      prompt: 'mismatch',
+      expectedUrl: url,
+      expectedConversationId: 'conversation-1',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 8_000
+    }), /review_composer_identity_mismatch/);
   assert.equal(insertCalls, 1);
+  assert.equal(strictClicks, 0);
+});
+
+test('chatgpt-controller: post-send rendered user mismatch is ambiguous and never acknowledged as submitted', async () => {
+  const url = 'https://chatgpt.com/c/rendered-mismatch';
+  const prompt = 'exact frozen prompt';
+  let strictClicks = 0;
+  let submitted = false;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('reviewComposerDiagnosticMarker')) {
+        return { ok: true, serializerOk: true, serializedLength: prompt.length, expectedLength: prompt.length };
+      }
+      if (js.includes('missing_prompt_textarea')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 } };
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: strictClicks ? [{
+            order: 0,
+            role: 'user',
+            id: 'rendered-mismatch-user',
+            text: 'Pasted_text.txt',
+            textLength: 15,
+            textIdentityReadable: true
+          }] : [],
+          modelEvidence: 'GPT-5.6 Pro',
+          modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [], selectorStop: false, sendVisible: true
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() {}, async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt,
+      expectedUrl: url,
+      expectedConversationId: 'rendered-mismatch',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 5_000,
+      onSubmitted: async () => { submitted = true; }
+    }),
+    (error) => {
+      assert.equal(error.message, 'review_user_message_content_mismatch');
+      assert.equal(error.data.exactMatchCount, 0);
+      return true;
+    }
+  );
   assert.equal(strictClicks, 1);
-  assert.equal(result.text, 'OK');
+  assert.equal(submitted, false);
 });
 
 test('chatgpt-controller: ambiguous send control fails before a click', async () => {
@@ -1039,7 +1211,7 @@ test('chatgpt-controller: ambiguous send control fails before a click', async ()
   assert.equal(sendEvaluationReached, true);
 });
 
-test('chatgpt-controller: strict review binds one long multi-node message causally to the exact composer receipt', async () => {
+test('chatgpt-controller: post-send unreadable rendered user content is ambiguous and never submitted', async () => {
   const url = 'https://chatgpt.com/c/conversation-rendered';
   const prompt = '```text\nsynthetic\n```\n';
   let strictClicks = 0;
@@ -1106,22 +1278,19 @@ test('chatgpt-controller: strict review binds one long multi-node message causal
     async mouseUp() {}
   };
   const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
-  const result = await controller.reviewQuery({
-    prompt,
-    expectedUrl: url,
-    expectedConversationId: 'conversation-rendered',
-    expectedModel: 'GPT-5.6 Pro',
-    timeoutMs: 8_000,
-    onSubmitted: async (receipt) => { submittedReceipt = receipt; }
-  });
+  await assert.rejects(controller.reviewQuery({
+      prompt,
+      expectedUrl: url,
+      expectedConversationId: 'conversation-rendered',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 8_000,
+      onSubmitted: async (receipt) => { submittedReceipt = receipt; }
+    }), /review_user_message_content_mismatch/);
   assert.equal(strictClicks, 1);
-  assert.equal(result.userMessageId, 'user-rendered');
-  assert.equal(submittedReceipt.userMessageId, 'user-rendered');
-  assert.equal('composerPromptSha256' in submittedReceipt, false);
-  assert.equal('renderedIdentityDiagnostic' in submittedReceipt, false);
+  assert.equal(submittedReceipt, null);
 });
 
-test('chatgpt-controller: active generation is observed without another send', async () => {
+test('chatgpt-controller: fresh strict review fails busy on an active prior turn', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   let inserted = false;
   let snapshots = 0;
@@ -1153,15 +1322,15 @@ test('chatgpt-controller: active generation is observed without another send', a
     }
   };
   const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt-textarea', sendButton: '#send', stopButton: '#stop' } });
-  const result = await controller.reviewQuery({
-    prompt: 'safe',
-    expectedUrl: url,
-    expectedConversationId: 'conversation-1',
-    expectedModel: 'GPT-5.6 Pro',
-    timeoutMs: 8_000
-  });
+  await assert.rejects(controller.reviewQuery({
+      prompt: 'safe',
+      expectedUrl: url,
+      expectedConversationId: 'conversation-1',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 8_000
+    }), /review_tab_busy/);
   assert.equal(inserted, false);
-  assert.equal(result.text, 'answer');
+  assert.equal(snapshots, 1);
 });
 
 test('chatgpt-controller: crash recovery excludes historical identical prompts by persisted baseline', async () => {

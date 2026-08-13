@@ -8,6 +8,7 @@ import path from 'node:path';
 import {
   prepareReviewPromptInput,
   resolveReviewPromptInput,
+  inspectReviewAdmission,
   runReviewQuery,
   sanitizeReviewErrorData
 } from '../review-transport.mjs';
@@ -604,6 +605,33 @@ test('review transport: Gemini uses the same strict receipt lifecycle with provi
   assert.equal(f.calls.review, 1);
 });
 
+test('review transport: admission distinguishes a fresh send from exact existing observation', async () => {
+  const f = await fixture();
+  const fresh = await inspectReviewAdmission({ stateDir: f.stateDir, request: f.request });
+  assert.equal(fresh.requiresSendCapacity, true);
+  assert.equal(fresh.exactExisting, false);
+
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  const existing = await inspectReviewAdmission({ stateDir: f.stateDir, request: f.request });
+  assert.equal(existing.requiresSendCapacity, false);
+  assert.equal(existing.exactExisting, true);
+  assert.equal(existing.observationOnly, true);
+
+  const verifying = await inspectReviewAdmission({
+    stateDir: f.stateDir,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(verifying.requiresSendCapacity, false);
+
+  await assert.rejects(
+    inspectReviewAdmission({
+      stateDir: f.stateDir,
+      request: { ...f.request, prompt: 'conflict', promptSha256: sha256('conflict') }
+    }),
+    /review_idempotency_conflict/
+  );
+});
+
 test('review transport: conflicting idempotency payload is rejected without another send', async () => {
   const f = await fixture();
   await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
@@ -749,6 +777,28 @@ test('review transport: bounded failed verification preserves its single submitt
   assert.equal(f.calls.review, 1);
   assert.equal(f.calls.observe, 1);
   assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
+});
+
+test('review transport: observer completion cannot promote a ledger without one persisted send action', async () => {
+  const f = await fixture();
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  operation.status = 'SUBMITTED';
+  operation.terminalState = null;
+  operation.sendActionCount = 0;
+  await writeReviewTransportState(state, f.stateDir);
+
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, verifyExisting: true }
+    }),
+    /review_send_receipt_invalid/
+  );
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
 });
 
 test('review transport: repeated verifyExisting has no send or control capability', async () => {

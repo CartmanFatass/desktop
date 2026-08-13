@@ -6,10 +6,29 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const BLOCKED_PAGE_TEXT_PATTERN = /\b403\b|access denied|forbidden|unusual traffic|verify you are human|human verification/i;
+const BLOCKED_PAGE_TEXT_PATTERN = /(?:\b403\s+(?:forbidden|error)\b|\bhttp\s*403\b|access denied|request forbidden|unusual traffic|verify you are human|human verification)/i;
 
 export function looksLikeBlockedPage(bodyText) {
   return BLOCKED_PAGE_TEXT_PATTERN.test(String(bodyText || ''));
+}
+
+export function classifyBlockedSignals({
+  hasTurnstile = false,
+  hasArkose = false,
+  hasVerifyButton = false,
+  looks403 = false,
+  loginLike = false,
+  promptVisible = false
+} = {}) {
+  const challenge = !!hasTurnstile || !!hasArkose || !!hasVerifyButton;
+  const accessBlocked = !!looks403 && !promptVisible;
+  const loginBlocked = !!loginLike && !promptVisible;
+  const blocked = challenge || accessBlocked || loginBlocked;
+  return {
+    blocked,
+    kind: !blocked ? null : challenge ? 'captcha' : loginBlocked ? 'login' : 'blocked',
+    accessBlocked
+  };
 }
 
 export function classifyReviewControls(labels, { selectorStop = false, sendVisible = false } = {}) {
@@ -48,6 +67,62 @@ export function modelLabelMatches(actual, expected) {
   if (expectedWords.length === 1 && expectedWords[0] === 'pro') return actualWords.at(-1) === 'pro';
   if (actualWords.length === 1 && actualWords[0] === 'pro') return expectedWords.at(-1) === 'pro';
   return false;
+}
+
+export function geminiExpectedModelSpec(expectedModel) {
+  const original = String(expectedModel || '').replace(/\s+/g, ' ').trim();
+  const hasExtendedThinking = /(?:\bextended(?:\s+thinking)?\b|\u6269\u5c55\u601d\u8003)/i.test(original);
+  const model = original
+    .replace(/^gemini\s+/i, '')
+    .replace(/(?:\s+extended(?:\s+thinking)?|\s*\u6269\u5c55\u601d\u8003)\s*$/i, '')
+    .trim();
+  return {
+    model,
+    thinkingMode: hasExtendedThinking ? 'Extended thinking' : null
+  };
+}
+
+export function geminiModelLabelMatches(actual, expected) {
+  const normalize = (value) => String(value || '')
+    .replace(/^gemini\s+/i, '')
+    .replace(/(?:\s+extended(?:\s+thinking)?|\s*\u6269\u5c55\u601d\u8003)(?:\s|$)/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const actualLabel = normalize(actual);
+  const expectedLabel = normalize(expected);
+  return !!actualLabel && actualLabel === expectedLabel;
+}
+
+export function canonicalizeGeminiModelEvidence(records, expectedModel) {
+  const spec = geminiExpectedModelSpec(expectedModel);
+  if (!spec.model) return { matched: false, labels: [], matchedLabel: null, modelLabel: null, thinkingMode: null };
+  const accepted = (Array.isArray(records) ? records : [])
+    .filter((record) => record?.visible === true && record?.scoped === true)
+    .filter((record) => record?.source === 'trigger' || record?.selected === true)
+    .map((record) => ({ ...record, label: String(record.label || '').replace(/\s+/g, ' ').trim() }))
+    .filter((record) => record.label);
+  const cleanModelLabel = (value) => String(value || '')
+    .replace(/^gemini\s+/i, '')
+    .replace(/(?:\s+extended(?:\s+thinking)?|\s*\u6269\u5c55\u601d\u8003)(?:\s|$)/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const modelRecord = accepted.find((record) => geminiModelLabelMatches(cleanModelLabel(record.label), spec.model)) || null;
+  const thinkingRecord = spec.thinkingMode
+    ? accepted.find((record) => record !== modelRecord && /(?:\bextended\s+thinking\b|\u6269\u5c55\u601d\u8003)/i.test(record.label)) || null
+    : null;
+  const modelLabel = modelRecord ? cleanModelLabel(modelRecord.label) : null;
+  const matched = !!modelLabel && (!spec.thinkingMode || !!thinkingRecord);
+  const matchedLabel = matched
+    ? `Gemini ${modelLabel}${spec.thinkingMode ? ' extended' : ''}`
+    : null;
+  return {
+    matched,
+    labels: accepted.map((record) => record.label),
+    matchedLabel,
+    modelLabel,
+    thinkingMode: thinkingRecord ? 'Extended thinking' : null
+  };
 }
 
 export function canonicalizeGeminiReviewMessageNodes(nodes, userSelector) {
@@ -352,6 +427,7 @@ export class ChatGPTController {
 
   async detectChallenge() {
     const result = await this.#eval(`(() => {
+      const classifyBlockedSignals = ${classifyBlockedSignals.toString()};
       const url = location.href || '';
       const title = document.title || '';
       const readyState = document.readyState || '';
@@ -448,15 +524,16 @@ export class ChatGPTController {
         });
       })();
       const promptVisible = rawPromptVisible && (!loginLike || sendVisible);
-
-      const blocked = hasTurnstile || hasArkose || hasVerifyButton || looks403 || (loginLike && !promptVisible);
-      const kind = (hasTurnstile || hasArkose || hasVerifyButton) ? 'captcha' : (loginLike ? 'login' : (looks403 ? 'blocked' : null));
+      const classification = classifyBlockedSignals({
+        hasTurnstile, hasArkose, hasVerifyButton, looks403, loginLike, promptVisible
+      });
+      const { blocked, kind, accessBlocked } = classification;
       return {
         url, title, readyState,
         blocked,
         promptVisible,
         kind,
-        indicators: { hasTurnstile, hasArkose, hasVerifyButton, looks403, loginLike, rawPromptVisible, sendVisible }
+        indicators: { hasTurnstile, hasArkose, hasVerifyButton, looks403, accessBlocked, loginLike, rawPromptVisible, sendVisible }
       };
     })()`);
 
@@ -1106,6 +1183,54 @@ export class ChatGPTController {
   async #readExpectedModelState(expectedModel) {
     const expected = String(expectedModel || '').trim();
     if (!expected) return { matched: true, labels: [], matchedLabel: null };
+    let isGemini = false;
+    try { isGemini = new URL(await this.page.getUrl()).hostname === 'gemini.google.com'; } catch {}
+    if (isGemini) {
+      return await this.#eval(`(() => {
+        const agentifyGeminiModelStateMarker = true;
+        const modelLabelMatches = ${modelLabelMatches.toString()};
+        const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+        const geminiExpectedModelSpec = ${geminiExpectedModelSpec.toString()};
+        const canonicalizeGeminiModelEvidence = ${canonicalizeGeminiModelEvidence.toString()};
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+        };
+        const labelOf = (node) => String(
+          node?.textContent || node?.getAttribute?.('aria-label') || ''
+        ).replace(/\s+/g, ' ').trim();
+        const selected = (node) => !!node && (
+          node.getAttribute('data-active') === 'true' ||
+          /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
+          node.getAttribute('aria-checked') === 'true' ||
+          node.getAttribute('aria-selected') === 'true' ||
+          Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|\u5df2\u9009\u4e2d/i.test(String(child.getAttribute('aria-label') || '')))
+        );
+        const prompt = document.querySelector(${JSON.stringify(this.selectors.promptTextarea)});
+        const composer = prompt?.closest?.('form') || prompt?.parentElement?.parentElement?.parentElement || null;
+        const triggerRoots = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
+        const controlledMenuIds = new Set(triggerRoots.flatMap((node) =>
+          String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)
+        ));
+        const menuRoots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
+          .filter(visible)
+          .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
+          .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
+        const records = [];
+        for (const root of triggerRoots) {
+          if (composer && !composer.contains(root) && !root.contains(composer)) continue;
+          const nodes = root.matches('button, [role="button"]') ? [root] : Array.from(root.querySelectorAll('button, [role="button"]'));
+          for (const node of nodes) records.push({ label: labelOf(node), visible: visible(node), scoped: true, selected: true, source: 'trigger' });
+        }
+        for (const root of menuRoots) {
+          for (const node of root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')) {
+            records.push({ label: labelOf(node), visible: visible(node), scoped: true, selected: selected(node), source: 'menu' });
+          }
+        }
+        return canonicalizeGeminiModelEvidence(records, ${JSON.stringify(expected)});
+      })()`);
+    }
     const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
     const modelSel = JSON.stringify([
       this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
@@ -1135,6 +1260,9 @@ export class ChatGPTController {
   async #ensureExpectedModel(expectedModel, timeoutMs = 20_000) {
     const expected = String(expectedModel || '').trim();
     if (!expected) return null;
+    let isGemini = false;
+    try { isGemini = new URL(await this.page.getUrl()).hostname === 'gemini.google.com'; } catch {}
+    if (isGemini) return await this.#ensureGeminiExpectedModel(expected, timeoutMs);
     const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
     const modelSel = JSON.stringify([
       this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
@@ -1214,14 +1342,128 @@ export class ChatGPTController {
     throw new Error('expected_model_switch_unconfirmed');
   }
 
-  async #completionMetadata(expectedModel = '') {
+  async #ensureGeminiExpectedModel(expectedModel, timeoutMs = 20_000) {
+    const expected = String(expectedModel || '').trim();
+    const spec = geminiExpectedModelSpec(expected);
+    if (!spec.model) throw new Error('expected_model_unavailable');
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.#emitProgress({ phase: 'selecting_model' });
+    let state = await this.#readExpectedModelState(expected);
+    if (state?.matched) return state;
+
+    const choose = async (targetKind, targetLabel) => {
+      let last = null;
+      while (Date.now() < deadline) {
+        last = await this.#eval(`(() => {
+          const agentifyGeminiChooseModelPartMarker = true;
+          const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+          const visible = (node) => {
+            const rect = node?.getBoundingClientRect?.();
+            const style = node ? window.getComputedStyle(node) : null;
+            return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+          };
+          const labelOf = (node) => String(node?.textContent || node?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
+          const selected = (node) => !!node && (
+            node.getAttribute('data-active') === 'true' ||
+            /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
+            node.getAttribute('aria-checked') === 'true' ||
+            node.getAttribute('aria-selected') === 'true' ||
+            Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|\u5df2\u9009\u4e2d/i.test(String(child.getAttribute('aria-label') || '')))
+          );
+          const triggers = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
+          const controlledMenuIds = new Set(triggers.flatMap((node) => String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)));
+          const roots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
+            .filter(visible)
+            .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
+            .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
+          const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')).filter(visible));
+          const labels = candidates.map(labelOf).filter(Boolean);
+          const target = candidates.find((node) => {
+            const label = labelOf(node);
+            return ${JSON.stringify(targetKind)} === 'thinking'
+              ? /(?:^|\s)(?:Extended thinking|\u6269\u5c55\u601d\u8003)(?:\s|$)/i.test(label)
+              : geminiModelLabelMatches(label, ${JSON.stringify(targetLabel)});
+          }) || null;
+          if (!target) return { ok: false, error: 'expected_model_unavailable', labels };
+          const rect = target.getBoundingClientRect();
+          return { ok: true, alreadySelected: selected(target), labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        })()`);
+        if (last?.ok) {
+          if (!last.alreadySelected) {
+            await this.#clickAt(last.rect.x + last.rect.w / 2, last.rect.y + last.rect.h / 2);
+          }
+          await sleep(250);
+          return;
+        }
+        const opened = await this.#eval(`(() => {
+          const agentifyGeminiOpenModelMenuMarker = true;
+          const visible = (node) => {
+            const rect = node?.getBoundingClientRect?.();
+            const style = node ? window.getComputedStyle(node) : null;
+            return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+          };
+          const candidates = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"]')).filter(visible);
+          const target = candidates[0] || null;
+          if (!target) return { ok: false, error: 'model_switcher_unavailable' };
+          const rect = target.getBoundingClientRect();
+          return { ok: true, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        })()`);
+        if (opened?.ok) {
+          await this.#clickAt(opened.rect.x + opened.rect.w / 2, opened.rect.y + opened.rect.h / 2);
+          await sleep(250);
+        } else {
+          await sleep(200);
+        }
+      }
+      const error = new Error(last?.error || 'expected_model_unavailable');
+      error.data = { expectedModel: expected, expectedPart: targetKind, availableModels: last?.labels || [] };
+      throw error;
+    };
+
+    if (!state?.modelLabel) await choose('model', spec.model);
+    state = await this.#readExpectedModelState(expected);
+    if (spec.thinkingMode && !state?.thinkingMode) await choose('thinking', spec.thinkingMode);
+    while (Date.now() < deadline) {
+      state = await this.#readExpectedModelState(expected);
+      if (state?.matched) return state;
+      const openedForVerification = await this.#eval(`(() => {
+        const agentifyGeminiOpenModelVerificationMarker = true;
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+        };
+        const trigger = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"]')).find(visible) || null;
+        const controlledIds = new Set(trigger ? String(trigger.getAttribute('aria-controls') || trigger.closest('[aria-controls]')?.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean) : []);
+        const menuOpen = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
+          .filter(visible)
+          .some((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledIds.has(String(node.id || '')));
+        if (menuOpen) return { ok: true, alreadyOpen: true };
+        if (!trigger) return { ok: false, error: 'model_switcher_unavailable' };
+        const rect = trigger.getBoundingClientRect();
+        return { ok: true, alreadyOpen: false, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+      })()`);
+      if (openedForVerification?.ok && !openedForVerification.alreadyOpen) {
+        await this.#clickAt(
+          openedForVerification.rect.x + openedForVerification.rect.w / 2,
+          openedForVerification.rect.y + openedForVerification.rect.h / 2
+        );
+      }
+      await sleep(200);
+    }
+    throw new Error('expected_model_switch_unconfirmed');
+  }
+
+  async #completionMetadata(expectedModel = '', verifiedModelState = null) {
     const conversationUrl = await this.page.getUrl();
     const conversationId = reviewConversationId(conversationUrl);
     let hostname = '';
     try { hostname = new URL(conversationUrl).hostname; } catch {}
     if (hostname === 'chatgpt.com' && !conversationId) throw new Error('conversation_identity_unreadable');
     const expected = String(expectedModel || '').trim();
-    const modelState = expected ? await this.#readExpectedModelState(expected) : null;
+    const modelState = expected && verifiedModelState?.matched && verifiedModelState?.matchedLabel
+      ? verifiedModelState
+      : expected ? await this.#readExpectedModelState(expected) : null;
     if (expected && !modelState?.matched) throw new Error('expected_model_switch_unconfirmed');
     return {
       status: 'COMPLETE',
@@ -1257,6 +1499,9 @@ export class ChatGPTController {
       const serializeReviewUserMessage = ${serializeReviewUserMessage.toString()};
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
       const canonicalizeGeminiReviewMessageNodes = ${canonicalizeGeminiReviewMessageNodes.toString()};
+      const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+      const geminiExpectedModelSpec = ${geminiExpectedModelSpec.toString()};
+      const canonicalizeGeminiModelEvidence = ${canonicalizeGeminiModelEvidence.toString()};
       const visible = (node) => {
         if (!node) return false;
         const rect = node.getBoundingClientRect();
@@ -1323,9 +1568,20 @@ export class ChatGPTController {
             return value && normalizeModel(value) === normalizeModel(expectedModel);
           })
         : [];
-      const geminiModeItems = ${isGeminiLiteral}
-        ? Array.from(document.querySelectorAll('[data-test-id^="bard-mode-option-"], [data-test-id="gem-mode-menu"] [role="menuitem"]'))
+      const geminiTriggerRoots = ${isGeminiLiteral}
+        ? Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible)
         : [];
+      const geminiControlledMenuIds = new Set(geminiTriggerRoots.flatMap((node) =>
+        String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)
+      ));
+      const geminiMenuRoots = ${isGeminiLiteral}
+        ? Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
+          .filter(visible)
+          .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || geminiControlledMenuIds.has(String(node.id || '')))
+        : [];
+      const geminiModeItems = geminiMenuRoots
+        .flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')))
+        .filter(visible);
       const geminiSelected = (node) => !!node && (
         node.getAttribute('data-active') === 'true' ||
         /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
@@ -1338,23 +1594,52 @@ export class ChatGPTController {
       const geminiExactEvidence = geminiSelected(geminiProItem) && geminiSelected(geminiThinkingItem)
         ? 'Gemini 3.1 Pro extended'
         : null;
+      const geminiRecords = geminiModeItems.map((node) => ({
+        label: String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim(),
+        visible: visible(node),
+        scoped: true,
+        selected: geminiSelected(node),
+        source: 'menu'
+      }));
+      for (const root of geminiTriggerRoots) {
+        if (composerRoot && !composerRoot.contains(root) && !root.contains(composerRoot)) continue;
+        const nodes = root.matches('button, [role="button"]') ? [root] : Array.from(root.querySelectorAll('button, [role="button"]'));
+        for (const node of nodes) geminiRecords.push({
+          label: String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim(),
+          visible: visible(node),
+          scoped: true,
+          selected: true,
+          source: 'trigger'
+        });
+      }
+      const geminiCanonicalEvidence = ${isGeminiLiteral}
+        ? canonicalizeGeminiModelEvidence(geminiRecords, expectedModel).matchedLabel
+        : null;
       const modelEvidenceCandidates = deduplicateReviewModelEvidence(
-        [
-          geminiExactEvidence,
-          ...[...semanticModelNodes, ...composerModelNodes]
+        ${isGeminiLiteral}
+          ? [geminiCanonicalEvidence]
+          : [...semanticModelNodes, ...composerModelNodes]
             .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
-        ]
       );
       const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);
       return {
         messages,
-        modelEvidence: geminiExactEvidence || (modelEvidenceCandidates.length === 1 ? modelEvidenceCandidates[0] : null),
+        modelEvidence: geminiCanonicalEvidence || (modelEvidenceCandidates.length === 1 ? modelEvidenceCandidates[0] : null),
         modelEvidenceCandidates,
         controlText,
         selectorStop,
         sendVisible: sendCandidates.length > 0
       };
     })()`);
+    if (
+      isGemini &&
+      dom &&
+      this.currentRun?.verifiedModelEvidence?.expectedModel === String(expectedModel || '') &&
+      this.currentRun.verifiedModelEvidence.matchedLabel
+    ) {
+      dom.modelEvidence = this.currentRun.verifiedModelEvidence.matchedLabel;
+      dom.modelEvidenceCandidates = [this.currentRun.verifiedModelEvidence.matchedLabel];
+    }
     const conversationId = reviewConversationId(url);
     const controls = classifyReviewControls(dom?.controlText, {
       selectorStop: !!dom?.selectorStop,
@@ -1420,7 +1705,7 @@ export class ChatGPTController {
     return result;
   }
 
-  async #waitForReviewUserMessage({ baselineIds, deadline, identity, firstBinding = false }) {
+  async #waitForReviewUserMessage({ baselineIds, deadline, identity, expectedPrompt, firstBinding = false }) {
     let submittedUserMessageId = null;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
@@ -1438,12 +1723,28 @@ export class ChatGPTController {
         (message) => message.role === 'user' && !baselineIds.has(message.id)
       );
       if (newUserMessages.length) {
+        if (newUserMessages.length !== 1) {
+          const error = new Error('review_user_message_identity_ambiguous');
+          error.data = { newUserMessageCount: newUserMessages.length };
+          throw error;
+        }
         submittedUserMessageId ||= newUserMessages.at(-1).id;
         const message = newUserMessages.find((candidate) => candidate.id === submittedUserMessageId);
         if (!message) throw new Error('review_user_message_identity_unreadable');
         if (firstBinding && provisionalChatgptConversationId(snapshot.conversationId)) {
           await sleep(400);
           continue;
+        }
+        if (message.textIdentityReadable === false || message.text !== expectedPrompt) {
+          const error = new Error('review_user_message_content_mismatch');
+          error.data = {
+            newUserMessageCount: 1,
+            readableCandidateCount: message.textIdentityReadable === false ? 0 : 1,
+            exactMatchCount: message.text === expectedPrompt ? 1 : 0,
+            serializedLength: Number.isFinite(message.textLength) ? message.textLength : null,
+            expectedLength: String(expectedPrompt || '').length
+          };
+          throw error;
         }
         return { snapshot, message };
       }
@@ -1722,12 +2023,21 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+      let provider = null;
+      try { provider = new URL(await this.page.getUrl()).hostname; } catch {}
+      if (provider === 'gemini.google.com' && geminiExpectedModelSpec(expectedModel).thinkingMode) {
+        const verifiedModelState = await this.#ensureExpectedModel(expectedModel, Math.min(Math.max(1, deadline - Date.now()), 60_000));
+        run.verifiedModelEvidence = {
+          expectedModel: String(expectedModel || ''),
+          matchedLabel: verifiedModelState?.matchedLabel || null
+        };
+      }
       const before = await this.#waitForReviewIdentity({ ...identity, deadline });
       const active = !!before.controls?.stop || !!before.controls?.continue || !!before.controls?.retry;
       if (active) {
-        const latestUser = [...(before.messages || [])].reverse().find((message) => message.role === 'user' && message.id);
-        if (!latestUser) throw new Error('review_user_message_identity_unreadable');
-        return await this.#waitForReviewAssistant({ userMessageId: latestUser.id, deadline, identity });
+        const error = new Error('review_tab_busy');
+        error.data = { noClickProven: true };
+        throw error;
       }
       const baselineIds = new Set((before.messages || []).map((message) => message.id));
       await onPrepared?.({
@@ -1737,14 +2047,14 @@ export class ChatGPTController {
         conversationId: before.conversationId,
         modelEvidence: before.modelEvidence
       });
-      await this.#typePrompt(prompt, { human: false });
+      await this.#typePrompt(prompt, { human: false, verifyExact: true });
       const clickReceipt = await this.#clickReviewSendOnce();
       await onSendAction?.({
         clickCount: clickReceipt?.clickCount || 0,
         sendActionCount: 1,
         sendActionAt: Date.now()
       });
-      const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity, firstBinding });
+      const submitted = await this.#waitForReviewUserMessage({ baselineIds, deadline, identity, expectedPrompt: prompt, firstBinding });
       const submittedIdentity = {
         expectedUrl: submitted.snapshot.url,
         expectedConversationId: submitted.snapshot.conversationId,
@@ -2000,13 +2310,13 @@ export class ChatGPTController {
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs });
-      await this.#ensureExpectedModel(expectedModel, Math.min(timeoutMs, 60_000));
+      const verifiedModelState = await this.#ensureExpectedModel(expectedModel, Math.min(timeoutMs, 60_000));
       await this.#attachFiles(attachments);
       await this.#typePrompt(prompt, { human: false });
       const baselineAssistantCount = Number(await this.#eval(`(() => document.querySelectorAll(${JSON.stringify(this.selectors.assistantMessage)}).length)()`)) || 0;
       await this.#clickSend();
       const result = await this.#waitForAssistantStable({ timeoutMs: Math.min(timeoutMs, 45 * 60_000), baselineAssistantCount });
-      return { ...result, ...(await this.#completionMetadata(expectedModel)) };
+      return { ...result, ...(await this.#completionMetadata(expectedModel, verifiedModelState)) };
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }

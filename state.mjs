@@ -123,6 +123,7 @@ function normalizeReviewTransportState(value) {
       const controls = operation.controls;
       if (
         operation.sendCount !== 1 ||
+        operation.sendActionCount !== 1 ||
         !operation.userMessageId ||
         !operation.assistantMessageId ||
         operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
