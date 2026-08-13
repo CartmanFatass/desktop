@@ -548,9 +548,6 @@ export class ChatGPTController {
         .some(b => /verify you are human|human verification|i am human/i.test((b.textContent || '').trim()));
 
       const looks403 = new RegExp(${JSON.stringify(BLOCKED_PAGE_TEXT_PATTERN.source)}, 'i').test(bodyText);
-      const loginLike = !!document.querySelector('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]')
-        || /log in|sign in|continue with/i.test(bodyText);
-
       const rawPromptVisible = (() => {
         const pickPrompt = (nodes) => {
           const editable = (n) => {
@@ -604,6 +601,16 @@ export class ChatGPTController {
         return !!pickPrompt(uniq);
       })();
 
+      // Conversation history can legitimately contain authentication language,
+      // and ChatGPT can render dormant account controls beside an authenticated
+      // conversation. Treat either as an access gate only when there is no
+      // usable provider composer; otherwise inspection misclassifies an idle
+      // continuation as a login shell before preflight.
+      const hasVisiblePasswordInput = Array.from(document.querySelectorAll('input[type=\"password\"], input[name=\"password\"], input[autocomplete=\"current-password\"]'))
+        .some(visible);
+      const loginLike = hasVisiblePasswordInput
+        || (!rawPromptVisible && /log in|sign in|continue with/i.test(bodyText));
+
       const sendVisible = (() => {
         const labelOf = (n) =>
           [
@@ -623,7 +630,11 @@ export class ChatGPTController {
           return /send|submit|run|go|ask|reply/.test(label) || n.matches('[data-testid=\"send-button\"], [aria-label=\"Send prompt\"], [aria-label=\"Send\"]');
         });
       })();
-      const promptVisible = rawPromptVisible && (!loginLike || sendVisible);
+      // An empty idle composer can deliberately expose a disabled Send control,
+      // so writable-composer visibility—not an enabled Send button—is the
+      // readiness fact. Strict review validates its unique Send control only
+      // after the frozen prompt has been inserted.
+      const promptVisible = rawPromptVisible;
       const classification = classifyBlockedSignals({
         hasTurnstile, hasArkose, hasVerifyButton, looks403, loginLike, promptVisible
       });
