@@ -1953,6 +1953,19 @@ export class ChatGPTController {
             return value && normalizeModel(value) === normalizeModel(expectedModel);
           })
         : [];
+      // ChatGPT's current composer can expose its selected-model pill outside
+      // the prompt root.  Keep the existing composer-scoped check first, then
+      // accept one visible menu trigger whose complete visible label is the
+      // expected model.  This is selected-model UI evidence, not account-plan
+      // text or a menu availability record.
+      const fallbackModelPickerNodes = expectedModel && composerModelNodes.length === 0
+        ? Array.from(document.querySelectorAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
+          .filter(visible)
+          .filter((node) => {
+            const value = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+            return value && normalizeModel(value) === normalizeModel(expectedModel);
+          })
+        : [];
       const geminiTriggerRoots = ${isGeminiLiteral}
         ? Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible)
         : [];
@@ -1980,7 +1993,7 @@ export class ChatGPTController {
       const modelEvidenceCandidates = deduplicateReviewModelEvidence(
         ${isGeminiLiteral}
           ? [geminiCanonicalEvidence]
-          : [...semanticModelNodes, ...composerModelNodes]
+          : [...semanticModelNodes, ...composerModelNodes, ...fallbackModelPickerNodes]
             .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
       );
       const sendCandidates = Array.from(document.querySelectorAll(${sendSel})).filter(visible);

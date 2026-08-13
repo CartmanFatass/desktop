@@ -169,6 +169,19 @@ function normalizeRequest(input) {
   const conversationUrl = requiredText(request.conversationUrl, 'conversationUrl', { max: 2048 });
   const conversationId = requiredText(request.conversationId, 'conversationId', { max: 256 });
   const firstBinding = request.firstBinding === true;
+  // These fields are part of the persisted v2 operation identity.  Defaulting
+  // omitted legacy callers to false preserves exact-fingerprint observation of
+  // an already submitted operation; it does not authorize a new send.
+  const geminiBootstrap = request.geminiBootstrap === true;
+  const geminiBootstrapContinuation = request.geminiBootstrapContinuation === true;
+  const bootstrapNonScientific = request.bootstrapNonScientific === true;
+  if (geminiBootstrap && (provider !== 'gemini' || !firstBinding || !bootstrapNonScientific || geminiBootstrapContinuation)) {
+    fail('review_invalid_request', { field: 'geminiBootstrap' });
+  }
+  if (model === '__selected__' && !geminiBootstrap) fail('review_invalid_request', { field: 'model' });
+  if (geminiBootstrapContinuation && (provider !== 'gemini' || firstBinding || geminiBootstrap)) {
+    fail('review_invalid_request', { field: 'geminiBootstrapContinuation' });
+  }
   if (firstBinding) {
     const supportedRoot =
       (provider === 'chatgpt' && conversationUrl === 'https://chatgpt.com/') ||
@@ -207,6 +220,9 @@ function normalizeRequest(input) {
     verifyExisting,
     diagnoseExisting,
     firstBinding,
+    geminiBootstrap,
+    geminiBootstrapContinuation,
+    bootstrapNonScientific,
     existingTabId
   };
 }
@@ -222,7 +238,10 @@ function requestFingerprint(request) {
       idempotencyKey: request.idempotencyKey,
       promptSha256: request.promptSha256,
       timeoutMs: request.timeoutMs,
-      firstBinding: request.firstBinding
+      firstBinding: request.firstBinding,
+      geminiBootstrap: request.geminiBootstrap,
+      geminiBootstrapContinuation: request.geminiBootstrapContinuation,
+      bootstrapNonScientific: request.bootstrapNonScientific
     })
   );
 }
