@@ -111,12 +111,41 @@ export function geminiModelLabelMatches(actual, expected) {
   return !!actualLabel && actualLabel === expectedLabel;
 }
 
+export function geminiThinkingLabelMatches(actual) {
+  const label = String(actual || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  return label === 'extended thinking' || label === '\u6269\u5c55\u601d\u8003';
+}
+
+export function geminiMenuItemSelected(node) {
+  return !!node && (
+    /(^|\s)selected(\s|$)/i.test(String(node.className || '')) ||
+    node.getAttribute?.('aria-checked') === 'true' ||
+    node.getAttribute?.('aria-selected') === 'true' ||
+    Array.from(node.querySelectorAll?.('[aria-label]') || [])
+      .some((child) => /selected|\u5df2\u9009\u4e2d/i.test(String(child.getAttribute?.('aria-label') || '')))
+  );
+}
+
+export function geminiMenuItemSemanticLabel(node, visible = () => true) {
+  if (!node) return null;
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const labels = Array.from(node.querySelectorAll?.('.label') || [])
+    .filter((candidate) => visible(candidate))
+    .map((candidate) => normalize(candidate.textContent))
+    .filter(Boolean);
+  const unique = [...new Set(labels)];
+  if (unique.length === 1) return unique[0];
+  if (unique.length > 1) return null;
+  const ariaLabel = normalize(node.getAttribute?.('aria-label'));
+  return ariaLabel || null;
+}
+
 export function canonicalizeGeminiModelEvidence(records, expectedModel) {
   const spec = geminiExpectedModelSpec(expectedModel);
   if (!spec.model) return { matched: false, labels: [], matchedLabel: null, modelLabel: null, thinkingMode: null };
   const accepted = (Array.isArray(records) ? records : [])
     .filter((record) => record?.visible === true && record?.scoped === true)
-    .filter((record) => record?.source === 'trigger' || record?.selected === true)
+    .filter((record) => record?.selected === true)
     .map((record) => ({ ...record, label: String(record.label || '').replace(/\s+/g, ' ').trim() }))
     .filter((record) => record.label);
   const cleanModelLabel = (value) => String(value || '')
@@ -126,7 +155,7 @@ export function canonicalizeGeminiModelEvidence(records, expectedModel) {
     .trim();
   const modelRecord = accepted.find((record) => geminiModelLabelMatches(cleanModelLabel(record.label), spec.model)) || null;
   const thinkingRecord = spec.thinkingMode
-    ? accepted.find((record) => record !== modelRecord && /(?:\bextended\s+thinking\b|\u6269\u5c55\u601d\u8003)/i.test(record.label)) || null
+    ? accepted.find((record) => record !== modelRecord && geminiThinkingLabelMatches(record.label)) || null
     : null;
   const modelLabel = modelRecord ? cleanModelLabel(modelRecord.label) : null;
   const matched = !!modelLabel && (!spec.thinkingMode || !!thinkingRecord);
@@ -1556,6 +1585,9 @@ export class ChatGPTController {
         const agentifyGeminiModelStateMarker = true;
         const modelLabelMatches = ${modelLabelMatches.toString()};
         const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+        const geminiThinkingLabelMatches = ${geminiThinkingLabelMatches.toString()};
+        const geminiMenuItemSelected = ${geminiMenuItemSelected.toString()};
+        const geminiMenuItemSemanticLabel = ${geminiMenuItemSemanticLabel.toString()};
         const geminiExpectedModelSpec = ${geminiExpectedModelSpec.toString()};
         const canonicalizeGeminiModelEvidence = ${canonicalizeGeminiModelEvidence.toString()};
         const visible = (node) => {
@@ -1563,18 +1595,6 @@ export class ChatGPTController {
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const labelOf = (node) => String(
-          node?.textContent || node?.getAttribute?.('aria-label') || ''
-        ).replace(/\s+/g, ' ').trim();
-        const selected = (node) => !!node && (
-          node.getAttribute('data-active') === 'true' ||
-          /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
-          node.getAttribute('aria-checked') === 'true' ||
-          node.getAttribute('aria-selected') === 'true' ||
-          Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|\u5df2\u9009\u4e2d/i.test(String(child.getAttribute('aria-label') || '')))
-        );
-        const prompt = document.querySelector(${JSON.stringify(this.selectors.promptTextarea)});
-        const composer = prompt?.closest?.('form') || prompt?.parentElement?.parentElement?.parentElement || null;
         const triggerRoots = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
         const controlledMenuIds = new Set(triggerRoots.flatMap((node) =>
           String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)
@@ -1584,14 +1604,15 @@ export class ChatGPTController {
           .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
           .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
         const records = [];
-        for (const root of triggerRoots) {
-          if (composer && !composer.contains(root) && !root.contains(composer)) continue;
-          const nodes = root.matches('button, [role="button"]') ? [root] : Array.from(root.querySelectorAll('button, [role="button"]'));
-          for (const node of nodes) records.push({ label: labelOf(node), visible: visible(node), scoped: true, selected: true, source: 'trigger' });
-        }
         for (const root of menuRoots) {
           for (const node of root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')) {
-            records.push({ label: labelOf(node), visible: visible(node), scoped: true, selected: selected(node), source: 'menu' });
+            records.push({
+              label: geminiMenuItemSemanticLabel(node, visible),
+              visible: visible(node),
+              scoped: true,
+              selected: geminiMenuItemSelected(node),
+              source: 'menu'
+            });
           }
         }
         return canonicalizeGeminiModelEvidence(records, ${JSON.stringify(expected)});
@@ -1723,19 +1744,14 @@ export class ChatGPTController {
         last = await this.#eval(`(() => {
           const agentifyGeminiChooseModelPartMarker = true;
           const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+          const geminiThinkingLabelMatches = ${geminiThinkingLabelMatches.toString()};
+          const geminiMenuItemSelected = ${geminiMenuItemSelected.toString()};
+          const geminiMenuItemSemanticLabel = ${geminiMenuItemSemanticLabel.toString()};
           const visible = (node) => {
             const rect = node?.getBoundingClientRect?.();
             const style = node ? window.getComputedStyle(node) : null;
             return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
           };
-          const labelOf = (node) => String(node?.textContent || node?.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim();
-          const selected = (node) => !!node && (
-            node.getAttribute('data-active') === 'true' ||
-            /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
-            node.getAttribute('aria-checked') === 'true' ||
-            node.getAttribute('aria-selected') === 'true' ||
-            Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|\u5df2\u9009\u4e2d/i.test(String(child.getAttribute('aria-label') || '')))
-          );
           const triggers = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
           const controlledMenuIds = new Set(triggers.flatMap((node) => String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)));
           const roots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
@@ -1743,16 +1759,16 @@ export class ChatGPTController {
             .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
             .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
           const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')).filter(visible));
-          const labels = candidates.map(labelOf).filter(Boolean);
+          const labels = candidates.map((node) => geminiMenuItemSemanticLabel(node, visible)).filter(Boolean);
           const target = candidates.find((node) => {
-            const label = labelOf(node);
+            const label = geminiMenuItemSemanticLabel(node, visible);
             return ${JSON.stringify(targetKind)} === 'thinking'
-              ? /(?:^|\s)(?:Extended thinking|\u6269\u5c55\u601d\u8003)(?:\s|$)/i.test(label)
+              ? geminiThinkingLabelMatches(label)
               : geminiModelLabelMatches(label, ${JSON.stringify(targetLabel)});
           }) || null;
           if (!target) return { ok: false, error: 'expected_model_unavailable', labels };
           const rect = target.getBoundingClientRect();
-          return { ok: true, alreadySelected: selected(target), labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+          return { ok: true, alreadySelected: geminiMenuItemSelected(target), labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
         })()`);
         if (last?.ok) {
           if (!last.alreadySelected) {
@@ -1866,6 +1882,9 @@ export class ChatGPTController {
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
       const canonicalizeGeminiReviewMessageNodes = ${canonicalizeGeminiReviewMessageNodes.toString()};
       const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+      const geminiThinkingLabelMatches = ${geminiThinkingLabelMatches.toString()};
+      const geminiMenuItemSelected = ${geminiMenuItemSelected.toString()};
+      const geminiMenuItemSemanticLabel = ${geminiMenuItemSemanticLabel.toString()};
       const geminiExpectedModelSpec = ${geminiExpectedModelSpec.toString()};
       const canonicalizeGeminiModelEvidence = ${canonicalizeGeminiModelEvidence.toString()};
       const visible = (node) => {
@@ -1948,36 +1967,13 @@ export class ChatGPTController {
       const geminiModeItems = geminiMenuRoots
         .flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')))
         .filter(visible);
-      const geminiSelected = (node) => !!node && (
-        node.getAttribute('data-active') === 'true' ||
-        /(^|\s)(active|selected)(\s|$)/i.test(String(node.className || '')) ||
-        node.getAttribute('aria-checked') === 'true' ||
-        node.getAttribute('aria-selected') === 'true' ||
-        Array.from(node.querySelectorAll('[aria-label]')).some((child) => /selected|已选中/i.test(String(child.getAttribute('aria-label') || '')))
-      );
-      const geminiProItem = geminiModeItems.find((node) => /^3\.1 Pro(?:\s|$)/i.test(String(node.textContent || '').replace(/\s+/g, ' ').trim()));
-      const geminiThinkingItem = geminiModeItems.find((node) => /^(Extended thinking|扩展思考)(?:\s|$)/i.test(String(node.textContent || '').replace(/\s+/g, ' ').trim()));
-      const geminiExactEvidence = geminiSelected(geminiProItem) && geminiSelected(geminiThinkingItem)
-        ? 'Gemini 3.1 Pro extended'
-        : null;
       const geminiRecords = geminiModeItems.map((node) => ({
-        label: String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim(),
+        label: geminiMenuItemSemanticLabel(node, visible),
         visible: visible(node),
         scoped: true,
-        selected: geminiSelected(node),
+        selected: geminiMenuItemSelected(node),
         source: 'menu'
       }));
-      for (const root of geminiTriggerRoots) {
-        if (composerRoot && !composerRoot.contains(root) && !root.contains(composerRoot)) continue;
-        const nodes = root.matches('button, [role="button"]') ? [root] : Array.from(root.querySelectorAll('button, [role="button"]'));
-        for (const node of nodes) geminiRecords.push({
-          label: String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim(),
-          visible: visible(node),
-          scoped: true,
-          selected: true,
-          source: 'trigger'
-        });
-      }
       const geminiCanonicalEvidence = ${isGeminiLiteral}
         ? canonicalizeGeminiModelEvidence(geminiRecords, expectedModel).matchedLabel
         : null;

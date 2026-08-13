@@ -11,6 +11,8 @@ import {
   classifyReviewControls,
   deduplicateReviewModelEvidence,
   looksLikeBlockedPage,
+  geminiMenuItemSelected,
+  geminiMenuItemSemanticLabel,
   modelLabelMatches,
   serializeReviewComposer,
   serializeReviewUserMessage,
@@ -200,7 +202,7 @@ test('chatgpt-controller: Gemini canonical model evidence requires two visible s
   const expected = 'Gemini 3.1 Pro extended';
   const valid = canonicalizeGeminiModelEvidence([
     { label: '3.1 Pro', visible: true, scoped: true, selected: true, source: 'menu' },
-    { label: 'Extended thinking', visible: true, scoped: true, selected: true, source: 'menu' }
+    { label: '扩展思考', visible: true, scoped: true, selected: true, source: 'menu' }
   ], expected);
   assert.equal(valid.matched, true);
   assert.equal(valid.matchedLabel, expected);
@@ -220,10 +222,68 @@ test('chatgpt-controller: Gemini canonical model evidence requires two visible s
       { label: 'Pro', visible: true, scoped: true, selected: true, source: 'menu' },
       { label: 'Extended thinking', visible: true, scoped: true, selected: true, source: 'menu' }
     ],
+    [
+      { label: '3.1 Pro', visible: true, scoped: true, selected: false, dataActive: true, source: 'menu' },
+      { label: 'Extended thinking', visible: true, scoped: true, selected: false, dataActive: true, source: 'menu' }
+    ],
     [{ label: expected, visible: true, scoped: true, selected: true, source: 'trigger' }]
   ]) {
     assert.equal(canonicalizeGeminiModelEvidence(invalid, expected).matched, false);
   }
+});
+
+test('chatgpt-controller: Gemini menu evidence uses the visible semantic label and not description or focus state', () => {
+  const labelNode = (textContent, isVisible = true) => ({ textContent, isVisible });
+  const menuItem = ({
+    textContent = '',
+    className = '',
+    dataActive = null,
+    ariaLabel = null,
+    semanticLabels = [],
+    descendantAriaLabels = []
+  } = {}) => ({
+    textContent,
+    className,
+    getAttribute(name) {
+      if (name === 'data-active') return dataActive;
+      if (name === 'aria-label') return ariaLabel;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === '.label') return semanticLabels;
+      if (selector === '[aria-label]') {
+        return descendantAriaLabels.map((value) => ({ getAttribute: () => value }));
+      }
+      return [];
+    }
+  });
+  const visible = (node) => node.isVisible !== false;
+  const selectedModel = menuItem({
+    textContent: '3.1 Pro 高阶数学与代码',
+    className: 'selected ng-star-inserted',
+    semanticLabels: [labelNode('3.1 Pro')]
+  });
+  const focusedFlash = menuItem({
+    textContent: '3.5 Flash-Lite 极速回答 新',
+    className: 'active',
+    dataActive: 'true',
+    semanticLabels: [labelNode('3.5 Flash-Lite')]
+  });
+  assert.equal(geminiMenuItemSemanticLabel(selectedModel, visible), '3.1 Pro');
+  assert.equal(geminiMenuItemSelected(selectedModel), true);
+  assert.equal(geminiMenuItemSelected(focusedFlash), false);
+  assert.equal(geminiMenuItemSemanticLabel(menuItem({
+    semanticLabels: [labelNode('3.1 Pro'), labelNode('spoof')]
+  }), visible), null);
+  assert.equal(geminiMenuItemSemanticLabel(menuItem({
+    ariaLabel: '3.1 Pro',
+    semanticLabels: [labelNode('hidden', false)]
+  }), visible), '3.1 Pro');
+  assert.equal(geminiMenuItemSelected(menuItem({ descendantAriaLabels: ['已选中'] })), true);
+  assert.equal(canonicalizeGeminiModelEvidence([
+    { label: selectedModel.textContent, visible: true, scoped: true, selected: true, source: 'menu' },
+    { label: '扩展思考 擅长解决复杂问题', visible: true, scoped: true, selected: true, source: 'menu' }
+  ], 'Gemini 3.1 Pro extended').matched, false);
 });
 
 test('chatgpt-controller: structural composer serialization preserves exact multiline plain text', () => {
@@ -1534,6 +1594,9 @@ test('chatgpt-controller: Gemini strict preflight selects model and Extended thi
         };
       }
       if (js.includes('agentifyGeminiChooseModelPartMarker')) {
+        assert.match(js, /geminiMenuItemSemanticLabel/);
+        assert.match(js, /geminiMenuItemSelected/);
+        assert.doesNotMatch(js, /getAttribute\('data-active'\)/);
         pendingSelection = js.includes('"thinking" === \'thinking\'') ? 'thinking' : 'model';
         return { ok: true, labels: ['3.1 Pro', 'Extended thinking'], rect: { x: 10, y: 10, w: 20, h: 20 } };
       }
