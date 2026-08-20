@@ -2545,6 +2545,15 @@ export class ChatGPTController {
         throw error;
       }
       const baselineIds = new Set((before.messages || []).map((message) => message.id));
+      if (!firstBinding && baselineIds.size === 0) {
+        const error = new Error('review_continuation_baseline_empty');
+        error.data = {
+          noClickProven: true,
+          failureStage: 'before_composer_write',
+          baselineMessageCount: 0
+        };
+        throw error;
+      }
       await onPrepared?.({
         baselineMessageIds: [...baselineIds],
         preparedAt: Date.now(),

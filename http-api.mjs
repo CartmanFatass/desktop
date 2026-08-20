@@ -104,6 +104,7 @@ export function mapErrorToHttp(error) {
       'review_control_activation_forbidden',
       'review_send_control_ambiguous',
       'review_composer_identity_mismatch',
+      'review_continuation_baseline_empty',
       'review_tab_busy',
       'key_url_mismatch'
     ].includes(msg)

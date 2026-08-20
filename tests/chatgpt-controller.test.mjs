@@ -537,9 +537,10 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: clicked ? [
-            { order: 0, role: 'user', id: 'draft-user', text: prompt, textIdentityReadable: true },
-            { order: 1, role: 'assistant', id: 'draft-assistant', text: 'DONE' }
-          ] : [],
+            { order: 0, role: 'user', id: 'draft-history', text: 'history', textIdentityReadable: true },
+            { order: 1, role: 'user', id: 'draft-user', text: prompt, textIdentityReadable: true },
+            { order: 2, role: 'assistant', id: 'draft-assistant', text: 'DONE' }
+          ] : [{ order: 0, role: 'user', id: 'draft-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [], selectorStop: false, sendVisible: true
         };
@@ -591,7 +592,7 @@ test('chatgpt-controller: asynchronously rehydrated draft fails before prompt in
       if (composerResult) return composerResult;
       if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
       if (js.includes('reviewSnapshotMarker')) return {
-        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        messages: [{ order: 0, role: 'user', id: 'draft-rehydrate-history', text: 'history', textIdentityReadable: true }], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true
       };
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
@@ -636,7 +637,7 @@ test('chatgpt-controller: failed contenteditable caret binding fails before prom
       if (composerResult) return composerResult;
       if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
       if (js.includes('reviewSnapshotMarker')) return {
-        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        messages: [{ order: 0, role: 'user', id: 'caret-fail-history', text: 'history', textIdentityReadable: true }], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true
       };
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
@@ -693,7 +694,7 @@ test('chatgpt-controller: click-time composer mutation is rejected atomically wi
         return { ok: true, clickCount: 1 };
       }
       if (js.includes('reviewSnapshotMarker')) return {
-        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        messages: [{ order: 0, role: 'user', id: 'click-time-history', text: 'history', textIdentityReadable: true }], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true
       };
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
@@ -758,9 +759,10 @@ test('chatgpt-controller: click-time reversible NBSP receipt performs exactly on
       }
       if (js.includes('reviewSnapshotMarker')) return {
         messages: clicked ? [
-          { order: 0, role: 'user', id: 'nbsp-user', text: browserPrompt, textIdentityReadable: true },
-          { order: 1, role: 'assistant', id: 'nbsp-assistant', text: 'DONE' }
-        ] : [],
+          { order: 0, role: 'user', id: 'nbsp-history', text: 'history', textIdentityReadable: true },
+          { order: 1, role: 'user', id: 'nbsp-user', text: browserPrompt, textIdentityReadable: true },
+          { order: 2, role: 'assistant', id: 'nbsp-assistant', text: 'DONE' }
+        ] : [{ order: 0, role: 'user', id: 'nbsp-history', text: 'history', textIdentityReadable: true }],
         modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true
       };
@@ -1427,6 +1429,58 @@ test('chatgpt-controller: strict review submits with one send control and return
   assert.equal(result.controls.answerNow, false);
 });
 
+test('chatgpt-controller: continuation with an empty baseline fails before composer write', async () => {
+  const url = 'https://chatgpt.com/c/empty-baseline';
+  let inserted = 0;
+  let strictClicks = 0;
+  let prepared = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: [],
+          modelEvidence: 'GPT-5.6 Pro',
+          modelEvidenceCandidates: ['GPT-5.6 Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: true
+        };
+      }
+      if (js.includes('reviewSendOnceMarker')) {
+        strictClicks += 1;
+        return { ok: true, clickCount: 1, label: 'Send prompt' };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { inserted += 1; },
+    async sendKey() {},
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {},
+    async setFileInputFiles() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt: 'must not reach the composer',
+      expectedUrl: url,
+      expectedConversationId: 'empty-baseline',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 5_000,
+      onPrepared: async () => { prepared += 1; }
+    }),
+    (error) =>
+      error?.message === 'review_continuation_baseline_empty' &&
+      error?.data?.noClickProven === true &&
+      error?.data?.failureStage === 'before_composer_write'
+  );
+  assert.equal(prepared, 0);
+  assert.equal(inserted, 0);
+  assert.equal(strictClicks, 0);
+});
+
 test('chatgpt-controller: first binding pastes once and follows the created ChatGPT conversation', async () => {
   const prompt = 'raw scientific question';
   let currentUrl = 'https://chatgpt.com/';
@@ -1538,9 +1592,10 @@ test('chatgpt-controller: Gemini strict review inserts once and completes on the
         assert.equal(js.includes('model-response'), true);
         return {
           messages: strictClicks ? [
-            { order: 0, role: 'user', id: 'user:0', text: prompt },
-            { order: 1, role: 'assistant', id: 'assistant:1', text: 'GEMINI_OK' }
-          ] : [],
+            { order: 0, role: 'user', id: 'gemini-strict-history', text: 'history', textIdentityReadable: true },
+            { order: 1, role: 'user', id: 'user:0', text: prompt },
+            { order: 2, role: 'assistant', id: 'assistant:1', text: 'GEMINI_OK' }
+          ] : [{ order: 0, role: 'user', id: 'gemini-strict-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'Gemini 2.5 Pro',
           modelEvidenceCandidates: ['Gemini 2.5 Pro'],
           controlText: [],
@@ -1611,9 +1666,10 @@ test('chatgpt-controller: Gemini strict preflight selects model and Extended thi
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: strictClicks ? [
-            { order: 0, role: 'user', id: 'gemini-composite-user', text: prompt, textIdentityReadable: true },
-            { order: 1, role: 'assistant', id: 'gemini-composite-assistant', text: 'DONE' }
-          ] : [],
+            { order: 0, role: 'user', id: 'gemini-composite-history', text: 'history', textIdentityReadable: true },
+            { order: 1, role: 'user', id: 'gemini-composite-user', text: prompt, textIdentityReadable: true },
+            { order: 2, role: 'assistant', id: 'gemini-composite-assistant', text: 'DONE' }
+          ] : [{ order: 0, role: 'user', id: 'gemini-composite-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: expectedModel,
           modelEvidenceCandidates: [expectedModel],
           controlText: [], selectorStop: false, sendVisible: true
@@ -1674,9 +1730,10 @@ test('chatgpt-controller: strict review accepts structural exactness when browse
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: strictClicks ? [
-            { order: 0, role: 'user', id: 'user-structural', text: prompt },
-            { order: 1, role: 'assistant', id: 'assistant-structural', text: 'OK' }
-          ] : [],
+            { order: 0, role: 'user', id: 'structural-history', text: 'history', textIdentityReadable: true },
+            { order: 1, role: 'user', id: 'user-structural', text: prompt },
+            { order: 2, role: 'assistant', id: 'assistant-structural', text: 'OK' }
+          ] : [{ order: 0, role: 'user', id: 'structural-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [],
@@ -1727,9 +1784,10 @@ test('chatgpt-controller: strict review rejects a non-exact composer before its 
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: strictClicks ? [
-            { order: 0, role: 'user', id: 'user-mismatch', text: 'Pasted_text.txt' },
-            { order: 1, role: 'assistant', id: 'assistant-mismatch', text: 'OK' }
-          ] : [],
+            { order: 0, role: 'user', id: 'mismatch-history', text: 'history', textIdentityReadable: true },
+            { order: 1, role: 'user', id: 'user-mismatch', text: 'Pasted_text.txt' },
+            { order: 2, role: 'assistant', id: 'assistant-mismatch', text: 'OK' }
+          ] : [{ order: 0, role: 'user', id: 'mismatch-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [],
@@ -1791,13 +1849,15 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: strictClicks ? [{
-            order: 0,
+            order: 0, role: 'user', id: 'rendered-mismatch-history', text: 'history', textIdentityReadable: true
+          }, {
+            order: 1,
             role: 'user',
             id: 'rendered-mismatch-user',
             text: 'Pasted_text.txt',
             textLength: 15,
             textIdentityReadable: true
-          }] : [],
+          }] : [{ order: 0, role: 'user', id: 'rendered-mismatch-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [], selectorStop: false, sendVisible: true
@@ -1939,7 +1999,7 @@ test('chatgpt-controller: ambiguous send control fails before a click', async ()
       }
       if (js.includes('reviewSnapshotMarker')) {
         return {
-          messages: [],
+          messages: [{ order: 0, role: 'user', id: 'send-control-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [],
@@ -2001,7 +2061,9 @@ test('chatgpt-controller: post-send unreadable rendered user content is ambiguou
       if (js.includes('reviewSnapshotMarker')) {
         return {
           messages: strictClicks ? [{
-            order: 0,
+            order: 0, role: 'user', id: 'rendered-history', text: 'history', textIdentityReadable: true
+          }, {
+            order: 1,
             role: 'user',
             id: 'user-rendered',
             text: null,
@@ -2023,7 +2085,7 @@ test('chatgpt-controller: post-send unreadable rendered user content is ambiguou
             role: 'assistant',
             id: 'assistant-rendered',
             text: 'SMOKE_OK'
-          }] : [],
+          }] : [{ order: 0, role: 'user', id: 'rendered-history', text: 'history', textIdentityReadable: true }],
           modelEvidence: 'GPT-5.6 Pro',
           modelEvidenceCandidates: ['GPT-5.6 Pro'],
           controlText: [],
@@ -2075,7 +2137,7 @@ test('chatgpt-controller: click with no visible new user turn has a distinct ter
         return { ok: true, clickCount: 1, label: 'Send prompt' };
       }
       if (js.includes('reviewSnapshotMarker')) return {
-        messages: [],
+        messages: [{ order: 0, role: 'user', id: 'no-turn-history', text: 'history', textIdentityReadable: true }],
         modelEvidence: 'GPT-5.6 Pro',
         modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true

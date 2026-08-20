@@ -98,7 +98,7 @@ export function sanitizeReviewErrorData(value) {
     'serializedLength', 'expectedLength', 'candidateCount', 'elementCount',
     'textNodeCount', 'otherNodeCount', 'maxDepth', 'exactMatchCount',
     'readableCandidateCount', 'renderedContentCandidateCount',
-    'newUserMessageCount', 'sendActionCount', 'expectedRawLength',
+    'newUserMessageCount', 'sendActionCount', 'baselineMessageCount', 'expectedRawLength',
     'expectedCanonicalLength', 'observedRawLength', 'observedCanonicalLength',
     'browserSpaceRebalanceCount', 'mismatchCount', 'firstMismatchCodePointIndex',
     'initialSerializedLength', 'emptySnapshotCount', 'promptInsertCount',
@@ -707,6 +707,13 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       : null;
     if (!baselineMessageIds) fail('review_submission_baseline_missing');
     if (new Set(baselineMessageIds).size !== baselineMessageIds.length) fail('review_submission_baseline_invalid');
+    if (!request.firstBinding && baselineMessageIds.length === 0) {
+      fail('review_continuation_baseline_empty', {
+        noClickProven: true,
+        failureStage: 'before_composer_write',
+        baselineMessageCount: 0
+      });
+    }
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
@@ -883,7 +890,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         op.sendActionCount === 0 &&
         !op.userMessageId &&
         (op.status === 'PREPARED' || !op.sendIntentAt || safeErrorData?.noClickProven === true);
-      op.failureStage = preSendFailure ? 'before_send_click' : 'send_occurred_or_uncertain';
+      const preComposerWriteFailure =
+        preSendFailure &&
+        !request.firstBinding &&
+        String(error?.message || error) === 'review_continuation_baseline_empty' &&
+        safeErrorData?.noClickProven === true &&
+        safeErrorData?.failureStage === 'before_composer_write';
+      op.failureStage = preSendFailure
+        ? preComposerWriteFailure ? 'before_composer_write' : 'before_send_click'
+        : 'send_occurred_or_uncertain';
       op.status = 'BLOCKED';
       op.terminalState = preSendFailure ? 'IDENTITY_UNREADABLE' : 'SUBMITTED_UNVERIFIED';
       op.error = String(error?.message || error);

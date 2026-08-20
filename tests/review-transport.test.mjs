@@ -829,7 +829,7 @@ test('review transport: composer replacement receipt is mandatory before strict 
   const originalReviewQuery = f.tabs.getControllerById().reviewQuery;
   f.tabs.getControllerById().reviewQuery = async (args) => {
     await args.onPrepared({
-      baselineMessageIds: [], preparedAt: 50,
+      baselineMessageIds: ['historical-user-1'], preparedAt: 50,
       conversationUrl: args.expectedUrl,
       conversationId: args.expectedConversationId,
       modelEvidence: 'GPT-5.6 Pro'
@@ -853,6 +853,41 @@ test('review transport: composer replacement receipt is mandatory before strict 
   assert.equal(operation.sendActionCount, 0);
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.failureStage, 'before_send_click');
+});
+
+test('review transport: an empty continuation baseline fails before composer write without a send', async () => {
+  const f = await fixture();
+  let composerVerified = 0;
+  let sendAction = 0;
+  f.tabs.getControllerById().reviewQuery = async (args) => {
+    await args.onPrepared({
+      baselineMessageIds: [],
+      preparedAt: 50,
+      conversationUrl: args.expectedUrl,
+      conversationId: args.expectedConversationId,
+      modelEvidence: 'GPT-5.6 Pro'
+    });
+    composerVerified += 1;
+    await args.onComposerVerified({});
+    sendAction += 1;
+    await args.onSendAction({});
+  };
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_continuation_baseline_empty/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  assert.equal(composerVerified, 0);
+  assert.equal(sendAction, 0);
+  assert.equal(operation.status, 'BLOCKED');
+  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
+  assert.equal(operation.failureStage, 'before_composer_write');
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.userMessageId, undefined);
+  assert.equal(operation.errorData.noClickProven, true);
+  assert.equal(operation.errorData.baselineMessageCount, 0);
 });
 
 test('review transport: admission distinguishes a fresh send from exact existing observation', async () => {

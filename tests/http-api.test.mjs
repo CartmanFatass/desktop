@@ -16,7 +16,67 @@ import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacemen
 test('http-api: strict pre-send busy and post-send identity ambiguity are conflicts', () => {
   assert.equal(mapErrorToHttp(new Error('review_tab_busy')).code, 409);
   assert.equal(mapErrorToHttp(new Error('review_composer_identity_mismatch')).code, 409);
+  assert.equal(mapErrorToHttp(new Error('review_continuation_baseline_empty')).code, 409);
   assert.equal(mapErrorToHttp(new Error('review_user_message_content_mismatch')).code, 409);
+});
+
+test('http-api: an empty continuation baseline is an explicit no-send conflict', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-empty-baseline-'));
+  let composerWrites = 0;
+  const controller = {
+    async reviewQuery(args) {
+      await args.onPrepared({
+        baselineMessageIds: [],
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      composerWrites += 1;
+    }
+  };
+  const tabs = {
+    ensureTab: async () => 'review-tab',
+    getControllerById: () => controller,
+    listTabs: () => []
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-empty-baseline',
+    stateDir,
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const prompt = 'Do not write this continuation prompt.';
+  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/review-query',
+    body: {
+      stableKey: 'empty-baseline-continuation',
+      provider: 'chatgpt',
+      model: 'GPT-5.6 Pro',
+      conversationUrl: 'https://chatgpt.com/c/empty-baseline',
+      conversationId: 'empty-baseline',
+      idempotencyKey: 'empty-baseline-continuation-op',
+      prompt,
+      promptSha256,
+      timeoutMs: 60_000,
+      firstBinding: false
+    }
+  });
+  assert.equal(res.status, 409);
+  assert.equal(data.error, 'review_continuation_baseline_empty');
+  assert.equal(composerWrites, 0);
+  const operation = (await readReviewTransportState(stateDir)).operations['empty-baseline-continuation-op'];
+  assert.equal(operation.failureStage, 'before_composer_write');
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.userMessageId, undefined);
 });
 
 async function req({ port, token, method, pth, body, headers = {} }) {
@@ -86,7 +146,7 @@ test('http-api: strict review query returns a durable receipt and does not dupli
     async reviewQuery(args) {
       sends += 1;
       await args.onPrepared({
-        baselineMessageIds: [],
+        baselineMessageIds: ['historical-user-1'],
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
@@ -2872,7 +2932,7 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
   const strictController = {
     runExclusive: async (fn) => await fn(),
     reviewQuery: async (args) => {
-      await args.onPrepared({ baselineMessageIds: [], conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
+      await args.onPrepared({ baselineMessageIds: ['historical-user-1'], conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
       await args.onComposerVerified?.({
         ok: true,
         textModel: REVIEW_PLAIN_TEXT_MODEL,
