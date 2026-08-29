@@ -470,6 +470,7 @@ const CHATGPT_MODEL_ROUTES = new Set([
   'semantic_model_switcher',
   'controlled_reasoning_menu'
 ]);
+const CHATGPT_PRODUCT_MODEL_ROUTES = new Set(['semantic_model_switcher']);
 
 function exactModelLabelMatches(actual, expected) {
   const normalize = (value) => String(value || '')
@@ -481,13 +482,31 @@ function exactModelLabelMatches(actual, expected) {
   return !!actualLabel && actualLabel === normalize(expected);
 }
 
+function chatgptVisibleModelLabel(expectedModel) {
+  const requested = String(expectedModel || '').replace(/\s+/g, ' ').trim();
+  const token = requested.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return token === 'gpt56pro' || token === 'gpt56solpro' ? 'Pro' : requested;
+}
+
+function isChatgptProductModelAlias(expectedModel) {
+  const requested = String(expectedModel || '').replace(/\s+/g, ' ').trim();
+  const token = requested.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return token === 'gpt56pro' || token === 'gpt56solpro';
+}
+
 function requireChatgptModelSelection(value, expectedModel) {
   const selection = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  const allowedRoutes = isChatgptProductModelAlias(expectedModel)
+    ? CHATGPT_PRODUCT_MODEL_ROUTES
+    : CHATGPT_MODEL_ROUTES;
   if (
     !selection ||
     !exactModelLabelMatches(selection.expectedModel, expectedModel) ||
-    !exactModelLabelMatches(selection.matchedLabel, expectedModel) ||
-    !CHATGPT_MODEL_ROUTES.has(selection.routeEvidence) ||
+    !(
+      exactModelLabelMatches(selection.matchedLabel, expectedModel) ||
+      exactModelLabelMatches(selection.matchedLabel, chatgptVisibleModelLabel(expectedModel))
+    ) ||
+    !allowedRoutes.has(selection.routeEvidence) ||
     selection.scopedMatchCount !== 1
   ) {
     fail('review_send_model_receipt_invalid');
@@ -832,7 +851,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
         state.bindings[request.stableKey] = {
           stableKey: request.stableKey,
           provider: request.provider,
-          model: op.modelEvidence || request.model,
+          model: request.provider === 'chatgpt' ? request.model : op.modelEvidence || request.model,
           conversationUrl: submittedUrl,
           conversationId: submittedId,
           createdAt: now,
@@ -1323,6 +1342,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
         completedAt: Date.now(),
         updatedAt: Date.now()
       });
+      if (request.provider === 'chatgpt' && op.causalSendReceipt?.modelSelection?.matchedLabel) {
+        op.modelEvidence = op.causalSendReceipt.modelSelection.matchedLabel;
+      }
       delete op.error;
       delete op.errorData;
       delete op.failureStage;

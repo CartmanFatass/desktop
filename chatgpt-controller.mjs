@@ -84,6 +84,34 @@ export function modelLabelMatches(actual, expected) {
   return !!actualLabel && actualLabel === expectedLabel;
 }
 
+export function chatgptProductModelAlias(expectedModel) {
+  const requestedModel = String(expectedModel || '').replace(/\s+/g, ' ').trim();
+  const token = requestedModel.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  return token === 'gpt56pro' || token === 'gpt56solpro';
+}
+
+export function chatgptExpectedModelSpec(expectedModel) {
+  const requestedModel = String(expectedModel || '').replace(/\s+/g, ' ').trim();
+  if (chatgptProductModelAlias(requestedModel)) {
+    return {
+      requestedModel,
+      visibleLabel: 'Pro',
+      canonicalProductModel: 'GPT-5.6 Sol Pro'
+    };
+  }
+  return {
+    requestedModel,
+    visibleLabel: requestedModel,
+    canonicalProductModel: requestedModel
+  };
+}
+
+export function chatgptModelLabelMatches(actual, expectedModel) {
+  const spec = chatgptExpectedModelSpec(expectedModel);
+  return modelLabelMatches(actual, spec.requestedModel) ||
+    modelLabelMatches(actual, spec.visibleLabel);
+}
+
 export function geminiExpectedModelSpec(expectedModel) {
   const original = String(expectedModel || '').replace(/\s+/g, ' ').trim();
   const hasExtendedThinking = /(?:\bextended(?:\s+thinking)?\b|\u6269\u5c55\u601d\u8003|\ud655\uc7a5)/i.test(original);
@@ -1828,13 +1856,16 @@ export class ChatGPTController {
         return canonicalizeGeminiModelEvidence(records, ${JSON.stringify(expected)});
       })()`);
     }
+    const expectedSpec = chatgptExpectedModelSpec(expected);
+    const visibleExpected = expectedSpec.visibleLabel;
+    const productModelRequest = chatgptProductModelAlias(expected);
     // ChatGPT exposes provider-model identity and an optional High/Pro
     // reasoning-strength axis as different controls. The exact caller value
     // decides which surface is relevant; a full model label never creates an
     // implicit requirement to inspect or change the reasoning-strength axis.
     const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
     const promptSelector = this.selectors.promptTextarea || '#prompt-textarea';
-    return await this.#eval(`(() => {
+    const state = await this.#eval(`(() => {
       const agentifyModelStateMarker = true;
       const agentifyReasoningControlScopeMarker = true;
       const modelLabelMatches = ${modelLabelMatches.toString()};
@@ -1843,11 +1874,12 @@ export class ChatGPTController {
         const style = node ? window.getComputedStyle(node) : null;
         return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
       };
-      const expected = ${JSON.stringify(expected)};
+      const expected = ${JSON.stringify(visibleExpected)};
+      const productModelRequest = ${JSON.stringify(productModelRequest)};
       const promptNode = document.querySelector(${JSON.stringify(promptSelector)});
       const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
       const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
-      const expectsReasoningStrength = /^(?:high|pro)$/i.test(expected);
+      const expectsReasoningStrength = !productModelRequest && /^(?:high|pro)$/i.test(expected);
       if (!expectsReasoningStrength) {
         const exactModelControls = Array.from(document.querySelectorAll('button, [role="button"]'))
           .filter(visible)
@@ -1858,7 +1890,7 @@ export class ChatGPTController {
             const aria = String(node.getAttribute('aria-label') || '');
             const route = testId === 'model-switcher-dropdown-button' || /model/i.test(aria)
               ? 'semantic_model_switcher'
-              : composerRoot?.contains?.(node) && /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || ''))
+              : !productModelRequest && composerRoot?.contains?.(node) && /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || ''))
                 ? 'composer_model_control'
                 : null;
             return { label, route };
@@ -1901,6 +1933,11 @@ export class ChatGPTController {
         scopedMatchCount: matched.length
       };
     })()`);
+    return {
+      ...state,
+      requestedModel: expectedSpec.requestedModel,
+      canonicalProductModel: expectedSpec.canonicalProductModel
+    };
   }
 
   async #ensureExpectedModel(expectedModel, timeoutMs = 20_000) {
@@ -1909,7 +1946,10 @@ export class ChatGPTController {
     let isGemini = false;
     try { isGemini = new URL(await this.page.getUrl()).hostname === 'gemini.google.com'; } catch {}
     if (isGemini) return await this.#ensureGeminiExpectedModel(expected, timeoutMs);
-    const expectsReasoningStrength = /^(?:high|pro)$/i.test(expected);
+    const expectedSpec = chatgptExpectedModelSpec(expected);
+    const visibleExpected = expectedSpec.visibleLabel;
+    const productModelRequest = chatgptProductModelAlias(expected);
+    const expectsReasoningStrength = !productModelRequest && /^(?:high|pro)$/i.test(visibleExpected);
     const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
     const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
     let state = null;
@@ -1925,7 +1965,11 @@ export class ChatGPTController {
       };
       if (!expectsReasoningStrength) {
         const error = new Error('expected_model_unavailable');
-        error.data = { expectedModel: expected, availableModels: state?.labels || [] };
+        error.data = {
+          expectedModel: expected,
+          expectedVisibleLabel: visibleExpected,
+          availableModels: state?.labels || []
+        };
         throw error;
       }
       opened = await this.#eval(`(() => {
@@ -2039,7 +2083,7 @@ export class ChatGPTController {
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const expected = ${JSON.stringify(expected)};
+        const expected = ${JSON.stringify(visibleExpected)};
         const controlledIds = new Set(${JSON.stringify(opened?.controlledIds || [])});
         const route = ${JSON.stringify(opened?.route || '')};
         const menuItems = (root) => Array.from(root.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]')).filter(visible);
@@ -2067,7 +2111,11 @@ export class ChatGPTController {
     }
     if (!chosen?.ok) {
       const err = new Error(chosen?.error || 'expected_reasoning_mode_unavailable');
-      err.data = { expectedReasoningMode: expected, availableModes: chosen?.labels || [] };
+      err.data = {
+        expectedModel: expected,
+        expectedVisibleLabel: visibleExpected,
+        availableModes: chosen?.labels || []
+      };
       throw err;
     }
 
@@ -2470,7 +2518,12 @@ export class ChatGPTController {
     const evidence = Array.isArray(snapshot?.modelEvidenceCandidates)
       ? snapshot.modelEvidenceCandidates
       : snapshot?.modelEvidence ? [snapshot.modelEvidence] : [];
-    if (expected && !evidence.some((label) => modelLabelMatches(label, expected))) {
+    let isChatgpt = false;
+    try { isChatgpt = new URL(snapshot?.url || '').hostname === 'chatgpt.com'; } catch {}
+    const matchesExpected = isChatgpt
+      ? (label) => chatgptModelLabelMatches(label, expected)
+      : (label) => modelLabelMatches(label, expected);
+    if (expected && !evidence.some(matchesExpected)) {
       const error = new Error('review_model_mismatch');
       error.data = { expectedModel: expected, modelEvidenceCandidates: evidence };
       throw error;
@@ -2484,6 +2537,8 @@ export class ChatGPTController {
     const sourceSha = JSON.stringify(sourcePromptSha256);
     const canonicalSha = JSON.stringify(canonicalPromptSha256);
     const expectedModelLabel = JSON.stringify(String(expectedModel || '').trim());
+    const expectedVisibleModelLabel = JSON.stringify(chatgptExpectedModelSpec(expectedModel).visibleLabel);
+    const productModelRequest = JSON.stringify(chatgptProductModelAlias(expectedModel));
     const textModel = JSON.stringify(REVIEW_PLAIN_TEXT_MODEL);
     const result = await this.#eval(`(() => {
       const reviewSendOnceMarker = true;
@@ -2540,17 +2595,22 @@ export class ChatGPTController {
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
       const expectedModel = ${expectedModelLabel};
+      const expectedVisibleModel = ${expectedVisibleModelLabel};
+      const productModelRequest = ${productModelRequest};
       let clickTimeModelEvidence = null;
       if (location.hostname === 'chatgpt.com' && expectedModel) {
         const agentifyReasoningControlScopeMarker = true;
-        const expectsReasoningStrength = /^(?:high|pro)$/i.test(expectedModel);
+        const expectsReasoningStrength = !productModelRequest && /^(?:high|pro)$/i.test(expectedVisibleModel);
         const promptNode = document.querySelector(${promptSel});
         const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
         const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
         const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
         const routeFor = (node) => {
+          const testId = String(node.getAttribute('data-testid') || '');
+          const aria = String(node.getAttribute('aria-label') || '');
+          if (testId === 'model-switcher-dropdown-button' || /model/i.test(aria)) return 'semantic_model_switcher';
+          if (productModelRequest) return null;
           if (composerRoot?.contains?.(node)) return expectsReasoningStrength ? 'composer_reasoning_control' : 'composer_model_control';
-          if (node.getAttribute('data-testid') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
           const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
           return controlledIds.some((id) => modeItems(document.getElementById(id)).map(semanticLabel).some((label) => /^(?:high|pro)$/i.test(label)))
             ? 'controlled_reasoning_menu'
@@ -2559,7 +2619,7 @@ export class ChatGPTController {
         const selectedReasoningControls = Array.from(document.querySelectorAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
           .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
           .map((node) => ({ node, label: semanticLabel(node), route: routeFor(node) }))
-          .filter((record) => record.route && modelLabelMatches(record.label, expectedModel));
+          .filter((record) => record.route && modelLabelMatches(record.label, expectedVisibleModel));
         if (selectedReasoningControls.length !== 1) return {
           ok: false,
           error: 'review_model_mismatch_at_send',
@@ -3098,10 +3158,8 @@ export class ChatGPTController {
           expectedModel,
           Math.min(Math.max(1, deadline - Date.now()), 60_000)
         );
-        activeExpectedModel = verifiedModelState?.matchedLabel || expectedModel;
-        identity.expectedModel = activeExpectedModel;
         run.verifiedModelEvidence = {
-          expectedModel: activeExpectedModel,
+          expectedModel,
           matchedLabel: verifiedModelState?.matchedLabel || null,
           routeEvidence: verifiedModelState?.routeEvidence || null,
           scopedMatchCount: verifiedModelState?.scopedMatchCount || 0

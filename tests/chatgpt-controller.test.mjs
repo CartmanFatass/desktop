@@ -8,6 +8,8 @@ import {
   canonicalizeReviewMessageNodes,
   canonicalizeGeminiReviewMessageNodes,
   canonicalizeGeminiModelEvidence,
+  chatgptExpectedModelSpec,
+  chatgptModelLabelMatches,
   classifyBlockedSignals,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
@@ -1280,6 +1282,88 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
   assert.equal(modelLabelMatches('High', 'Pro'), false);
 });
 
+test('chatgpt-controller: current ChatGPT Pro product names bind to the visible Pro selector', () => {
+  assert.deepEqual(chatgptExpectedModelSpec('GPT-5.6 Pro'), {
+    requestedModel: 'GPT-5.6 Pro',
+    visibleLabel: 'Pro',
+    canonicalProductModel: 'GPT-5.6 Sol Pro'
+  });
+  assert.deepEqual(chatgptExpectedModelSpec('GPT-5.6 Sol Pro'), {
+    requestedModel: 'GPT-5.6 Sol Pro',
+    visibleLabel: 'Pro',
+    canonicalProductModel: 'GPT-5.6 Sol Pro'
+  });
+  assert.equal(chatgptModelLabelMatches('Pro', 'GPT-5.6 Pro'), true);
+  assert.equal(chatgptModelLabelMatches('GPT-5.6 Pro', 'GPT-5.6 Pro'), true);
+  assert.equal(chatgptModelLabelMatches('High', 'GPT-5.6 Pro'), false);
+  assert.equal(chatgptModelLabelMatches('Jacob Frantz Pro, open profile menu', 'GPT-5.6 Pro'), false);
+});
+
+test('chatgpt-controller: full Pro product ignores a separate reasoning Pro control', async () => {
+  let productLabel = 'Thinking';
+  let promptInsertCount = 0;
+  let sendBoundaryCount = 0;
+  const composerRoot = { contains(node) { return node === reasoningPro; } };
+  const promptNode = {
+    closest(selector) { return selector === 'form' ? composerRoot : null; },
+    parentElement: null
+  };
+  const control = ({ label, testId = null, aria = null, popup = 'menu' }) => ({
+    get textContent() { return typeof label === 'function' ? label() : label; },
+    getAttribute(name) {
+      if (name === 'aria-label') return aria;
+      if (name === 'data-testid') return testId;
+      if (name === 'aria-haspopup') return popup;
+      return null;
+    },
+    getBoundingClientRect() { return { width: 80, height: 32, top: 700, bottom: 732, left: 300, right: 380 }; },
+    closest() { return null; }
+  });
+  const productModel = control({
+    label: () => productLabel,
+    testId: 'model-switcher-dropdown-button'
+  });
+  const reasoningPro = control({ label: 'Pro' });
+  const document = {
+    querySelector() { return promptNode; },
+    querySelectorAll() { return [productModel, reasoningPro]; },
+    getElementById() { return null; }
+  };
+  const window = { getComputedStyle() { return { visibility: 'visible', display: 'block' }; } };
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) {
+        return await Function('document', 'window', `return ${js}`)(document, window);
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: productLabel, modelEvidenceCandidates: [productLabel, 'Pro'],
+        controlText: [], selectorStop: false, sendVisible: false
+      };
+      if (js.includes('reviewSendOnceMarker')) sendBoundaryCount += 1;
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { promptInsertCount += 1; },
+    async sendKey() { throw new Error('product_preflight_must_not_send'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt' } });
+  const wrongProduct = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(wrongProduct.preflightVerified, false);
+  assert.equal(wrongProduct.modelEvidence, null);
+  assert.deepEqual(wrongProduct.modelEvidenceCandidates, []);
+  assert.equal(promptInsertCount, 0);
+  assert.equal(sendBoundaryCount, 0);
+
+  productLabel = 'Pro';
+  const selectedProduct = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(selectedProduct.preflightVerified, true);
+  assert.equal(selectedProduct.modelEvidence, 'Pro');
+  assert.deepEqual(selectedProduct.modelEvidenceCandidates, ['Pro']);
+  assert.equal(promptInsertCount, 0);
+  assert.equal(sendBoundaryCount, 0);
+});
+
 test('chatgpt-controller: unrelated visible Pro account control cannot satisfy reasoning-mode proof', async () => {
   let inserted = 0;
   let sendBoundaryReached = false;
@@ -2316,7 +2400,7 @@ test('chatgpt-controller: non-sending ChatGPT review preflight reads the selecte
     async sendKey() { throw new Error('preflight_must_not_send_key'); }
   };
   const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
-  const result = await controller.reviewPreflight({ expectedModel: 'Pro', timeoutMs: 10_000 });
+  const result = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 10_000 });
   assert.deepEqual(result, {
     provider: 'chatgpt', conversationUrl: url, modelEvidence: 'Pro',
     modelEvidenceCandidates: ['Pro'], modelEvidenceDiagnostics: [], preflightVerified: true,

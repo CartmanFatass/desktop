@@ -42,6 +42,8 @@ async function fixture() {
   let submissionDiagnosticResult = null;
   let renderedDisplayFidelity = 'exact';
   let returnWaitingAfterSubmission = false;
+  let visibleModelLabel = 'GPT-5.6 Pro';
+  let visibleModelRoute = 'semantic_model_switcher';
   let fixturePrompt = '';
   const composerIdentityFields = () => ({
     composerPromptSha256: sha256(fixturePrompt),
@@ -113,7 +115,7 @@ async function fixture() {
         preparedAt: 50,
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
+        modelEvidence: visibleModelLabel
       });
       await args.onComposerVerified?.({
         ok: true,
@@ -142,8 +144,8 @@ async function fixture() {
         enteredAt: 85,
         modelEvidence: {
           expectedModel: args.expectedModel,
-          matchedLabel: 'GPT-5.6 Pro',
-          routeEvidence: 'semantic_model_switcher',
+          matchedLabel: visibleModelLabel,
+          routeEvidence: visibleModelRoute,
           scopedMatchCount: 1
         }
       });
@@ -166,8 +168,8 @@ async function fixture() {
         },
         clickTimeModelEvidence: {
           expectedModel: args.expectedModel,
-          matchedLabel: 'GPT-5.6 Pro',
-          routeEvidence: 'semantic_model_switcher',
+          matchedLabel: visibleModelLabel,
+          routeEvidence: visibleModelRoute,
           scopedMatchCount: 1
         }
       });
@@ -183,7 +185,7 @@ async function fixture() {
         observedAt: 95,
         conversationUrl: submittedUrl,
         conversationId: submittedId,
-        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidence: visibleModelLabel,
         commitmentClass,
         submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
         renderedDisplayFidelity,
@@ -205,7 +207,7 @@ async function fixture() {
         submittedAt: 100,
         conversationUrl: submittedUrl,
         conversationId: submittedId,
-        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidence: visibleModelLabel,
         sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
@@ -379,6 +381,12 @@ async function fixture() {
     },
     setReturnWaitingAfterSubmission(value) {
       returnWaitingAfterSubmission = !!value;
+    },
+    setVisibleModelLabel(value) {
+      visibleModelLabel = String(value);
+    },
+    setVisibleModelRoute(value) {
+      visibleModelRoute = String(value);
     }
   };
 }
@@ -953,8 +961,40 @@ test('review transport: one send persists a complete receipt and duplicate retur
   assert.equal(f.calls.review, 1);
 });
 
+test('review transport: visible Pro is canonical send evidence for requested GPT-5.6 Pro', async () => {
+  const f = await fixture();
+  f.setVisibleModelLabel('Pro');
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(receipt.status, 'COMPLETE');
+  assert.equal(receipt.model, 'GPT-5.6 Pro');
+  assert.equal(receipt.modelEvidence, 'Pro');
+  assert.deepEqual(receipt.causalSendReceipt.modelSelection, {
+    expectedModel: 'GPT-5.6 Pro',
+    matchedLabel: 'Pro',
+    routeEvidence: 'semantic_model_switcher',
+    scopedMatchCount: 1
+  });
+});
+
+test('review transport: a reasoning Pro route cannot satisfy the GPT-5.6 Pro product request', async () => {
+  const f = await fixture();
+  f.setVisibleModelLabel('Pro');
+  f.setVisibleModelRoute('composer_reasoning_control');
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_send_model_receipt_invalid/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const receipt = state.operations[f.request.idempotencyKey];
+  assert.equal(receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(receipt.sendActionCount, 0);
+  assert.equal(receipt.error, 'review_send_model_receipt_invalid');
+  assert.equal(f.calls.review, 1);
+});
+
 test('review transport: first ChatGPT binding captures the created conversation after one strict send', async () => {
   const f = await fixture();
+  f.setVisibleModelLabel('Pro');
   const request = {
     ...f.request,
     stableKey: 'first-binding-key',
@@ -969,6 +1009,8 @@ test('review transport: first ChatGPT binding captures the created conversation 
   assert.deepEqual(f.calls.update, [{ tabId: 'tab-1', url: 'https://chatgpt.com/c/first-bound' }]);
   const state = await readReviewTransportState(f.stateDir);
   assert.equal(state.bindings['first-binding-key'].conversationId, 'first-bound');
+  assert.equal(state.bindings['first-binding-key'].model, 'GPT-5.6 Pro');
+  assert.equal(state.operations['first-binding-op'].modelEvidence, 'Pro');
   assert.equal(state.operations['first-binding-op'].conversationId, 'first-bound');
 });
 
