@@ -18,6 +18,7 @@ import {
   positionReviewComposerCaret,
   reviewComposerKind
 } from './review-composer-replacement.mjs';
+import { NativeOperatorControl } from './operator-control.mjs';
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -73,25 +74,22 @@ export function deduplicateReviewModelEvidence(values) {
 }
 
 export function modelLabelMatches(actual, expected) {
-  const words = (value) => String(value || '')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-  const actualWords = words(actual);
-  const expectedWords = words(expected);
-  if (!actualWords.length || !expectedWords.length) return false;
-  if (actualWords.join('') === expectedWords.join('')) return true;
-  if (expectedWords.length === 1 && expectedWords[0] === 'pro') return actualWords.at(-1) === 'pro';
-  if (actualWords.length === 1 && actualWords[0] === 'pro') return expectedWords.at(-1) === 'pro';
-  return false;
+  const normalize = (value) => String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const actualLabel = normalize(actual);
+  const expectedLabel = normalize(expected);
+  return !!actualLabel && actualLabel === expectedLabel;
 }
 
 export function geminiExpectedModelSpec(expectedModel) {
   const original = String(expectedModel || '').replace(/\s+/g, ' ').trim();
-  const hasExtendedThinking = /(?:\bextended(?:\s+thinking)?\b|\u6269\u5c55\u601d\u8003)/i.test(original);
+  const hasExtendedThinking = /(?:\bextended(?:\s+thinking)?\b|\u6269\u5c55\u601d\u8003|\ud655\uc7a5)/i.test(original);
   const model = original
     .replace(/^gemini\s+/i, '')
-    .replace(/(?:\s+extended(?:\s+thinking)?|\s*\u6269\u5c55\u601d\u8003)\s*$/i, '')
+    .replace(/(?:\s+extended(?:\s+thinking)?|\s*\u6269\u5c55\u601d\u8003|\s*\ud655\uc7a5)\s*$/i, '')
     .trim();
   return {
     model,
@@ -108,12 +106,18 @@ export function geminiModelLabelMatches(actual, expected) {
     .toLowerCase();
   const actualLabel = normalize(actual);
   const expectedLabel = normalize(expected);
-  return !!actualLabel && actualLabel === expectedLabel;
+  if (!actualLabel || !expectedLabel) return false;
+  if (actualLabel === expectedLabel) return true;
+  // Gemini's selected semantic menu label can abbreviate the already-scoped
+  // `3.1 Pro` option to `Pro`. This alias is accepted only for that exact
+  // expected model; callers still require a visible, menu-scoped selected
+  // record and a separately selected thinking-mode record.
+  return actualLabel === 'pro' && expectedLabel === '3.1 pro';
 }
 
 export function geminiThinkingLabelMatches(actual) {
   const label = String(actual || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  return label === 'extended thinking' || label === '\u6269\u5c55\u601d\u8003';
+  return label === 'extended thinking' || label === '\u6269\u5c55\u601d\u8003' || label === '\ud655\uc7a5';
 }
 
 export function geminiMenuItemSelected(node) {
@@ -157,7 +161,7 @@ export function canonicalizeGeminiModelEvidence(records, expectedModel) {
   const thinkingRecord = spec.thinkingMode
     ? accepted.find((record) => record !== modelRecord && geminiThinkingLabelMatches(record.label)) || null
     : null;
-  const modelLabel = modelRecord ? cleanModelLabel(modelRecord.label) : null;
+  const modelLabel = modelRecord ? spec.model : null;
   const matched = !!modelLabel && (!spec.thinkingMode || !!thinkingRecord);
   const matchedLabel = matched
     ? `Gemini ${modelLabel}${spec.thinkingMode ? ' extended' : ''}`
@@ -171,7 +175,7 @@ export function canonicalizeGeminiModelEvidence(records, expectedModel) {
   };
 }
 
-export function canonicalizeGeminiReviewMessageNodes(nodes, userSelector) {
+export function canonicalizeReviewMessageNodes(nodes, userSelector) {
   const accepted = [];
   for (const node of Array.from(nodes || [])) {
     const role = node?.matches?.(userSelector) ? 'user' : 'assistant';
@@ -179,15 +183,23 @@ export function canonicalizeGeminiReviewMessageNodes(nodes, userSelector) {
     const identity = String(
       host?.getAttribute?.('data-message-id') || host?.getAttribute?.('data-turn-id') || node?.id || ''
     ).trim();
-    const duplicate = accepted.some((entry) =>
+    const matchingIndex = accepted.findIndex((entry) =>
       entry.role === role && (
-        (identity && entry.identity === identity) || entry.node?.contains?.(node)
+        (identity && entry.identity === identity) ||
+        entry.node?.contains?.(node) ||
+        node?.contains?.(entry.node)
       )
     );
-    if (!duplicate) accepted.push({ node, role, identity });
+    if (matchingIndex < 0) {
+      accepted.push({ node, role, identity });
+    } else if (node?.contains?.(accepted[matchingIndex].node)) {
+      accepted[matchingIndex] = { node, role, identity };
+    }
   }
   return accepted;
 }
+
+export const canonicalizeGeminiReviewMessageNodes = canonicalizeReviewMessageNodes;
 
 function reviewConversationId(value) {
   try {
@@ -211,6 +223,13 @@ export function serializeReviewComposer(root) {
     'SUB', 'SUP', 'U'
   ]);
   const blockTags = new Set(['DIV', 'P']);
+  const hasButtonRole = (node) => {
+    try {
+      return String(node?.getAttribute?.('role') || '').toLowerCase() === 'button';
+    } catch {
+      return true;
+    }
+  };
 
   const serializePreCode = (node, requireCodeRoot = false) => {
     if (!node || typeof node !== 'object') {
@@ -223,6 +242,9 @@ export function serializeReviewComposer(root) {
       return { ok: false, error: 'review_composer_node_type_unsupported' };
     }
     const tag = String(node.tagName || '').toUpperCase();
+    if (hasButtonRole(node)) {
+      return { ok: false, error: 'review_composer_element_unsupported', tag };
+    }
     if (requireCodeRoot && tag !== 'CODE') {
       return { ok: false, error: 'review_pre_code_shape_unsupported', tag };
     }
@@ -250,6 +272,9 @@ export function serializeReviewComposer(root) {
       return { ok: false, error: 'review_composer_node_type_unsupported' };
     }
     const tag = String(node.tagName || '').toUpperCase();
+    if (hasButtonRole(node)) {
+      return { ok: false, error: 'review_composer_element_unsupported', tag };
+    }
     if (tag === 'BR') return { ok: true, text: '\n', block: false };
     if (tag === 'PRE') {
       const children = Array.from(node.childNodes || []);
@@ -372,9 +397,50 @@ export function serializeReviewUserMessage(root) {
     }
     return false;
   };
-  const candidates = discovered.length
-    ? contentNodes.filter((node) => !contentNodes.some((outer) => outer !== node && containsNode(outer, node)))
-    : isControl(root) ? [] : [root];
+  const elementChildren = (node) => Array.from(node?.childNodes || [])
+    .filter((child) => Number(child?.nodeType) === 1);
+  const testId = (node) => String(node?.getAttribute?.('data-testid') || '');
+  const collapsibleRoots = [...new Set([
+    ...(testId(root) === 'collapsible-user-message-root' ? [root] : []),
+    ...(typeof root.querySelectorAll === 'function'
+      ? Array.from(root.querySelectorAll('[data-testid="collapsible-user-message-root"]'))
+        .filter((node) => testId(node) === 'collapsible-user-message-root')
+      : [])
+  ])];
+  let renderedProjection = null;
+  let candidates;
+  if (collapsibleRoots.length > 0) {
+    if (collapsibleRoots.length !== 1) {
+      return { ok: false, error: 'review_collapsible_message_structure_unreadable' };
+    }
+    const directChildren = elementChildren(collapsibleRoots[0]);
+    const contents = directChildren.filter((node) => testId(node) === 'collapsible-user-message-content');
+    const toggles = directChildren.filter((node) => testId(node) === 'collapsible-user-message-toggle');
+    const content = contents[0] || null;
+    const toggle = toggles[0] || null;
+    const contentId = String(content?.id || content?.getAttribute?.('id') || '');
+    const toggleTag = String(toggle?.tagName || '').toUpperCase();
+    const toggleType = String(toggle?.getAttribute?.('type') || '').toLowerCase();
+    const toggleControls = String(toggle?.getAttribute?.('aria-controls') || '');
+    if (
+      directChildren.length !== 2 ||
+      contents.length !== 1 ||
+      toggles.length !== 1 ||
+      toggleTag !== 'BUTTON' ||
+      toggleType !== 'button' ||
+      !contentId ||
+      toggleControls !== contentId ||
+      containsNode(content, toggle)
+    ) {
+      return { ok: false, error: 'review_collapsible_message_structure_unreadable' };
+    }
+    candidates = [content];
+    renderedProjection = 'collapsible_inner_text_v1';
+  } else {
+    candidates = discovered.length
+      ? contentNodes.filter((node) => !contentNodes.some((outer) => outer !== node && containsNode(outer, node)))
+      : isControl(root) ? [] : [root];
+  }
   if (candidates.length === 0) {
     return { ok: false, error: 'review_user_message_content_missing' };
   }
@@ -391,7 +457,27 @@ export function serializeReviewUserMessage(root) {
       ...structure
     };
   }
-  const exactTexts = [...new Set(serialized.map((entry) => entry.text))];
+  let projectedTexts;
+  if (renderedProjection === 'collapsible_inner_text_v1') {
+    projectedTexts = [];
+    for (const candidate of candidates) {
+      let innerText;
+      try { innerText = candidate.innerText; } catch {}
+      if (typeof innerText !== 'string') {
+        const structure = summarizeReviewComposerStructure(candidate);
+        return {
+          ok: false,
+          error: 'review_collapsible_message_inner_text_unreadable',
+          candidateCount: candidates.length,
+          ...structure
+        };
+      }
+      projectedTexts.push(innerText);
+    }
+  } else {
+    projectedTexts = serialized.map((entry) => entry.text);
+  }
+  const exactTexts = [...new Set(projectedTexts)];
   if (exactTexts.length !== 1) {
     return {
       ok: false,
@@ -401,7 +487,37 @@ export function serializeReviewUserMessage(root) {
     };
   }
   const structure = candidates.length === 1 ? summarizeReviewComposerStructure(candidates[0]) : {};
-  return { ok: true, text: exactTexts[0], candidateCount: candidates.length, ...structure };
+  return {
+    ok: true,
+    text: exactTexts[0],
+    candidateCount: candidates.length,
+    ...(renderedProjection ? { renderedProjection } : {}),
+    ...structure
+  };
+}
+
+function compareRenderedReviewUserText(expectedPrompt, message, { causalSubmissionAccepted = false } = {}) {
+  if (!message || message.textIdentityReadable === false) return null;
+  const comparison = safeReviewPlainTextComparison(expectedPrompt, message.text);
+  if (comparison.ok === true) return comparison;
+  const projection = message.textIdentityDiagnostic?.renderedProjection;
+  const expected = canonicalizeReviewPlainText(expectedPrompt);
+  const observed = canonicalizeReviewPlainText(message.text);
+  if (
+    causalSubmissionAccepted &&
+    projection === 'collapsible_inner_text_v1' &&
+    expected.endsWith('\n') &&
+    observed === expected.slice(0, -1)
+  ) {
+    return {
+      ...comparison,
+      ok: true,
+      identityMode: 'causal_collapsible_inner_text_terminal_lf_projection',
+      mismatchClass: null,
+      terminalLineFeedElided: true
+    };
+  }
+  return comparison;
 }
 
 function jitter(minMs, maxMs) {
@@ -434,7 +550,7 @@ class Mutex {
 }
 
 export class ChatGPTController {
-  constructor({ page, selectors, onBlocked, onUnblocked, stateDir }) {
+  constructor({ page, selectors, onBlocked, onUnblocked, stateDir, operatorControlFactory = null }) {
     this.page = page;
     this.selectors = selectors;
     this.onBlocked = onBlocked;
@@ -446,6 +562,9 @@ export class ChatGPTController {
     this.serverId = null;
     this.mouse = { x: 30, y: 30 };
     this.currentRun = null;
+    this.operatorControl = typeof operatorControlFactory === 'function'
+      ? operatorControlFactory({ page })
+      : new NativeOperatorControl({ page });
   }
 
   async runExclusive(fn) {
@@ -469,6 +588,21 @@ export class ChatGPTController {
 
   async getUrl() {
     return await this.page.getUrl();
+  }
+
+  // The Operator surface is deliberately separate from strict review. It
+  // exposes only observed visible controls and one native input event at a
+  // time; it has no ledger, provider, or Send capability.
+  async operatorObserve({ tabId } = {}) {
+    return await this.operatorControl.observe({ tabId });
+  }
+
+  async operatorAct(args = {}) {
+    return await this.operatorControl.act(args);
+  }
+
+  async operatorWait(args = {}) {
+    return await this.operatorControl.wait(args);
   }
 
   async readPageText({ maxChars = 200_000 } = {}) {
@@ -1570,17 +1704,20 @@ export class ChatGPTController {
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const triggerRoots = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
+        // Gemini's mode trigger is localized.  Prefer the stable test id when
+        // available, but accept the visible semantic trigger observed in the
+        // live UI rather than inferring selection from its abbreviated label.
+        const triggerRoots = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).filter(visible);
         const controlledMenuIds = new Set(triggerRoots.flatMap((node) =>
           String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)
         ));
         const menuRoots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
           .filter(visible)
           .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
-          .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
+          .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]'));
         const records = [];
         for (const root of menuRoots) {
-          for (const node of root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')) {
+          for (const node of root.querySelectorAll('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]')) {
             records.push({
               label: geminiMenuItemSemanticLabel(node, visible),
               visible: visible(node),
@@ -1593,13 +1730,15 @@ export class ChatGPTController {
         return canonicalizeGeminiModelEvidence(records, ${JSON.stringify(expected)});
       })()`);
     }
-    const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
-    const modelSel = JSON.stringify([
-      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
-      composerModelPicker
-    ].join(', '));
+    // On the current ChatGPT surface, High and Pro are values of its one
+    // visible reasoning-strength axis. They are not separate provider-model
+    // evidence. A fresh tab can reset Pro to High, so strict Pro work must
+    // normalize this exact visible control before any composer action.
+    const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
+    const promptSelector = this.selectors.promptTextarea || '#prompt-textarea';
     return await this.#eval(`(() => {
       const agentifyModelStateMarker = true;
+      const agentifyReasoningControlScopeMarker = true;
       const modelLabelMatches = ${modelLabelMatches.toString()};
       const visible = (node) => {
         const rect = node?.getBoundingClientRect?.();
@@ -1607,15 +1746,36 @@ export class ChatGPTController {
         return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
       };
       const expected = ${JSON.stringify(expected)};
-      const readLabels = (nodes) => Array.from(nodes)
+      const promptNode = document.querySelector(${JSON.stringify(promptSelector)});
+      const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
+      const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+      const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
+      const routeFor = (node) => {
+        if (composerRoot?.contains?.(node)) return 'composer_reasoning_control';
+        if (node.getAttribute('data-testid') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
+        const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+        const controlsModeMenu = controlledIds.some((id) => {
+          const root = document.getElementById(id);
+          const labels = modeItems(root).map(semanticLabel);
+          return labels.some((label) => /^(?:high|pro)$/i.test(label));
+        });
+        return controlsModeMenu ? 'controlled_reasoning_menu' : null;
+      };
+      const records = Array.from(document.querySelectorAll(${JSON.stringify(reasoningModePicker)}))
         .filter(visible)
-        .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
-        .filter(Boolean);
-      const composerLabels = readLabels(document.querySelectorAll(${JSON.stringify(composerModelPicker)}));
-      const semanticLabels = readLabels(document.querySelectorAll(${modelSel}));
-      const labels = composerLabels.length ? composerLabels : semanticLabels;
-      const matchedLabel = labels.find((label) => modelLabelMatches(label, expected)) || null;
-      return { matched: !!matchedLabel, labels, matchedLabel };
+        .filter((node) => !node.closest('[role="menu"], [role="listbox"]'))
+        .map((node) => ({ node, label: semanticLabel(node), route: routeFor(node) }))
+        .filter((record) => record.route && /^(?:high|pro)$/i.test(record.label));
+      const labels = records.map((record) => record.label);
+      const matched = records.filter((record) => modelLabelMatches(record.label, expected));
+      const matchedLabel = matched.length === 1 ? matched[0].label : null;
+      return {
+        matched: !!matchedLabel,
+        labels,
+        matchedLabel,
+        routeEvidence: matched.length === 1 ? matched[0].route : null,
+        scopedMatchCount: matched.length
+      };
     })()`);
   }
 
@@ -1625,18 +1785,14 @@ export class ChatGPTController {
     let isGemini = false;
     try { isGemini = new URL(await this.page.getUrl()).hostname === 'gemini.google.com'; } catch {}
     if (isGemini) return await this.#ensureGeminiExpectedModel(expected, timeoutMs);
-    const composerModelPicker = '[data-composer-transition-slot="trailing"] button[aria-haspopup="menu"]';
-    const modelSel = JSON.stringify([
-      this.selectors.reviewModelEvidence || 'button[data-testid*="model" i], [role="button"][data-testid*="model" i], button[aria-label*="model" i], [role="button"][aria-label*="model" i]',
-      composerModelPicker
-    ].join(', '));
+    const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
     const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
     let state = null;
     let opened = null;
     await this.#emitProgress({ phase: 'selecting_model' });
     while (Date.now() < deadline) {
       state = await this.#readExpectedModelState(expected);
-      if (state?.matched) return state;
+      if (state?.matched) return { ...state, selectionMethod: 'already_selected_visible_reasoning_mode' };
       opened = await this.#eval(`(() => {
         const agentifyOpenModelPickerMarker = true;
         const visible = (node) => {
@@ -1644,14 +1800,91 @@ export class ChatGPTController {
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const composerPicker = Array.from(document.querySelectorAll(${JSON.stringify(composerModelPicker)})).filter(visible);
-        const preferred = Array.from(document.querySelectorAll('button[data-testid*="model-switcher" i], [role="button"][data-testid*="model-switcher" i]')).filter(visible);
-        const fallback = Array.from(document.querySelectorAll(${modelSel})).filter((node) => visible(node) && node.matches('button, [role="button"]'));
-        const picker = composerPicker[0] || preferred[0] || fallback[0] || null;
-        if (!picker) return { ok: false, error: 'model_switcher_unavailable' };
+        const pickers = Array.from(document.querySelectorAll(${JSON.stringify(reasoningModePicker)}))
+          .filter((node) => visible(node) && node.matches('button, [role="button"]'))
+          .filter((node) => !node.closest('[role="menu"], [role="listbox"]'))
+          .filter((node) => /^(?:high|pro)$/i.test(String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim()));
+        if (pickers.length !== 1) return { ok: false, error: 'reasoning_mode_selector_unavailable', pickerCount: pickers.length };
+        const picker = pickers[0];
+        const controlledIds = String(picker.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+        if (!controlledIds.length) return { ok: false, error: 'reasoning_mode_menu_unbound' };
         const rect = picker.getBoundingClientRect();
-        return { ok: true, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        return { ok: true, controlledIds, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
       })()`);
+      // Some fresh tabs expose the same visible High/Pro trigger directly at
+      // the composer but omit aria-controls. Keep it separate from arbitrary
+      // composer menus: there must be exactly one visible exact mode label,
+      // and post-open selection below still requires one mode-bearing menu.
+      if (!opened?.ok && opened?.error === 'reasoning_mode_menu_unbound') {
+        opened = await this.#eval(`(() => {
+          const agentifyOpenUnboundLocalReasoningModePickerMarker = true;
+          const visible = (node) => {
+            const rect = node?.getBoundingClientRect?.();
+            const style = node ? window.getComputedStyle(node) : null;
+            return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+          };
+          const label = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          const pickers = Array.from(document.querySelectorAll(${JSON.stringify(reasoningModePicker)}))
+            .filter((node) => visible(node) && node.matches('button, [role="button"]'))
+            .filter((node) => !node.closest('[role="menu"], [role="listbox"]'))
+            .filter((node) => /^(?:high|pro)$/i.test(label(node)))
+            .filter((node) => !String(node.getAttribute('aria-controls') || '').trim());
+          if (pickers.length !== 1) return { ok: false, error: 'reasoning_mode_unbound_local_selector_unavailable', pickerCount: pickers.length };
+          const rect = pickers[0].getBoundingClientRect();
+          return { ok: true, controlledIds: [], route: 'local_visible_unbound_reasoning_mode', rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        })()`);
+      }
+      // The current ChatGPT page can expose its High/Pro reasoning control
+      // behind a visible top-level `ChatGPT`/mode trigger rather than beside
+      // the composer.  That trigger is eligible only when it explicitly
+      // controls one visible menu/listbox, so this is not a generic chrome
+      // click or a model/account inference.
+      if (!opened?.ok && opened?.error === 'reasoning_mode_selector_unavailable') {
+        opened = await this.#eval(`(() => {
+          const agentifyOpenPageReasoningModePickerMarker = true;
+          const visible = (node) => {
+            const rect = node?.getBoundingClientRect?.();
+            const style = node ? window.getComputedStyle(node) : null;
+            return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+          };
+          const semanticName = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          const controls = Array.from(document.querySelectorAll('button, [role="button"]'))
+            .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
+            .map((node) => ({ node, name: semanticName(node), controlledIds: String(node.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean) }))
+            .filter(({ node, name, controlledIds }) => {
+              const popup = /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || ''));
+              const semantic = /^(?:chatgpt|reasoning(?: mode| strength)?|mode|thinking)$/i.test(name);
+              return popup && semantic && controlledIds.length > 0;
+            });
+          if (controls.length !== 1) return { ok: false, error: 'reasoning_mode_page_selector_unavailable', pickerCount: controls.length };
+          const picker = controls[0].node;
+          const rect = picker.getBoundingClientRect();
+          return { ok: true, controlledIds: controls[0].controlledIds, route: 'page_visible_top_level_controlled_menu', rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        })()`);
+      }
+      // One observed ChatGPT state exposes its header trigger as the visible
+      // semantic `Model Selector` button without aria-controls. It is safe
+      // only when this exact visible test-id/name is unique; selection below
+      // then accepts one visible mode-bearing menu/listbox only. No unrelated
+      // popup may satisfy this fallback.
+      if (!opened?.ok && opened?.error === 'reasoning_mode_page_selector_unavailable') {
+        opened = await this.#eval(`(() => {
+          const agentifyOpenUnboundPageReasoningModePickerMarker = true;
+          const visible = (node) => {
+            const rect = node?.getBoundingClientRect?.();
+            const style = node ? window.getComputedStyle(node) : null;
+            return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+          };
+          const semanticName = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          const controls = Array.from(document.querySelectorAll('button, [role="button"]'))
+            .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
+            .filter((node) => /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || '')))
+            .filter((node) => node.getAttribute('data-testid') === 'model-switcher-dropdown-button' || /^model selector$/i.test(semanticName(node)));
+          if (controls.length !== 1) return { ok: false, error: 'reasoning_mode_unbound_page_selector_unavailable', pickerCount: controls.length };
+          const rect = controls[0].getBoundingClientRect();
+          return { ok: true, controlledIds: [], route: 'page_visible_semantic_model_selector', rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        })()`);
+      }
       if (opened?.ok) {
         await this.#clickAt(opened.rect.x + opened.rect.w / 2, opened.rect.y + opened.rect.h / 2);
         break;
@@ -1672,15 +1905,22 @@ export class ChatGPTController {
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
         const expected = ${JSON.stringify(expected)};
-        const visibleCandidates = Array.from(document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]'))
-          .filter(visible);
+        const controlledIds = new Set(${JSON.stringify(opened?.controlledIds || [])});
+        const route = ${JSON.stringify(opened?.route || '')};
+        const menuItems = (root) => Array.from(root.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]')).filter(visible);
+        const exactMode = (node) => modelLabelMatches(String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim(), expected);
+        const roots = Array.from(document.querySelectorAll('[role="menu"], [role="listbox"]'))
+          .filter(visible)
+          .filter((node) => controlledIds.size > 0 ? controlledIds.has(String(node.id || '')) : /^(?:local_visible_unbound_reasoning_mode|page_visible_semantic_model_selector)$/.test(route) && menuItems(node).some(exactMode));
+        if (roots.length !== 1) return { ok: false, error: 'reasoning_mode_menu_ambiguous', labels: roots.flatMap(menuItems).map((node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim()).filter(Boolean) };
+        const visibleCandidates = menuItems(roots[0]).filter(exactMode);
         const labels = visibleCandidates
           .map((node) => String(node.textContent || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
           .filter(Boolean);
         const candidates = visibleCandidates
-          .filter((node) => modelLabelMatches(node.textContent || node.getAttribute('aria-label') || '', expected));
+          .filter((node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase() === expected.toLowerCase());
         const target = candidates[0] || null;
-        if (!target) return { ok: false, error: 'expected_model_unavailable', labels };
+        if (!target || candidates.length !== 1) return { ok: false, error: 'expected_reasoning_mode_unavailable', labels };
         const rect = target.getBoundingClientRect();
         return { ok: true, labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
       })()`);
@@ -1691,17 +1931,26 @@ export class ChatGPTController {
       await sleep(200);
     }
     if (!chosen?.ok) {
-      const err = new Error(chosen?.error || 'expected_model_unavailable');
-      err.data = { expectedModel: expected, availableModels: chosen?.labels || [] };
+      const err = new Error(chosen?.error || 'expected_reasoning_mode_unavailable');
+      err.data = { expectedReasoningMode: expected, availableModes: chosen?.labels || [] };
       throw err;
     }
 
     while (Date.now() < deadline) {
       state = await this.#readExpectedModelState(expected);
-      if (state?.matched) return state;
+      if (state?.matched) return {
+        ...state,
+        selectionMethod: opened?.route === 'page_visible_top_level_controlled_menu'
+          ? 'page_visible_top_level_controlled_menu_exact_reasoning_mode_option'
+          : opened?.route === 'page_visible_semantic_model_selector'
+            ? 'page_visible_semantic_model_selector_exact_reasoning_mode_option'
+            : opened?.route === 'local_visible_unbound_reasoning_mode'
+              ? 'local_visible_unbound_reasoning_mode_exact_option'
+            : 'visible_exact_reasoning_mode_option'
+      };
       await sleep(200);
     }
-    throw new Error('expected_model_switch_unconfirmed');
+    throw new Error('expected_reasoning_mode_switch_unconfirmed');
   }
 
   async #ensureGeminiExpectedModel(expectedModel, timeoutMs = 20_000) {
@@ -1727,13 +1976,13 @@ export class ChatGPTController {
             const style = node ? window.getComputedStyle(node) : null;
             return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
           };
-          const triggers = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible);
+          const triggers = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).filter(visible);
           const controlledMenuIds = new Set(triggers.flatMap((node) => String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)));
           const roots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
             .filter(visible)
             .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
-            .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]'));
-          const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')).filter(visible));
+            .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]'));
+          const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]')).filter(visible));
           const labels = candidates.map((node) => geminiMenuItemSemanticLabel(node, visible)).filter(Boolean);
           const target = candidates.find((node) => {
             const label = geminiMenuItemSemanticLabel(node, visible);
@@ -1746,11 +1995,50 @@ export class ChatGPTController {
           return { ok: true, alreadySelected: geminiMenuItemSelected(target), labels, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
         })()`);
         if (last?.ok) {
+          let selected = !!last.alreadySelected;
           if (!last.alreadySelected) {
-            await this.#clickAt(last.rect.x + last.rect.w / 2, last.rect.y + last.rect.h / 2);
+            // Gemini can accept a CDP press as focus-only (data-active) while
+            // leaving the visible menu item unselected.  Activate the exact
+            // visible semantic control first, then retain the CDP click only
+            // as a bounded fallback when the selected state did not commit.
+            // This remains wholly pre-send and the subsequent state read is
+            // still authoritative.
+            const activation = await this.#eval(`(() => {
+              const agentifyGeminiFallbackModelPartMarker = true;
+              const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
+              const geminiThinkingLabelMatches = ${geminiThinkingLabelMatches.toString()};
+              const geminiMenuItemSelected = ${geminiMenuItemSelected.toString()};
+              const geminiMenuItemSemanticLabel = ${geminiMenuItemSemanticLabel.toString()};
+              const visible = (node) => {
+                const rect = node?.getBoundingClientRect?.();
+                const style = node ? window.getComputedStyle(node) : null;
+                return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+              };
+              const triggers = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).filter(visible);
+              const controlledMenuIds = new Set(triggers.flatMap((node) => String(node.getAttribute('aria-controls') || '').split(/\\s+/).filter(Boolean)));
+              const roots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
+                .filter(visible)
+                .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledMenuIds.has(String(node.id || '')))
+                .filter((node) => node.querySelector('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]'));
+              const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]')).filter(visible));
+              const target = candidates.find((node) => {
+                const label = geminiMenuItemSemanticLabel(node, visible);
+                return ${JSON.stringify(targetKind)} === 'thinking'
+                  ? geminiThinkingLabelMatches(label)
+                  : geminiModelLabelMatches(label, ${JSON.stringify(targetLabel)});
+              }) || null;
+              if (!target || geminiMenuItemSelected(target)) return { activated: false, selected: !!target && geminiMenuItemSelected(target) };
+              try { target.click(); } catch { return { activated: false, selected: false }; }
+              return { activated: true, selected: geminiMenuItemSelected(target) };
+            })()`);
+            selected = activation?.selected === true;
+            if (!activation?.selected) {
+              await this.#clickAt(last.rect.x + last.rect.w / 2, last.rect.y + last.rect.h / 2);
+              await sleep(250);
+            }
           }
           await sleep(250);
-          return;
+          return { selected };
         }
         const opened = await this.#eval(`(() => {
           const agentifyGeminiOpenModelMenuMarker = true;
@@ -1759,14 +2047,17 @@ export class ChatGPTController {
             const style = node ? window.getComputedStyle(node) : null;
             return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
           };
-          const candidates = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"]')).filter(visible);
-          const target = candidates[0] || null;
+          const localizedModeSelector = String.fromCodePoint(0x6a21, 0x5f0f, 0x9009, 0x62e9, 0x5668);
+          const candidates = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+          const target = candidates.find((node) => {
+            const aria = String(node.getAttribute('aria-label') || '').toLowerCase();
+            return aria.includes(localizedModeSelector) || aria.includes('mode selector');
+          }) || null;
           if (!target) return { ok: false, error: 'model_switcher_unavailable' };
-          const rect = target.getBoundingClientRect();
-          return { ok: true, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+          try { target.click(); } catch { return { ok: false, error: 'model_switcher_activation_failed' }; }
+          return { ok: true, activated: true };
         })()`);
         if (opened?.ok) {
-          await this.#clickAt(opened.rect.x + opened.rect.w / 2, opened.rect.y + opened.rect.h / 2);
           await sleep(250);
         } else {
           await sleep(200);
@@ -1777,9 +2068,25 @@ export class ChatGPTController {
       throw error;
     };
 
-    if (!state?.modelLabel) await choose('model', spec.model);
-    state = await this.#readExpectedModelState(expected);
-    if (spec.thinkingMode && !state?.thinkingMode) await choose('thinking', spec.thinkingMode);
+    const modelSelection = state?.modelLabel ? { selected: true } : await choose('model', spec.model);
+    const modelSelected = !!state?.modelLabel || modelSelection?.selected === true;
+    const thinkingSelection = spec.thinkingMode && !state?.thinkingMode
+      ? await choose('thinking', spec.thinkingMode)
+      : { selected: true };
+    const thinkingSelected = !spec.thinkingMode || !!state?.thinkingMode || thinkingSelection?.selected === true;
+    // The picker closes immediately after a successful Gemini selection.  The
+    // direct activation above already observed the same visible semantic menu
+    // item in its selected state, so do not discard that fact merely because a
+    // later closed-menu read has no records.
+    if (modelSelected && thinkingSelected) {
+      return {
+        matched: true,
+        labels: [spec.model, ...(spec.thinkingMode ? [spec.thinkingMode] : [])],
+        matchedLabel: `Gemini ${spec.model}${spec.thinkingMode ? ' extended' : ''}`,
+        modelLabel: spec.model,
+        thinkingMode: spec.thinkingMode || null
+      };
+    }
     while (Date.now() < deadline) {
       state = await this.#readExpectedModelState(expected);
       if (state?.matched) return state;
@@ -1790,25 +2097,49 @@ export class ChatGPTController {
           const style = node ? window.getComputedStyle(node) : null;
           return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
         };
-        const trigger = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"]')).find(visible) || null;
+        const trigger = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).find(visible) || null;
         const controlledIds = new Set(trigger ? String(trigger.getAttribute('aria-controls') || trigger.closest('[aria-controls]')?.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean) : []);
         const menuOpen = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]'))
           .filter(visible)
           .some((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || controlledIds.has(String(node.id || '')));
         if (menuOpen) return { ok: true, alreadyOpen: true };
         if (!trigger) return { ok: false, error: 'model_switcher_unavailable' };
-        const rect = trigger.getBoundingClientRect();
-        return { ok: true, alreadyOpen: false, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+        try { trigger.click(); } catch { return { ok: false, error: 'model_switcher_activation_failed' }; }
+        return { ok: true, alreadyOpen: false, activated: true };
       })()`);
-      if (openedForVerification?.ok && !openedForVerification.alreadyOpen) {
-        await this.#clickAt(
-          openedForVerification.rect.x + openedForVerification.rect.w / 2,
-          openedForVerification.rect.y + openedForVerification.rect.h / 2
-        );
-      }
       await sleep(200);
     }
     throw new Error('expected_model_switch_unconfirmed');
+  }
+
+  async #captureGeminiSelectedModel(timeoutMs = 20_000) {
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    while (Date.now() < deadline) {
+      const state = await this.#eval(`(() => {
+        const visible = (node) => { const r = node?.getBoundingClientRect?.(); const s = node ? window.getComputedStyle(node) : null; return !!r && r.width > 0 && r.height > 0 && s?.visibility !== 'hidden' && s?.display !== 'none'; };
+        const selected = (node) => node?.getAttribute('aria-selected') === 'true' || node?.getAttribute('aria-checked') === 'true' || node?.classList?.contains('selected') || !!node?.querySelector?.('[aria-selected="true"], [aria-checked="true"], .selected');
+        const label = (node) => String(node?.querySelector?.('.label')?.textContent || node?.getAttribute?.('aria-label') || '').replace(/\\s+/g, ' ').trim();
+        const roots = Array.from(document.querySelectorAll('[data-test-id="gem-mode-menu"], [role="menu"]')).filter(visible);
+        const labels = roots.flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]')).filter(visible).filter(selected).map(label).filter(Boolean));
+        // A bootstrap records the actual selected model; it must not guess a
+        // family label (for example, infer Pro from a closed trigger).  The
+        // only semantic distinction needed here is the separately selected
+        // thinking-mode item.
+        const model = labels.filter((value) => !/(?:thinking|思考|확장)/i.test(value));
+        const thinking = labels.filter((value) => /(?:thinking|思考|확장)/i.test(value));
+        return { model, thinking };
+      })()`);
+      if (state?.model?.length === 1 && state.thinking?.length <= 1) {
+        const matchedLabel = `Gemini ${state.model[0]}${state.thinking[0] ? ' extended' : ''}`;
+        await this.#eval(`(() => { const n = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).find((x) => { const r=x.getBoundingClientRect(); return r.width>0&&r.height>0; }); n?.click?.(); return !!n; })()`);
+        await sleep(150);
+        return { matched: true, matchedLabel, modelLabel: state.model[0], thinkingMode: state.thinking[0] || null };
+      }
+      const opened = await this.#eval(`(() => { const n = Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"] button, [data-test-id="bard-mode-menu-button"] [role="button"], [data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).find((x) => { const r=x.getBoundingClientRect(); return r.width>0&&r.height>0; }); if (!n) return { ok:false }; n.click(); return { ok:true }; })()`);
+      if (!opened?.ok) throw new Error('model_switcher_unavailable');
+      await sleep(250);
+    }
+    throw new Error('selected_model_unreadable');
   }
 
   async #completionMetadata(expectedModel = '', verifiedModelState = null) {
@@ -1855,7 +2186,7 @@ export class ChatGPTController {
       const summarizeReviewComposerStructure = ${summarizeReviewComposerStructure.toString()};
       const serializeReviewUserMessage = ${serializeReviewUserMessage.toString()};
       const deduplicateReviewModelEvidence = ${deduplicateReviewModelEvidence.toString()};
-      const canonicalizeGeminiReviewMessageNodes = ${canonicalizeGeminiReviewMessageNodes.toString()};
+      const canonicalizeReviewMessageNodes = ${canonicalizeReviewMessageNodes.toString()};
       const geminiModelLabelMatches = ${geminiModelLabelMatches.toString()};
       const geminiThinkingLabelMatches = ${geminiThinkingLabelMatches.toString()};
       const geminiMenuItemSelected = ${geminiMenuItemSelected.toString()};
@@ -1876,13 +2207,7 @@ export class ChatGPTController {
         return exact || (${isGeminiLiteral} ? role + ':' + order : '');
       };
       const messageNodes = Array.from(document.querySelectorAll(${reviewUserSel} + ', ' + ${reviewAssistantSel}));
-      const messageEntries = ${isGeminiLiteral}
-        ? canonicalizeGeminiReviewMessageNodes(messageNodes, ${reviewUserSel})
-        : messageNodes.map((node) => ({
-          node,
-          role: String(node.getAttribute('data-message-author-role') || '').trim(),
-          identity: ''
-        }));
+      const messageEntries = canonicalizeReviewMessageNodes(messageNodes, ${reviewUserSel});
       const messages = messageEntries.map(({ node, role, identity: canonicalIdentity }, order) => {
           const serialized = role === 'user'
             ? serializeReviewUserMessage(node)
@@ -1897,6 +2222,7 @@ export class ChatGPTController {
             textIdentityError: serialized.error || null,
             textIdentityTag: serialized.tag || null,
             textIdentityDiagnostic: {
+              renderedProjection: serialized.renderedProjection || null,
               candidateCount: serialized.candidateCount ?? null,
               rootTag: serialized.rootTag || null,
               elementCount: serialized.elementCount ?? null,
@@ -1942,7 +2268,7 @@ export class ChatGPTController {
           })
         : [];
       const geminiTriggerRoots = ${isGeminiLiteral}
-        ? Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"]')).filter(visible)
+        ? Array.from(document.querySelectorAll('[data-test-id="bard-mode-menu-button"], button[aria-label*="模式选择器"], [role="button"][aria-label*="模式选择器"], button[aria-label*="mode selector" i], [role="button"][aria-label*="mode selector" i]')).filter(visible)
         : [];
       const geminiControlledMenuIds = new Set(geminiTriggerRoots.flatMap((node) =>
         String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean)
@@ -1953,7 +2279,7 @@ export class ChatGPTController {
           .filter((node) => node.getAttribute('data-test-id') === 'gem-mode-menu' || geminiControlledMenuIds.has(String(node.id || '')))
         : [];
       const geminiModeItems = geminiMenuRoots
-        .flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], [role="menuitem"], [role="menuitemradio"]')))
+        .flatMap((root) => Array.from(root.querySelectorAll('[data-test-id^="bard-mode-option-"], gem-menu-item, [role="menuitem"], [role="menuitemradio"]')))
         .filter(visible);
       const geminiRecords = geminiModeItems.map((node) => ({
         label: geminiMenuItemSemanticLabel(node, visible),
@@ -2016,12 +2342,13 @@ export class ChatGPTController {
     }
   }
 
-  async #clickReviewSendOnce({ expectedPrompt, sourcePromptSha256, canonicalPromptSha256 }) {
+  async #clickReviewSendOnce({ expectedPrompt, expectedModel, sourcePromptSha256, canonicalPromptSha256 }) {
     const sendSel = JSON.stringify(this.selectors.sendButton);
     const promptSel = JSON.stringify(this.selectors.promptTextarea);
     const expected = JSON.stringify(expectedPrompt);
     const sourceSha = JSON.stringify(sourcePromptSha256);
     const canonicalSha = JSON.stringify(canonicalPromptSha256);
+    const expectedModelLabel = JSON.stringify(String(expectedModel || '').trim());
     const textModel = JSON.stringify(REVIEW_PLAIN_TEXT_MODEL);
     const result = await this.#eval(`(() => {
       const reviewSendOnceMarker = true;
@@ -2031,6 +2358,7 @@ export class ChatGPTController {
       const canonicalizeReviewPlainText = ${canonicalizeReviewPlainText.toString()};
       const browserSpaceRebalanceSite = ${browserSpaceRebalanceSite.toString()};
       const compareReviewPlainText = ${compareReviewPlainText.toString()};
+      const modelLabelMatches = ${modelLabelMatches.toString()};
       const serializeReviewComposer = ${serializeReviewComposer.toString()};
       const selected = locateReviewComposer(${promptSel});
       const composer = selected.element;
@@ -2076,6 +2404,39 @@ export class ChatGPTController {
         const style = window.getComputedStyle(node);
         return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
       };
+      const expectedModel = ${expectedModelLabel};
+      let clickTimeModelEvidence = null;
+      if (location.hostname === 'chatgpt.com' && expectedModel) {
+        const agentifyReasoningControlScopeMarker = true;
+        const promptNode = document.querySelector(${promptSel});
+        const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
+        const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+        const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
+        const routeFor = (node) => {
+          if (composerRoot?.contains?.(node)) return 'composer_reasoning_control';
+          if (node.getAttribute('data-testid') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
+          const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+          return controlledIds.some((id) => modeItems(document.getElementById(id)).map(semanticLabel).some((label) => /^(?:high|pro)$/i.test(label)))
+            ? 'controlled_reasoning_menu'
+            : null;
+        };
+        const selectedReasoningControls = Array.from(document.querySelectorAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
+          .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
+          .map((node) => ({ node, label: semanticLabel(node), route: routeFor(node) }))
+          .filter((record) => record.route && modelLabelMatches(record.label, expectedModel));
+        if (selectedReasoningControls.length !== 1) return {
+          ok: false,
+          error: 'review_model_mismatch_at_send',
+          noClickProven: true,
+          selectedModelMatchCount: selectedReasoningControls.length
+        };
+        clickTimeModelEvidence = {
+          expectedModel,
+          matchedLabel: selectedReasoningControls[0].label,
+          routeEvidence: selectedReasoningControls[0].route,
+          scopedMatchCount: 1
+        };
+      }
       const label = (node) => [
         node.getAttribute('aria-label') || '',
         node.getAttribute('data-testid') || '',
@@ -2088,10 +2449,49 @@ export class ChatGPTController {
       const geminiSend = (node) => {
         const aria = String(node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
         const dataTestId = String(node.getAttribute('data-test-id') || node.getAttribute('data-testid') || '').trim();
-        return /^(send|发送)$/i.test(aria) || /^send-button$/i.test(dataTestId);
+        return /^(send|\u53d1\u9001)$/i.test(aria) || /^send-button$/i.test(dataTestId);
       };
-      const candidates = isGemini ? allCandidates.filter(geminiSend) : allCandidates;
+      const geminiCandidatePool = isGemini
+        ? Array.from(document.querySelectorAll('button, [role="button"]')).filter((node) => visible(node) && !node.disabled && !prohibited.test(label(node)))
+        : allCandidates;
+      const explicitGeminiCandidates = isGemini ? geminiCandidatePool.filter(geminiSend) : allCandidates;
+      const composerForm = composer.closest('form');
+      const candidates = isGemini && explicitGeminiCandidates.length === 0
+        ? allCandidates.filter((node) => node.getAttribute('type') === 'submit' && (!!composerForm && composerForm.contains(node)))
+        : explicitGeminiCandidates;
       if (candidates.length !== 1) return { ok: false, error: 'review_send_control_ambiguous', count: candidates.length, noClickProven: true };
+      // Gemini's Angular control can ignore a synthetic HTMLElement.click()
+      // even though the visible button is unique and enabled. Hand off one
+      // hit-tested exact control to the native CDP pointer path instead. The
+      // caller dispatches exactly one press/release pair; no DOM click is
+      // performed first, so this cannot become a duplicate Send.
+      if (isGemini) {
+        const rect = candidates[0].getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        if (!hit || (hit !== candidates[0] && !candidates[0].contains(hit))) {
+          return { ok: false, error: 'review_send_control_obscured', noClickProven: true };
+        }
+        return {
+          ok: true,
+          nativePointer: true,
+          rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
+          label: label(candidates[0]),
+          clickTimeIdentity: {
+            ok: true,
+            recoveredExact: true,
+            textModel: REVIEW_PLAIN_TEXT_MODEL,
+            identityMode: comparison.identityMode,
+            sourceSha256: ${sourceSha},
+            canonicalPromptSha256: ${canonicalSha},
+            observedCanonicalSha256: ${canonicalSha},
+            serializedLength: String(serialized.text ?? '').length,
+            expectedLength: expected.length,
+            browserSpaceRebalanceCount: comparison.browserSpaceRebalanceCount || 0,
+            mismatchCount: comparison.mismatchCount || 0
+          },
+          clickTimeModelEvidence
+        };
+      }
       candidates[0].click();
       return {
         ok: true,
@@ -2109,15 +2509,26 @@ export class ChatGPTController {
           expectedLength: expected.length,
           browserSpaceRebalanceCount: comparison.browserSpaceRebalanceCount || 0,
           mismatchCount: comparison.mismatchCount || 0
-        }
+        },
+        clickTimeModelEvidence
       };
     })()`);
-    if (!result?.ok || result?.clickCount !== 1) {
+    if (!result?.ok || (result?.nativePointer !== true && result?.clickCount !== 1)) {
       const error = new Error(result?.error || 'review_send_control_ambiguous');
       error.data = result && result.ok === false
         ? { ...result, noClickProven: true }
         : result || null;
       throw error;
+    }
+    if (result.nativePointer === true) {
+      const rect = result.rect;
+      if (!rect || !Number.isFinite(rect.x) || !Number.isFinite(rect.y) || !Number.isFinite(rect.w) || !Number.isFinite(rect.h) || rect.w <= 0 || rect.h <= 0) {
+        const error = new Error('review_send_control_obscured');
+        error.data = { noClickProven: true };
+        throw error;
+      }
+      await this.#clickAt(rect.x + rect.w / 2, rect.y + rect.h / 2);
+      return { ...result, clickCount: 1 };
     }
     return result;
   }
@@ -2162,9 +2573,9 @@ export class ChatGPTController {
         submittedUserMessageId ||= newUserMessages.at(-1).id;
         const message = newUserMessages.find((candidate) => candidate.id === submittedUserMessageId);
         if (!message) throw new Error('review_user_message_identity_unreadable');
-        const textIdentity = message.textIdentityReadable === false
-          ? null
-          : safeReviewPlainTextComparison(expectedPrompt, message.text);
+        const textIdentity = compareRenderedReviewUserText(expectedPrompt, message, {
+          causalSubmissionAccepted
+        });
         const renderedDisplayFidelity = message.textIdentityReadable === false
           ? 'unreadable'
           : textIdentity?.ok === true
@@ -2215,12 +2626,12 @@ export class ChatGPTController {
           await sleep(400);
           continue;
         }
-        if (message.textIdentityReadable === false && !causalSubmissionAccepted) {
+        if (message.textIdentityReadable === false) {
           const error = new Error('review_user_message_identity_unreadable');
           error.data = observed;
           throw error;
         }
-        if (textIdentity?.ok !== true && !causalSubmissionAccepted) {
+        if (textIdentity?.ok !== true) {
           const error = new Error('review_user_message_content_mismatch');
           error.data = observed;
           throw error;
@@ -2326,7 +2737,13 @@ export class ChatGPTController {
     ) {
       throw new Error('review_content_rebind_receipt_invalid');
     }
-    if (renderedDisplayFidelity !== 'exact') {
+    // A causal send receipt plus a persisted user-message anchor can survive a
+    // provider DOM reconstruction with a different message id.  For a lossy
+    // rendered prompt, permit that rebind only in a one-turn conversation with
+    // no baseline messages; it cannot select an older or later user turn.
+    const causalSingleTurnLossy =
+      renderedDisplayFidelity !== 'exact' && baselineMessageIds.length === 0;
+    if (renderedDisplayFidelity !== 'exact' && !causalSingleTurnLossy) {
       throw new Error('review_content_rebind_unavailable_for_lossy_rendering');
     }
 
@@ -2347,15 +2764,22 @@ export class ChatGPTController {
       if (users.some((message) => message.textIdentityReadable !== true)) {
         throw new Error('review_content_rebind_user_content_unreadable');
       }
-      const matches = users.map((message) => ({
-        message,
-        identity: safeReviewPlainTextComparison(expectedPrompt, message.text)
-      })).filter(({ identity }) =>
-        identity.ok === true &&
-        identity.canonicalPromptSha256 === identity.observedCanonicalSha256
-      );
-      if (matches.length !== 1) throw new Error('review_content_rebind_user_match_ambiguous');
-      const { message: anchor, identity: anchorIdentity } = matches[0];
+      let anchor;
+      let anchorIdentity = null;
+      if (causalSingleTurnLossy) {
+        if (users.length !== 1) throw new Error('review_content_rebind_user_match_ambiguous');
+        [anchor] = users;
+      } else {
+        const matches = users.map((message) => ({
+          message,
+          identity: safeReviewPlainTextComparison(expectedPrompt, message.text)
+        })).filter(({ identity }) =>
+          identity.ok === true &&
+          identity.canonicalPromptSha256 === identity.observedCanonicalSha256
+        );
+        if (matches.length !== 1) throw new Error('review_content_rebind_user_match_ambiguous');
+        ({ message: anchor, identity: anchorIdentity } = matches[0]);
+      }
       if (!anchor.id) throw new Error('review_content_rebind_anchor_unreadable');
       if (baselineMessageIds.includes(anchor.id)) throw new Error('review_content_rebind_baseline_collision');
       const turn = await this.#reviewAssistantResult({
@@ -2386,13 +2810,13 @@ export class ChatGPTController {
         return {
           currentUserMessageId: anchor.id,
           contentRebind: {
-            mode: 'exact_prompt_content',
+            mode: causalSingleTurnLossy ? 'causal_single_turn_lossy' : 'exact_prompt_content',
             originalUserMessageId: userMessageId,
             currentUserMessageId: anchor.id,
             promptSha256: expectedPromptSha256,
-            promptTextModel: anchorIdentity.textModel,
-            canonicalPromptSha256: anchorIdentity.canonicalPromptSha256,
-            renderedIdentityMode: anchorIdentity.identityMode,
+            promptTextModel: causalSingleTurnLossy ? REVIEW_CAUSAL_SUBMISSION_MODEL : anchorIdentity.textModel,
+            canonicalPromptSha256: causalSingleTurnLossy ? expectedPromptSha256 : anchorIdentity.canonicalPromptSha256,
+            renderedIdentityMode: causalSingleTurnLossy ? 'display_not_source_identity' : anchorIdentity.identityMode,
             baselineMessageCount: baselineMessageIds.length,
             observedAt: now
           }
@@ -2516,24 +2940,44 @@ export class ChatGPTController {
     timeoutMs,
     onPrepared,
     onComposerVerified,
+    onSendBoundaryEntered,
     onSendAction,
     onUserTurnObserved,
     onSubmitted,
-    firstBinding = false
+    firstBinding = false,
+    requireModelPreflight = false
   }) {
     if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('missing_prompt');
     const deadline = Date.now() + Number(timeoutMs || 0);
-    const identity = { expectedUrl, expectedConversationId, expectedModel, allowUnboundRoot: firstBinding };
+    let activeExpectedModel = expectedModel;
+    const identity = { expectedUrl, expectedConversationId, expectedModel: activeExpectedModel, allowUnboundRoot: firstBinding };
     const run = { kind: 'review_query', requested: false, requestedAt: null, reason: null, onProgress: null };
     this.currentRun = run;
     try {
       await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
       let provider = null;
       try { provider = new URL(await this.page.getUrl()).hostname; } catch {}
-      if (provider === 'gemini.google.com' && geminiExpectedModelSpec(expectedModel).thinkingMode) {
-        const verifiedModelState = await this.#ensureExpectedModel(expectedModel, Math.min(Math.max(1, deadline - Date.now()), 60_000));
+      if (provider === 'chatgpt.com' && requireModelPreflight === true) {
+        const verifiedModelState = await this.#ensureExpectedModel(
+          expectedModel,
+          Math.min(Math.max(1, deadline - Date.now()), 60_000)
+        );
+        activeExpectedModel = verifiedModelState?.matchedLabel || expectedModel;
+        identity.expectedModel = activeExpectedModel;
         run.verifiedModelEvidence = {
-          expectedModel: String(expectedModel || ''),
+          expectedModel: activeExpectedModel,
+          matchedLabel: verifiedModelState?.matchedLabel || null,
+          routeEvidence: verifiedModelState?.routeEvidence || null,
+          scopedMatchCount: verifiedModelState?.scopedMatchCount || 0
+        };
+      } else if (provider === 'gemini.google.com' && (geminiExpectedModelSpec(expectedModel).thinkingMode || requireModelPreflight === true)) {
+        const verifiedModelState = expectedModel === '__selected__'
+          ? await this.#captureGeminiSelectedModel(Math.min(Math.max(1, deadline - Date.now()), 60_000))
+          : await this.#ensureExpectedModel(expectedModel, Math.min(Math.max(1, deadline - Date.now()), 60_000));
+        activeExpectedModel = verifiedModelState?.matchedLabel || expectedModel;
+        identity.expectedModel = activeExpectedModel;
+        run.verifiedModelEvidence = {
+          expectedModel: activeExpectedModel,
           matchedLabel: verifiedModelState?.matchedLabel || null
         };
       }
@@ -2575,8 +3019,32 @@ export class ChatGPTController {
       }
       await onComposerVerified?.(composerIdentity);
       const promptIdentity = reviewPlainTextIdentity(prompt);
+      const clickTimeSnapshot = await this.#reviewSnapshot(activeExpectedModel);
+      this.#assertReviewIdentity(clickTimeSnapshot, identity);
+      if (clickTimeSnapshot.controls?.stop || clickTimeSnapshot.controls?.continue || clickTimeSnapshot.controls?.retry) {
+        const error = new Error('review_tab_busy_at_send');
+        error.data = { noClickProven: true };
+        throw error;
+      }
+      let sendTimeModelEvidence = null;
+      if (provider === 'chatgpt.com' && requireModelPreflight === true) {
+        const modelState = run.verifiedModelEvidence;
+        if (modelState?.scopedMatchCount !== 1 || !modelState.matchedLabel || !modelState.routeEvidence) {
+          const error = new Error('review_model_mismatch_at_send');
+          error.data = { noClickProven: true, selectedModelMatchCount: modelState?.scopedMatchCount || 0 };
+          throw error;
+        }
+        sendTimeModelEvidence = {
+          expectedModel: activeExpectedModel,
+          matchedLabel: modelState.matchedLabel,
+          routeEvidence: modelState.routeEvidence,
+          scopedMatchCount: 1
+        };
+      }
+      await onSendBoundaryEntered?.({ enteredAt: Date.now(), modelEvidence: sendTimeModelEvidence });
       const clickReceipt = await this.#clickReviewSendOnce({
         expectedPrompt: prompt,
+        expectedModel: activeExpectedModel,
         sourcePromptSha256: promptIdentity.sourceSha256,
         canonicalPromptSha256: promptIdentity.canonicalSha256
       });
@@ -2584,7 +3052,8 @@ export class ChatGPTController {
         clickCount: clickReceipt?.clickCount || 0,
         sendActionCount: 1,
         sendActionAt: Date.now(),
-        clickTimeIdentity: clickReceipt?.clickTimeIdentity || null
+        clickTimeIdentity: clickReceipt?.clickTimeIdentity || null,
+        clickTimeModelEvidence: clickReceipt?.clickTimeModelEvidence || sendTimeModelEvidence
       });
       const submitted = await this.#waitForReviewUserMessage({
         baselineIds,
@@ -2599,14 +3068,14 @@ export class ChatGPTController {
       const submittedIdentity = {
         expectedUrl: submitted.snapshot.url,
         expectedConversationId: submitted.snapshot.conversationId,
-        expectedModel
+        expectedModel: activeExpectedModel
       };
       await onSubmitted?.({
         userMessageId: submitted.message.id,
         submittedAt: Date.now(),
         conversationUrl: submitted.snapshot.url,
         conversationId: submitted.snapshot.conversationId,
-        modelEvidence: submitted.snapshot.modelEvidence,
+        modelEvidence: sendTimeModelEvidence?.matchedLabel || submitted.snapshot.modelEvidence,
         sourcePromptSha256: reviewPlainTextIdentity(prompt).sourceSha256,
         canonicalPromptSha256: reviewPlainTextIdentity(prompt).canonicalSha256,
         submissionIdentityMode: submitted.submissionIdentityMode,
@@ -2615,20 +3084,237 @@ export class ChatGPTController {
         renderedDisplayEvidence: submitted.renderedDisplayEvidence,
         renderedIdentityMode: submitted.textIdentity?.identityMode || null
       });
-      return await this.#waitForReviewAssistant({
+      return {
+        status: 'SENT_WAITING',
         userMessageId: submitted.message.id,
-        deadline,
-        identity: firstBinding ? submittedIdentity : identity
-      });
+        conversationUrl: submitted.snapshot.url,
+        conversationId: submitted.snapshot.conversationId,
+        modelEvidence: sendTimeModelEvidence?.matchedLabel || submitted.snapshot.modelEvidence,
+        controls: submitted.snapshot.controls || null
+      };
     } finally {
       if (this.currentRun === run) this.currentRun = null;
     }
+  }
+
+  // A no-prompt/no-send normalizer for the current ChatGPT reasoning-strength
+  // control. A fresh tab may reset Pro to High. This entry point can change
+  // only that exact visible mode and returns before baseline capture, composer
+  // mutation, ledger creation, or Send.
+  async reviewReasoningModePreflight({ expectedMode, timeoutMs = 20_000 } = {}) {
+    const expected = String(expectedMode || '').trim();
+    if (!expected) throw new Error('missing_expected_reasoning_mode');
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+    const conversationUrl = await this.page.getUrl();
+    let provider = '';
+    try { provider = new URL(conversationUrl).hostname; } catch {}
+    if (provider !== 'chatgpt.com') throw new Error('review_reasoning_mode_provider_unsupported');
+    const modeState = await this.#ensureExpectedModel(expected, Math.max(1, deadline - Date.now()));
+    if (!modeState?.matched || !modeState?.matchedLabel) throw new Error('expected_reasoning_mode_switch_unconfirmed');
+    const snapshot = await this.#reviewSnapshot(expected);
+    this.#assertReviewIdentity(snapshot, {
+      expectedUrl: conversationUrl,
+      expectedConversationId: snapshot.conversationId,
+      expectedModel: expected,
+      allowUnboundRoot: !snapshot.conversationId
+    });
+    if (snapshot.controls?.stop || snapshot.controls?.continue || snapshot.controls?.retry || snapshot.controls?.answerNow) {
+      throw new Error('review_active_generation');
+    }
+    return {
+      provider: 'chatgpt',
+      conversationUrl,
+      reasoningModeEvidence: modeState.matchedLabel,
+      reasoningModeReceipt: {
+        selectedMode: modeState.matchedLabel,
+        expectedMode: expected,
+        selectionMethod: modeState.selectionMethod || 'visible_exact_reasoning_mode_option',
+        promptInsertCount: 0,
+        sendActionCount: 0
+      },
+      promptInsertCount: 0,
+      sendActionCount: 0
+    };
+  }
+
+  // Visible-DOM-only diagnostic for reasoning-control drift. It never focuses
+  // the composer, writes, or sends. The explicit `openModeSelector` option
+  // can open one unique visible mode trigger to enumerate its rendered menu.
+  // `scope=page` additionally records header/topbar relationships only.
+  async reviewReasoningModeDiagnostics({ timeoutMs = 20_000, scope = 'composer', openModeSelector = false } = {}) {
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+    const conversationUrl = await this.page.getUrl();
+    let provider = '';
+    try { provider = new URL(conversationUrl).hostname; } catch {}
+    if (provider !== 'chatgpt.com') throw new Error('review_reasoning_mode_provider_unsupported');
+    const promptSel = JSON.stringify(this.selectors.promptTextarea);
+    const requestedScope = String(scope || 'composer').trim().toLowerCase();
+    if (!['composer', 'page'].includes(requestedScope)) throw new Error('review_reasoning_mode_diagnostic_scope_invalid');
+    if (openModeSelector && requestedScope !== 'page') throw new Error('review_reasoning_mode_diagnostic_open_requires_page_scope');
+    let pickerOpened = false;
+    if (openModeSelector) {
+      const opener = await this.#eval(`(() => {
+        const agentifyOpenReasoningDiagnosticPickerMarker = true;
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+        };
+        const semanticName = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\\s+/g, ' ').trim();
+        const controls = Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
+          .filter((node) => /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || '')))
+          .filter((node) => node.getAttribute('data-testid') === 'model-switcher-dropdown-button' || /^(?:model selector|high|pro)$/i.test(semanticName(node)));
+        if (controls.length !== 1) return { ok: false, error: 'reasoning_mode_unbound_page_selector_unavailable', pickerCount: controls.length };
+        const rect = controls[0].getBoundingClientRect();
+        return { ok: true, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+      })()`);
+      if (!opener?.ok) throw new Error(opener?.error || 'reasoning_mode_unbound_page_selector_unavailable');
+      await this.#clickAt(opener.rect.x + opener.rect.w / 2, opener.rect.y + opener.rect.h / 2);
+      pickerOpened = true;
+      await sleep(250);
+    }
+    const diagnostic = await this.#eval(`(() => {
+      const reviewReasoningModeDiagnosticMarker = true;
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const visible = (node) => {
+        const rect = node?.getBoundingClientRect?.();
+        const style = node ? window.getComputedStyle(node) : null;
+        return !!rect && rect.width > 0 && rect.height > 0 && style?.visibility !== 'hidden' && style?.display !== 'none';
+      };
+      const composerSelection = locateReviewComposer(${promptSel});
+      const composer = composerSelection.element;
+      const composerRect = composer?.getBoundingClientRect?.() || null;
+      const requestedScope = ${JSON.stringify(requestedScope)};
+      const candidates = Array.from(document.querySelectorAll(requestedScope === 'page'
+        ? 'button, [role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"]'
+        : 'button, [role="button"]'))
+        .filter(visible)
+        .filter((node) => {
+          if (requestedScope === 'page') return true;
+          if (!composerRect) return false;
+          const r = node.getBoundingClientRect();
+          return r.bottom >= composerRect.top - 180 && r.top <= composerRect.bottom + 180 && r.right >= composerRect.left - 240 && r.left <= composerRect.right + 240;
+        })
+        .filter((node) => {
+          const testId = String(node.getAttribute('data-testid') || '');
+          const rawName = String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+          // History rows can expose science-bearing titles. They are not a
+          // reasoning-mode observation surface, so omit them entirely.
+          return !/(?:history-item|undefined-options)/i.test(testId) && !/^(?:pin|unpin|open conversation options? for)\b/i.test(rawName);
+        })
+        .slice(0, requestedScope === 'page' ? 40 : 24)
+        .map((node) => ({
+          tag: String(node.tagName || ''), role: String(node.getAttribute('role') || ''),
+          name: String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+          ariaHasPopup: String(node.getAttribute('aria-haspopup') || ''),
+          ariaControls: String(node.getAttribute('aria-controls') || ''),
+          dataTestId: String(node.getAttribute('data-testid') || ''),
+          insideComposerForm: !!composer?.closest?.('form')?.contains?.(node),
+          region: (() => {
+            const r = node.getBoundingClientRect();
+            if (composerRect && r.bottom >= composerRect.top - 180 && r.top <= composerRect.bottom + 180 && r.right >= composerRect.left - 240 && r.left <= composerRect.right + 240) return 'composer_neighborhood';
+            if (r.top < Math.max(180, window.innerHeight * 0.28)) return 'header_or_topbar';
+            return 'page_other';
+          })(),
+          semanticModeTrigger: /^(?:high|pro|chatgpt|model selector|reasoning(?: mode| strength)?|mode|thinking)$/i.test(String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim())
+        }));
+      return { scope: requestedScope, composerFound: !!composer, composerCandidateCount: composerSelection.candidateCount, controls: candidates };
+    })()`);
+    return { provider: 'chatgpt', conversationUrl, pickerOpened, promptInsertCount: 0, sendActionCount: 0, ...(diagnostic || {}) };
+  }
+
+  // No-prompt/no-send profile and root-binding inspection. Cookie results are
+  // aggregate presence metadata only and cannot establish authentication.
+  async reviewChatGPTProfileSnapshot({ timeoutMs = 20_000 } = {}) {
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+    const conversationUrl = await this.page.getUrl();
+    let parsed = null;
+    try { parsed = new URL(conversationUrl); } catch {}
+    if (parsed?.hostname !== 'chatgpt.com') throw new Error('review_chatgpt_profile_provider_unsupported');
+    let cookiePresence = { supported: false, reason: 'page_cookie_presence_unavailable' };
+    if (typeof this.page.getCookiePresenceMetadata === 'function') {
+      try {
+        cookiePresence = await this.page.getCookiePresenceMetadata({ url: 'https://chatgpt.com/' });
+      } catch (error) {
+        cookiePresence = { supported: false, reason: String(error?.message || 'page_cookie_presence_failed') };
+      }
+    }
+    const visibleControls = await this.reviewReasoningModeDiagnostics({
+      timeoutMs: Math.max(1, deadline - Date.now()), scope: 'page'
+    });
+    return {
+      provider: 'chatgpt',
+      conversationUrl,
+      urlBinding: parsed?.pathname === '/' ? 'provider_root' : /^\/c\/[^/]+\/?$/.test(parsed?.pathname || '') ? 'concrete_conversation' : 'other_chatgpt_path',
+      cookiePresence,
+      visibleControls,
+      promptInsertCount: 0,
+      sendActionCount: 0
+    };
+  }
+
+  // A bounded, non-sending probe for strict provider model preflight. Gemini
+  // uses its picker adapter; ChatGPT reads only the already-visible selected
+  // model. Both paths stop before baseline capture, composer mutation, or the
+  // Send boundary.
+  async reviewPreflight({ expectedModel, timeoutMs = 20_000 } = {}) {
+    const expected = String(expectedModel || '').trim();
+    if (!expected) throw new Error('missing_expected_model');
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.ensureReady({ timeoutMs: Math.max(1, deadline - Date.now()) });
+    const conversationUrl = await this.page.getUrl();
+    let provider = '';
+    try { provider = new URL(conversationUrl).hostname; } catch {}
+    if (provider === 'chatgpt.com') {
+      const modelState = await this.#readExpectedModelState(expected);
+      const snapshot = await this.#reviewSnapshot('');
+      this.#assertReviewIdentity(snapshot, {
+        expectedUrl: conversationUrl,
+        expectedConversationId: snapshot.conversationId,
+        expectedModel: '',
+        allowUnboundRoot: !snapshot.conversationId
+      });
+      if (snapshot.controls?.stop || snapshot.controls?.continue || snapshot.controls?.retry || snapshot.controls?.answerNow) {
+        throw new Error('review_active_generation');
+      }
+      return {
+        provider: 'chatgpt',
+        conversationUrl,
+        modelEvidence: modelState?.matchedLabel || null,
+        modelEvidenceCandidates: Array.isArray(modelState?.labels) ? modelState.labels : [],
+        modelEvidenceDiagnostics: Array.isArray(modelState?.visibleExactLabels) ? modelState.visibleExactLabels : [],
+        preflightVerified: modelState?.matched === true && !!modelState?.matchedLabel,
+        sendActionCount: 0,
+        promptInsertCount: 0
+      };
+    }
+    if (provider !== 'gemini.google.com') throw new Error('review_preflight_provider_unsupported');
+
+    const verified = await this.#ensureExpectedModel(expected, Math.max(1, deadline - Date.now()));
+    // A Gemini selection closes its menu synchronously.  `verified` is the
+    // adapter's immediate observation of the exact visible, menu-scoped,
+    // selected model and thinking controls; reopening/reading the now-closed
+    // menu can only erase that genuine evidence.  Do not substitute the
+    // abbreviated trigger label as a replacement proof.
+    if (!verified?.matched || !verified.matchedLabel) throw new Error('expected_model_switch_unconfirmed');
+    return {
+      provider: 'gemini',
+      conversationUrl,
+      modelEvidence: verified.matchedLabel,
+      sendActionCount: 0,
+      promptInsertCount: 0
+    };
   }
 
   async observeReviewResponse({
     expectedUrl,
     expectedConversationId,
     expectedModel,
+    submittedModelEvidence = expectedModel,
     userMessageId,
     expectedPrompt,
     expectedPromptSha256,
@@ -2638,11 +3324,21 @@ export class ChatGPTController {
     renderedDisplayFidelity = 'exact',
     timeoutMs
   }) {
+    if (renderedDisplayFidelity !== 'exact') {
+      throw new Error(renderedDisplayFidelity === 'unreadable'
+        ? 'review_user_message_identity_unreadable'
+        : 'review_user_message_content_mismatch');
+    }
     const deadline = Date.now() + Number(timeoutMs || 0);
-    let identity = { expectedUrl, expectedConversationId, expectedModel };
+    const persistedModelEvidence = String(submittedModelEvidence || expectedModel || '').trim();
+    // A replacement tab's reasoning picker describes the next submission,
+    // not the model used by this already-persisted user turn. Observation is
+    // therefore bound only to the concrete conversation and exact user turn;
+    // the send-time model receipt remains immutable evidence for completion.
+    let identity = { expectedUrl, expectedConversationId, expectedModel: '' };
     while (provisionalChatgptConversationId(identity.expectedConversationId) && Date.now() < deadline) {
       this.#throwIfStopRequested();
-      const snapshot = await this.#reviewSnapshot(expectedModel);
+      const snapshot = await this.#reviewSnapshot('');
       const sameUser = (snapshot.messages || []).some(
         (candidate) => candidate.role === 'user' && candidate.id === userMessageId
       );
@@ -2652,7 +3348,7 @@ export class ChatGPTController {
         snapshot.conversationId &&
         !provisionalChatgptConversationId(snapshot.conversationId)
       ) {
-        identity = { expectedUrl: snapshot.url, expectedConversationId: snapshot.conversationId, expectedModel };
+        identity = { expectedUrl: snapshot.url, expectedConversationId: snapshot.conversationId, expectedModel: '' };
         break;
       }
       await sleep(400);
@@ -2672,12 +3368,24 @@ export class ChatGPTController {
       sendActionCount,
       renderedDisplayFidelity
     });
-    return await this.#waitForReviewAssistant({
-      userMessageId,
-      deadline,
-      identity,
-      ...anchor
-    });
+    try {
+      const completed = await this.#waitForReviewAssistant({
+        userMessageId,
+        deadline,
+        identity,
+        ...anchor
+      });
+      return { ...completed, modelEvidence: persistedModelEvidence };
+    } catch (error) {
+      if (String(error?.message || error) !== 'timeout_waiting_for_response') throw error;
+      return {
+        status: 'SENT_WAITING',
+        userMessageId,
+        conversationUrl: identity.expectedUrl,
+        conversationId: identity.expectedConversationId,
+        modelEvidence: persistedModelEvidence
+      };
+    }
   }
 
   async inspectReviewSubmissionIdentity({ prompt, baselineMessageIds, expectedUrl, expectedConversationId, expectedModel }) {
@@ -2728,14 +3436,15 @@ export class ChatGPTController {
     expectedUrl,
     expectedConversationId,
     expectedModel,
+    submittedModelEvidence = expectedModel,
     timeoutMs,
     causalSubmissionReceipt,
     onRecovered
   }) {
     const deadline = Date.now() + Number(timeoutMs || 0);
-    const identity = { expectedUrl, expectedConversationId, expectedModel };
-    const snapshot = await this.#reviewSnapshot(expectedModel);
-    this.#assertReviewIdentity(snapshot, identity);
+    const persistedModelEvidence = String(submittedModelEvidence || '').trim();
+    const identity = { expectedUrl, expectedConversationId, expectedModel: '' };
+    const snapshot = await this.#waitForReviewIdentity({ ...identity, deadline });
     if (!Array.isArray(baselineMessageIds)) throw new Error('review_submission_baseline_missing');
     const baselineIds = new Set(baselineMessageIds);
     const newUserMessages = (snapshot.messages || []).filter(
@@ -2760,9 +3469,9 @@ export class ChatGPTController {
       throw error;
     }
     const message = newUserMessages[0];
-    const renderedIdentity = message.textIdentityReadable === false
-      ? null
-      : safeReviewPlainTextComparison(prompt, message.text);
+    const renderedIdentity = compareRenderedReviewUserText(prompt, message, {
+      causalSubmissionAccepted: true
+    });
     const renderedExact = renderedIdentity?.ok === true;
     const {
       candidateCount: renderedContentCandidateCount = null,
@@ -2774,7 +3483,7 @@ export class ChatGPTController {
       submittedAt: Date.now(),
       conversationUrl: snapshot.url,
       conversationId: snapshot.conversationId,
-      modelEvidence: snapshot.modelEvidence,
+      modelEvidence: persistedModelEvidence,
       identityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
       renderedDisplayFidelity: message.textIdentityReadable === false
         ? 'unreadable'
@@ -2790,7 +3499,14 @@ export class ChatGPTController {
         ...renderedContentDiagnostic
       }
     });
-    return await this.#waitForReviewAssistant({ userMessageId: message.id, deadline, identity });
+    if (!renderedExact) throw new Error('review_recovery_rendered_identity_unreadable');
+    return {
+      status: 'SENT_WAITING',
+      userMessageId: message.id,
+      conversationUrl: snapshot.url,
+      conversationId: snapshot.conversationId,
+      modelEvidence: persistedModelEvidence
+    };
   }
 
   async #waitForAssistantStable({ timeoutMs = 5 * 60_000, stableMs = 3000, pollMs = 400, baselineAssistantCount = 0 } = {}) {

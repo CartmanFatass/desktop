@@ -148,7 +148,7 @@ The core loop is:
 The MCP server registers `agentify_*` tools, including:
 
 - `agentify_query`: send a prompt to a stable tab and return the assistant response.
-- `agentify_review_query`: submit one exact ChatGPT Pro review request with a persistent conversation binding, idempotency key, exact message identities, two-snapshot natural-completion proof, and a durable receipt. It never activates Continue, Retry, ResponseRetry, or Answer now.
+- `agentify_review_query`: submit one exact review request, return after the sent user turn is confirmed, and observe that same provider conversation until the full response is atomically archived. It never activates Continue, Retry, ResponseRetry, or Answer now.
 - `agentify_read_page`: read visible page text from a tab.
 - `agentify_navigate`: navigate a tab to a URL.
 - `agentify_ensure_ready`: wait for login, CAPTCHA, or UI readiness.
@@ -163,20 +163,32 @@ The MCP server registers `agentify_*` tools, including:
 
 `agentify_review_query` is intentionally narrower than `agentify_query`. It requires
 an exact ChatGPT conversation URL and identity, an expected visible model label, a
-stable key, an idempotency key, and the lowercase SHA-256 of the exact UTF-8 prompt.
+stable key, an idempotency key, and an absolute `responsePath`. `promptSha256` is an
+optional tool-local check; Agentify computes it when omitted.
 The first call records durable send intent before one send-button action. Reusing the
 same idempotency key returns or observe-only verifies the existing operation; a
 different payload is rejected.
 
 The strict path inserts the complete prompt without using clipboard paste, then
-verifies the active composer contains the exact text before it can activate Send.
+verifies the active composer, provider conversation, and exact currently visible model
+label immediately before it can activate Send. Model labels are discovered from the
+live UI and compared exactly after case and whitespace normalization; Agentify does
+not invent aliases for unavailable variants.
 If ChatGPT cannot expose the full text as one exact user message, identity remains
 unreadable and the durable intent prevents an automatic duplicate submission.
 
+After the exact user turn is confirmed, the send call returns `SENT_WAITING` and may
+keep observing natural generation for the requested window, up to 45 minutes. That
+window reflects ordinary Pro generation latency rather than an error budget. An
+observation timeout is nonterminal and does not authorize another send. Repeated calls
+continue observing the same operation; tabs may be replaced while observing the same
+persistent provider conversation.
+
 Completion requires the same assistant message identity and response hash in two
 snapshots at least three seconds apart, with no active Stop, Continue, or Retry
-control. The maximum submission deadline is 45 minutes. An explicit verification of
-a persisted submission uses a new, bounded observation window and never sends again.
+control. Agentify writes the complete response to a temporary file, atomically renames
+it to `responsePath`, and verifies it before returning `COMPLETE`. The MCP result
+contains the archive path and metadata, not the potentially large response body.
 Ambiguous identity or a crash around submission never triggers an automatic second send.
 
 The 2026-07-31 production dependency audit reports 11 advisories (6 moderate,

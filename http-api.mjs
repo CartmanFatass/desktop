@@ -8,7 +8,7 @@ import { ensureArtifactsDir, listArtifacts, registerArtifact, artifactsRoot } fr
 import { deleteBundle, getBundle, listBundles, saveBundle } from './bundle-store.mjs';
 import { assertWithin } from './orchestrator/security.mjs';
 import { prepareQueryContext } from './context-packer.mjs';
-import { inspectReviewAdmission, runReviewQuery } from './review-transport.mjs';
+import { inspectReviewAdmission, observeReviewOperation, runReviewQuery } from './review-transport.mjs';
 
 function isLoopback(remoteAddress) {
   const a = String(remoteAddress || '');
@@ -52,6 +52,8 @@ function authOk(req, token) {
 
 export function mapErrorToHttp(error) {
   const msg = String(error?.message || '');
+  if (msg.startsWith('operator_')) return { code: 409, body: { error: msg, data: error?.data || null } };
+  if (msg === 'LOAD_OR_POSTCONDITION_UNRESOLVED') return { code: 408, body: { error: msg, data: error?.data || null } };
   if (msg === 'body_too_large') return { code: 413, body: { error: 'body_too_large' } };
   if (msg === 'invalid_json') return { code: 400, body: { error: 'invalid_json' } };
   if (msg === 'invalid_vendor') return { code: 400, body: { error: 'invalid_vendor', data: error?.data || null } };
@@ -81,6 +83,7 @@ export function mapErrorToHttp(error) {
   if (msg === 'max_tabs_reached') return { code: 409, body: { error: 'max_tabs_reached' } };
   if (msg === 'rate_limited') return { code: 429, body: { error: 'rate_limited', ...(error?.data || {}) } };
   if (msg === 'query_aborted') return { code: 409, body: { error: 'query_aborted', data: error?.data || null } };
+  if (msg.startsWith('controller_refresh_')) return { code: 409, body: { error: msg, data: error?.data || null } };
   if (msg === 'timeout_waiting_for_prompt') return { code: 408, body: { error: 'timeout_waiting_for_prompt', data: error?.data || null } };
   if (msg === 'timeout_waiting_for_response') return { code: 408, body: { error: 'timeout_waiting_for_response', data: error?.data || null } };
   if (['review_invalid_request', 'review_prompt_hash_mismatch', 'review_timeout_out_of_range'].includes(msg)) {
@@ -105,6 +108,10 @@ export function mapErrorToHttp(error) {
       'review_send_control_ambiguous',
       'review_composer_identity_mismatch',
       'review_continuation_baseline_empty',
+      'strict_transport_requires_chrome_cdp',
+      'strict_transport_requires_existing_chrome_cdp',
+      'chrome_cdp_existing_surface_unavailable',
+      'chrome_cdp_surface_not_google_chrome',
       'review_tab_busy',
       'key_url_mismatch'
     ].includes(msg)
@@ -130,6 +137,64 @@ function positiveIntOr(value, fallback, max = Number.POSITIVE_INFINITY) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.max(1, Math.min(max, Math.floor(n)));
+}
+
+const STRICT_REVIEW_TERMINAL_TAB_STATES = new Set([
+  'NATURAL_COMPLETION_VERIFIED',
+  'ZERO_SEND_FAILED',
+  'SENT_INPUT_MISMATCH',
+  'SENT_MODEL_MISMATCH'
+]);
+
+const STRICT_REVIEW_RECOVERABLE_TAB_STATES = new Set([
+  'COMMITMENT_UNKNOWN',
+  'SENT_WAITING',
+  'SENT_UNREADABLE'
+]);
+
+function concreteReviewConversationId(receipt) {
+  const value = String(
+    receipt?.observedConversationId || receipt?.conversationId || ''
+  ).trim();
+  if (!value || value === '__new__' || value.startsWith('WEB:')) return '';
+  return value;
+}
+
+export async function releaseStrictReviewTab({ tabs, defaultTabId, receipt } = {}) {
+  const tabId = String(receipt?.tabId || '').trim();
+  if (!tabId) return { status: 'NOT_APPLICABLE', tabId: null };
+  if (tabId === String(defaultTabId || '').trim()) {
+    return { status: 'RETAINED_PROTECTED', tabId };
+  }
+
+  const transportState = String(receipt?.terminalState || receipt?.status || '').trim();
+  const terminal = receipt?.status === 'COMPLETE' ||
+    STRICT_REVIEW_TERMINAL_TAB_STATES.has(transportState);
+  const recoverable = STRICT_REVIEW_RECOVERABLE_TAB_STATES.has(transportState);
+  const conversationId = concreteReviewConversationId(receipt);
+  if (!terminal && !(recoverable && conversationId)) {
+    return {
+      status: 'RETAINED_RECOVERY_HANDLE',
+      tabId,
+      reason: 'concrete_conversation_id_unavailable'
+    };
+  }
+
+  try {
+    await tabs.closeTab(tabId);
+    return { status: 'CLOSED', tabId, conversationId: conversationId || null };
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (message === 'tab_not_found' || message === 'tab_closed') {
+      return { status: 'ALREADY_RELEASED', tabId, conversationId: conversationId || null };
+    }
+    return {
+      status: 'CLOSE_FAILED',
+      tabId,
+      conversationId: conversationId || null,
+      error: message
+    };
+  }
 }
 
 function normalizeAbsolutePathList(items, { field } = {}) {
@@ -471,7 +536,9 @@ export function startHttpApi({
   onScanWatchFolder,
   getStatus,
   getSettings,
-  onRuntimeChanged
+  onRuntimeChanged,
+  getControllerRuntimeState = null,
+  onControllerRuntimeRefresh = null
 }) {
   const tokenRef = typeof token === 'string' ? { current: token } : token;
 
@@ -486,10 +553,27 @@ export function startHttpApi({
   const lastQueryAt = new Map(); // tabId -> ms
   let lastAnyQueryAt = 0;
   const bucket = { tokens: null, lastRefillAt: Date.now(), lastCap: null };
+  let controllerRefreshInProgress = false;
+  let runtimeAdmissions = 0;
+
+  const controllerRuntimeSnapshot = () => {
+    const value = typeof getControllerRuntimeState === 'function' ? getControllerRuntimeState() : null;
+    return { supported: false, refreshInProgress: controllerRefreshInProgress, ...(value && typeof value === 'object' ? value : {}) };
+  };
+
+  const assertRefreshSafe = () => {
+    const reasons = [];
+    if (inflight.queries > 0 || activeQueries.size > 0 || activeReviewQueries.size > 0 || activeReviewAdmissions.size > 0) reasons.push('runtime_inflight_or_strict_operation');
+    if (reasons.length) {
+      const error = new Error('controller_refresh_deferred');
+      error.data = { reasons, runtime: runtimeSnapshot() };
+      throw error;
+    }
+  };
 
   const getGovernor = async () => {
     const s = (await getSettings?.().catch(() => null)) || {};
-    const maxInflightQueries = Math.max(1, Number(s.maxInflightQueries || 2) || 2);
+    const maxInflightQueries = Math.max(1, Number(s.maxInflightQueries || 6) || 6);
     const maxQueriesPerMinute = Math.max(1, Number(s.maxQueriesPerMinute || 12) || 12);
     const minTabGapMs = Math.max(0, Number(s.minTabGapMs || 0) || 0);
     const minGlobalGapMs = Math.max(0, Number(s.minGlobalGapMs || 0) || 0);
@@ -648,7 +732,8 @@ export function startHttpApi({
       .sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0)),
     lastOutcomes: Array.from(lastOutcomes.entries())
       .map(([tabId, item]) => ({ tabId, ...item }))
-      .sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0))
+      .sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0)),
+    controllerRuntime: controllerRuntimeSnapshot()
   });
 
   const emitRuntimeChanged = () => {
@@ -734,6 +819,8 @@ export function startHttpApi({
   };
 
   const server = http.createServer(async (req, res) => {
+    let runtimeAdmissionReserved = false;
+    let refreshGateReserved = false;
     try {
       if (!isLoopback(req.socket?.remoteAddress)) return sendJson(res, 403, { error: 'forbidden' });
       if (req.method === 'OPTIONS') return sendJson(res, 200, { ok: true });
@@ -749,6 +836,23 @@ export function startHttpApi({
       }
 
       if (!authOk(req, tokenRef.current)) return sendJson(res, 401, { error: 'unauthorized' });
+
+      const isControllerRefresh = url.pathname === '/runtime-controller-refresh' && req.method === 'POST';
+      const isControllerRefreshStatus = url.pathname === '/runtime-controller-refresh-status' && req.method === 'GET';
+      if (isControllerRefresh) {
+        if (controllerRefreshInProgress) throw new Error('controller_refresh_in_progress');
+        if (runtimeAdmissions > 0) {
+          const error = new Error('controller_refresh_deferred');
+          error.data = { reasons: ['runtime_request_active'], runtime: runtimeSnapshot() };
+          throw error;
+        }
+        controllerRefreshInProgress = true;
+        refreshGateReserved = true;
+      } else if (!isControllerRefreshStatus) {
+        if (controllerRefreshInProgress) throw new Error('controller_refresh_in_progress');
+        runtimeAdmissions += 1;
+        runtimeAdmissionReserved = true;
+      }
 
       const governor = await getGovernor();
 
@@ -889,6 +993,131 @@ export function startHttpApi({
         return sendJson(res, 200, { ok: true, tabId, state: st });
       }
 
+      if (url.pathname === '/review-preflight' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const expectedModel = String(body.expectedModel || body.model || '').trim();
+        if (!expectedModel) throw new Error('missing_expected_model');
+        const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        const controller = tabs.getControllerById(tabId);
+        if (typeof controller?.reviewPreflight !== 'function') throw new Error('review_preflight_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewPreflight({ expectedModel, timeoutMs }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      // This path has no prompt or review-operation fields. It can only
+      // normalize the visible ChatGPT High/Pro reasoning mode pre-send.
+      if (url.pathname === '/review-reasoning-mode-preflight' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const expectedMode = String(body.expectedMode || body.expectedModel || body.model || '').trim();
+        if (!expectedMode) throw new Error('missing_expected_reasoning_mode');
+        const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        const controller = tabs.getControllerById(tabId);
+        if (typeof controller?.reviewReasoningModePreflight !== 'function') throw new Error('review_reasoning_mode_preflight_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewReasoningModePreflight({ expectedMode, timeoutMs }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      if (url.pathname === '/review-reasoning-mode-diagnostics' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
+        const scope = String(body.scope || 'composer').trim().toLowerCase();
+        if (!['composer', 'page'].includes(scope)) throw new Error('review_reasoning_mode_diagnostic_scope_invalid');
+        const openModeSelector = body.openModeSelector === true;
+        if (openModeSelector && scope !== 'page') throw new Error('review_reasoning_mode_diagnostic_open_requires_page_scope');
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        const controller = tabs.getControllerById(tabId);
+        if (typeof controller?.reviewReasoningModeDiagnostics !== 'function') throw new Error('review_reasoning_mode_diagnostics_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewReasoningModeDiagnostics({ timeoutMs, scope, openModeSelector }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      // This path exposes only aggregate ChatGPT session/profile metadata plus
+      // visible controls. It has no prompt, operation, or Send surface.
+      if (url.pathname === '/review-chatgpt-profile-snapshot' && req.method === 'POST') {
+        const body = await parseBody(req);
+        const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
+        const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        const controller = tabs.getControllerById(tabId);
+        if (typeof controller?.reviewChatGPTProfileSnapshot !== 'function') throw new Error('review_chatgpt_profile_snapshot_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewChatGPTProfileSnapshot({ timeoutMs }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      // Closed-loop native Operator surface. Observation is result-blind and
+      // includes only a fail-closed rendered High/Pro-to-actionable-ancestor
+      // mapping; an action can address only a current, visible, hit-tested
+      // non-forbidden target from that exact observation. The protected default
+      // is read-only.
+      if (url.pathname === '/operator-observe' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 8_192 });
+        const tabId = String(body.tabId || '').trim();
+        if (!tabId) throw new Error('missing_tabId');
+        const controller = tabs.getControllerById(tabId);
+        if (!controller) throw new Error('tab_not_found');
+        if (typeof controller.operatorObserve !== 'function') throw new Error('operator_observe_unavailable');
+        const result = await runExclusive(controller, async () => controller.operatorObserve({ tabId }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      if (url.pathname === '/operator-act' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 16_384 });
+        const tabId = String(body.tabId || '').trim();
+        if (!tabId) throw new Error('missing_tabId');
+        if (tabId === defaultTabId) throw new Error('operator_protected_default_mutation_forbidden');
+        const controller = tabs.getControllerById(tabId);
+        if (!controller) throw new Error('tab_not_found');
+        if (typeof controller.operatorAct !== 'function') throw new Error('operator_act_unavailable');
+        const result = await runExclusive(controller, async () => controller.operatorAct({
+          tabId, url: String(body.url || ''), revision: String(body.revision || ''), targetId: String(body.targetId || ''),
+          action: String(body.action || ''), key: body.key, modifiers: body.modifiers,
+          textPath: body.textPath, textSha256: body.textSha256
+        }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      if (url.pathname === '/operator-wait' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 8_192 });
+        const tabId = String(body.tabId || '').trim();
+        if (!tabId) throw new Error('missing_tabId');
+        const controller = tabs.getControllerById(tabId);
+        if (!controller) throw new Error('tab_not_found');
+        if (typeof controller.operatorWait !== 'function') throw new Error('operator_wait_unavailable');
+        const result = await runExclusive(controller, async () => controller.operatorWait({ tabId, url: String(body.url || ''), role: String(body.role || ''), label: String(body.label || ''), selected: typeof body.selected === 'boolean' ? body.selected : null, timeoutMs: body.timeoutMs }));
+        return sendJson(res, 200, { ok: true, tabId, result });
+      }
+
+      // Local controller/module reload: no tab, prompt, provider, operation or
+      // source-path input exists. The current loaded generation/digest must be
+      // echoed, so stale callers cannot silently replace a controller.
+      if (url.pathname === '/runtime-controller-refresh-status' && req.method === 'GET') {
+        return sendJson(res, 200, { ok: true, runtime: runtimeSnapshot() });
+      }
+
+      if (url.pathname === '/runtime-controller-refresh' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 8_192 });
+        const keys = Object.keys(body || {}).sort();
+        if (keys.length !== 2 || keys[0] !== 'expectedGeneration' || keys[1] !== 'expectedSourceDigest') throw new Error('controller_refresh_request_invalid');
+        const expectedGeneration = Number(body.expectedGeneration);
+        const expectedSourceDigest = String(body.expectedSourceDigest || '').trim();
+        if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0 || !/^[0-9a-f]{64}$/.test(expectedSourceDigest)) throw new Error('controller_refresh_request_invalid');
+        if (typeof onControllerRuntimeRefresh !== 'function') throw new Error('controller_refresh_unsupported');
+        assertRefreshSafe();
+        const result = await onControllerRuntimeRefresh({ expectedGeneration, expectedSourceDigest });
+        return sendJson(res, 200, { ok: true, result, runtime: runtimeSnapshot() });
+      }
+
+      if (url.pathname === '/review-observe' && req.method === 'POST') {
+        const body = await parseBody(req, { maxBytes: 8_192 });
+        const result = await observeReviewOperation({
+          stateDir,
+          idempotencyKey: body.idempotencyKey,
+          operationId: body.operationId
+        });
+        return sendJson(res, 200, { ok: true, result });
+      }
+
       if (url.pathname === '/review-query' && req.method === 'POST') {
         const body = await parseBody(req, { maxBytes: 2_000_000 });
         const admission = await inspectReviewAdmission({ stateDir, request: body });
@@ -919,14 +1148,68 @@ export function startHttpApi({
           startedAt,
           updatedAt: startedAt
         };
+        const reviewScopes = new Set();
+        const reserveReviewScope = (scope) => {
+          if (!scope) return;
+          const current = activeScopes.get(scope);
+          if (current && current.id !== reviewRun.id) assertScopeNotBusy(scope);
+          if (!current) {
+            reserveScope(scope, reviewRun);
+            reviewScopes.add(scope);
+          }
+        };
+        const releaseReviewReceipt = async (receipt) => {
+          const lifecycleReceipt = {
+            ...receipt,
+            tabId: receipt?.tabId || reviewRun.tabId || null
+          };
+          if (joinsExactActiveOperation) {
+            return {
+              status: 'RETAINED_ACTIVE_OPERATION',
+              tabId: lifecycleReceipt.tabId,
+              conversationId: concreteReviewConversationId(lifecycleReceipt) || null
+            };
+          }
+          const tabId = String(lifecycleReceipt.tabId || '').trim();
+          if (!tabId) return await releaseStrictReviewTab({ tabs, defaultTabId, receipt: lifecycleReceipt });
+          try {
+            const controller = tabs.getControllerById(tabId);
+            return await runExclusive(controller, async () =>
+              await releaseStrictReviewTab({ tabs, defaultTabId, receipt: lifecycleReceipt })
+            );
+          } catch {
+            // A browser target may already be gone while TabManager still has a
+            // stale row. Let closeTab perform its idempotent local cleanup.
+            return await releaseStrictReviewTab({ tabs, defaultTabId, receipt: lifecycleReceipt });
+          }
+        };
         activeReviewQueries.set(runtimeKey, reviewRun);
         emitRuntimeChanged();
         try {
-          const receipt = await runReviewQuery({ stateDir, tabs, request: body });
+          if (!joinsExactActiveOperation) {
+            reserveReviewScope(reviewRun.stableKey ? `key:${reviewRun.stableKey}` : null);
+            reserveReviewScope(reviewRun.tabId ? `tab:${reviewRun.tabId}` : null);
+          }
+          const receipt = await runReviewQuery({
+            stateDir,
+            tabs,
+            request: body,
+            onTabResolved: async ({ tabId }) => {
+              reviewRun.tabId = tabId;
+              reviewRun.updatedAt = Date.now();
+              if (!joinsExactActiveOperation) reserveReviewScope(`tab:${tabId}`);
+              emitRuntimeChanged();
+            }
+          });
+          const tabLifecycle = await releaseReviewReceipt(receipt);
+          const returnedReceipt = { ...receipt, tabLifecycle };
           if (reviewRun.tabId) {
+            const nonterminal = new Set(['COMMITMENT_UNKNOWN', 'SENT_WAITING', 'SENT_UNREADABLE']).has(receipt?.terminalState);
             setLastOutcome(reviewRun.tabId, {
-              status: 'success',
-              label: reviewRun.verifyExisting ? 'Strict review observed' : 'Strict review completed',
+              status: nonterminal ? 'in_progress' : 'success',
+              label: nonterminal
+                ? 'Strict review retained for observation'
+                : reviewRun.verifyExisting ? 'Strict review observed' : 'Strict review completed',
               detail: receipt?.terminalState || receipt?.status || 'complete',
               source: 'strict-review',
               kind: 'review_query',
@@ -934,8 +1217,44 @@ export function startHttpApi({
               durationMs: Math.max(0, Date.now() - startedAt)
             });
           }
-          return sendJson(res, 200, { ok: true, receipt });
+          return sendJson(res, 200, { ok: true, receipt: returnedReceipt });
         } catch (error) {
+          let transportReceipt = null;
+          try {
+            transportReceipt = await observeReviewOperation({
+              stateDir,
+              idempotencyKey: String(body.idempotencyKey || '').trim()
+            });
+          } catch {
+            // Request validation and programming failures may not have created
+            // an operation. Those remain ordinary HTTP errors below.
+          }
+          const typedTransportStates = new Set([
+            'ZERO_SEND_FAILED',
+            'COMMITMENT_UNKNOWN',
+            'SENT_WAITING',
+            'SENT_UNREADABLE',
+            'SENT_INPUT_MISMATCH',
+            'SENT_MODEL_MISMATCH'
+          ]);
+          if (transportReceipt && typedTransportStates.has(transportReceipt.terminalState)) {
+            const tabLifecycle = await releaseReviewReceipt(transportReceipt);
+            const returnedReceipt = { ...transportReceipt, tabLifecycle };
+            if (reviewRun.tabId) {
+              setLastOutcome(reviewRun.tabId, {
+                status: ['COMMITMENT_UNKNOWN', 'SENT_WAITING', 'SENT_UNREADABLE'].includes(transportReceipt.terminalState)
+                  ? 'in_progress'
+                  : 'error',
+                label: 'Strict review transport fact recorded',
+                detail: transportReceipt.terminalState,
+                source: 'strict-review',
+                kind: 'review_query',
+                finishedAt: Date.now(),
+                durationMs: Math.max(0, Date.now() - startedAt)
+              });
+            }
+            return sendJson(res, 200, { ok: true, receipt: returnedReceipt });
+          }
           if (reviewRun.tabId) {
             setLastOutcome(reviewRun.tabId, {
               status: 'error',
@@ -949,6 +1268,7 @@ export function startHttpApi({
           }
           throw error;
         } finally {
+          for (const scope of reviewScopes) clearScope(scope, reviewRun.id);
           activeReviewQueries.delete(runtimeKey);
           if (reserveSendCapacity) {
             if (activeReviewAdmissions.get(admission.idempotencyKey)?.requestFingerprint === admission.requestFingerprint) {
@@ -1191,7 +1511,7 @@ export function startHttpApi({
             result = await Promise.race([
               activeRun.promise,
               new Promise((resolve) => {
-                timer = setTimeout(() => resolve(pending), Math.min(timeoutMs, 240_000));
+                timer = setTimeout(() => resolve(pending), timeoutMs);
               })
             ]);
           } finally {
@@ -1340,24 +1660,33 @@ export function startHttpApi({
       const mapped = mapErrorToHttp(error);
       if (mapped) return sendJson(res, mapped.code, mapped.body);
       return sendJson(res, 500, { error: 'internal_error', message: error?.message || String(error), data: error?.data || null });
+    } finally {
+      if (runtimeAdmissionReserved) runtimeAdmissions = Math.max(0, runtimeAdmissions - 1);
+      if (refreshGateReserved) controllerRefreshInProgress = false;
     }
   });
 
   server.getRuntimeState = () => runtimeSnapshot();
   server.stopActiveQuery = async ({ tabId }) => {
-    const active = patchActiveQuery(tabId, { stopRequested: true, stopRequestedAt: Date.now() }) || null;
-    const controller = tabs.getControllerById(tabId);
-    const stopped = typeof controller?.requestStop === 'function'
-      ? await controller.requestStop({ reason: 'user_stop' })
-      : { ok: true, requested: false, clicked: false };
-    return {
-      ok: true,
-      tabId,
-      requested: !!stopped?.requested || !!active,
-      clicked: !!stopped?.clicked,
-      activeQuery: activeQueries.get(tabId) || active || null,
-      runtime: runtimeSnapshot()
-    };
+    if (controllerRefreshInProgress) throw new Error('controller_refresh_in_progress');
+    runtimeAdmissions += 1;
+    try {
+      const active = patchActiveQuery(tabId, { stopRequested: true, stopRequestedAt: Date.now() }) || null;
+      const controller = tabs.getControllerById(tabId);
+      const stopped = typeof controller?.requestStop === 'function'
+        ? await controller.requestStop({ reason: 'user_stop' })
+        : { ok: true, requested: false, clicked: false };
+      return {
+        ok: true,
+        tabId,
+        requested: !!stopped?.requested || !!active,
+        clicked: !!stopped?.clicked,
+        activeQuery: activeQueries.get(tabId) || active || null,
+        runtime: runtimeSnapshot()
+      };
+    } finally {
+      runtimeAdmissions = Math.max(0, runtimeAdmissions - 1);
+    }
   };
 
   return new Promise((resolve, reject) => {

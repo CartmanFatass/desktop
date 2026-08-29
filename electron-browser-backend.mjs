@@ -163,8 +163,14 @@ export class ElectronBrowserBackend {
   }
 
   async start() {
+    return this.getState();
+  }
+
+  getState() {
     return {
       kind: 'electron',
+      attachedToExisting: false,
+      launchedByAgentify: true,
       managedProfile: true
     };
   }

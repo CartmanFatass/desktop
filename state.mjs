@@ -114,8 +114,18 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
     ) {
       throw new Error('review_transport_state_invalid');
     }
+    if (binding.geminiBootstrap !== undefined) {
+      const bootstrap = binding.geminiBootstrap;
+      if (
+        binding.provider !== 'gemini' || !bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap) ||
+        bootstrap.nonScientific !== true || !nonEmptyString(bootstrap.bootstrapOperationId) ||
+        !nonEmptyString(bootstrap.bootstrapModel) || typeof bootstrap.continuationConsumed !== 'boolean' ||
+        (bootstrap.continuationConsumed && (!nonEmptyString(bootstrap.continuationOperationId) || !nonEmptyString(bootstrap.continuationModel))) ||
+        (!bootstrap.continuationConsumed && (bootstrap.continuationOperationId !== undefined || bootstrap.continuationModel !== undefined))
+      ) throw new Error('review_transport_state_invalid');
+    }
   }
-  const statuses = new Set(['SEND_INTENT', 'PREPARED', 'SUBMITTED', 'BLOCKED', 'COMPLETE']);
+  const statuses = new Set(['SEND_INTENT', 'PREPARED', 'SUBMITTED', 'OBSERVING', 'BLOCKED', 'COMPLETE']);
   for (const [key, operation] of Object.entries(value.operations)) {
     if (
       !nonEmptyString(key) ||
@@ -136,9 +146,7 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
       operation.sendCount < 0 ||
       operation.sendCount > 1 ||
       !Number.isFinite(operation.createdAt) ||
-      !Number.isFinite(operation.updatedAt) ||
-      !Number.isFinite(operation.deadlineAt) ||
-      operation.deadlineAt <= operation.createdAt
+      !Number.isFinite(operation.updatedAt)
     ) {
       throw new Error('review_transport_state_invalid');
     }
@@ -151,7 +159,24 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
         throw new Error('review_transport_state_invalid');
       }
     }
+    const geminiBootstrap = operation.geminiBootstrap === true;
+    const geminiBootstrapContinuation = operation.geminiBootstrapContinuation === true;
+    const bootstrapNonScientific = operation.bootstrapNonScientific === true;
+    if (
+      (operation.geminiBootstrap !== undefined && typeof operation.geminiBootstrap !== 'boolean') ||
+      (operation.geminiBootstrapContinuation !== undefined && typeof operation.geminiBootstrapContinuation !== 'boolean') ||
+      (operation.bootstrapNonScientific !== undefined && typeof operation.bootstrapNonScientific !== 'boolean') ||
+      (geminiBootstrap && (operation.provider !== 'gemini' || operation.firstBinding !== true || !bootstrapNonScientific)) ||
+      (geminiBootstrapContinuation && operation.provider !== 'gemini') ||
+      (geminiBootstrap && geminiBootstrapContinuation)
+    ) throw new Error('review_transport_state_invalid');
     if (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.responsePath !== undefined && (!path.isAbsolute(operation.responsePath) || !nonEmptyString(operation.responsePath))) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (operation.sendBoundaryEnteredAt !== undefined && !Number.isFinite(operation.sendBoundaryEnteredAt)) {
       throw new Error('review_transport_state_invalid');
     }
     const hasObservedUserTurn = operation.observedUserMessageId !== undefined;
@@ -245,9 +270,27 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
     }
     if (operation.status === 'COMPLETE') {
       const responseText = operation.responseText;
-      const responseSha256 = typeof responseText === 'string'
+      const legacyResponseSha256 = typeof responseText === 'string'
         ? crypto.createHash('sha256').update(responseText, 'utf8').digest('hex')
         : null;
+      const archivedResponse = path.isAbsolute(String(operation.responsePath || '')) &&
+        Number.isInteger(operation.responseBytes) && operation.responseBytes > 0 &&
+        /^[0-9a-f]{64}$/.test(String(operation.responseSha256 || ''));
+      const responseArchiveProjection = operation.responseArchiveProjection || 'exact';
+      const snapshotHashes = Array.isArray(operation.snapshots)
+        ? operation.snapshots.map((snapshot) => snapshot?.textSha256)
+        : [];
+      const responseProjectionValid = responseArchiveProjection === 'exact'
+        ? snapshotHashes.every((hash) => hash === operation.responseSha256) &&
+          (operation.renderedResponseBytes === undefined || operation.renderedResponseBytes === operation.responseBytes)
+        : responseArchiveProjection === 'terminal_lf_v1' &&
+          Number.isInteger(operation.renderedResponseBytes) &&
+          operation.responseBytes === operation.renderedResponseBytes + 1 &&
+          snapshotHashes.length === 2 &&
+          /^[0-9a-f]{64}$/.test(String(snapshotHashes[0] || '')) &&
+          snapshotHashes[0] === snapshotHashes[1] &&
+          snapshotHashes[0] !== operation.responseSha256;
+      const legacyInlineResponse = nonEmptyString(responseText) && operation.responseSha256 === legacyResponseSha256;
       const snapshots = operation.snapshots;
       const controls = operation.controls;
       const validSendActionCount = operation.sendActionCount === 1 || (
@@ -259,14 +302,13 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
         !operation.userMessageId ||
         !operation.assistantMessageId ||
         operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
-        !nonEmptyString(responseText) ||
-        operation.responseSha256 !== responseSha256 ||
+        (!archivedResponse && !legacyInlineResponse) ||
         !Array.isArray(snapshots) ||
         snapshots.length !== 2 ||
         snapshots.some((snapshot) =>
           !snapshot ||
           snapshot.assistantMessageId !== operation.assistantMessageId ||
-          snapshot.textSha256 !== responseSha256 ||
+          !responseProjectionValid ||
           !Number.isFinite(snapshot.observedAt)
         ) ||
         snapshots[1].observedAt - snapshots[0].observedAt < 3_000 ||
@@ -279,6 +321,7 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
         !Array.isArray(operation.clickedControls) ||
         operation.clickedControls.length !== 0 ||
         !nonEmptyString(operation.modelEvidence) ||
+        (archivedResponse && operation.renderedDisplay?.fidelity !== 'exact') ||
         !Number.isFinite(operation.completedAt)
       ) {
         throw new Error('review_transport_state_invalid');
@@ -335,9 +378,10 @@ export function defaultSettings() {
     chromeExecutablePath: null,
     chromeProfileMode: 'isolated',
     chromeProfileName: 'Default',
+    chromeAttachExisting: false,
 
     // Governor defaults (intentionally conservative).
-    maxInflightQueries: 2,
+    maxInflightQueries: 6,
     maxQueriesPerMinute: 12,
     minTabGapMs: 1200,
     minGlobalGapMs: 200,
@@ -376,6 +420,7 @@ export function normalizeSettings(input) {
       : d.chromeProfileMode,
     chromeProfileName:
       typeof s.chromeProfileName === 'string' && s.chromeProfileName.trim() ? s.chromeProfileName.trim() : d.chromeProfileName,
+    chromeAttachExisting: typeof s.chromeAttachExisting === 'boolean' ? s.chromeAttachExisting : d.chromeAttachExisting,
     maxInflightQueries: clampInt(s.maxInflightQueries, { min: 1, max: 12, fallback: d.maxInflightQueries }),
     maxQueriesPerMinute: clampInt(s.maxQueriesPerMinute, { min: 1, max: 600, fallback: d.maxQueriesPerMinute }),
     minTabGapMs: clampMs(s.minTabGapMs, { min: 0, max: 60_000, fallback: d.minTabGapMs }),
@@ -427,24 +472,30 @@ export async function writeState(state, stateDir = defaultStateDir()) {
   await atomicWriteFile(statePath(stateDir), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-export async function readReviewTransportState(stateDir = defaultStateDir()) {
+export async function readReviewTransportStateReadOnly(stateDir = defaultStateDir()) {
   try {
     const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
     const parsed = JSON.parse(raw);
-    const normalized = normalizeReviewTransportState(parsed, { migrateLegacy: true });
-    if (parsed.schemaVersion !== normalized.schemaVersion) {
-      await atomicWriteFile(
-        reviewTransportPath(stateDir),
-        `${JSON.stringify(normalized, null, 2)}\n`,
-        { mode: 0o600 }
-      );
-    }
-    return normalized;
+    return normalizeReviewTransportState(parsed, { migrateLegacy: true });
   } catch (error) {
     if (error?.code === 'ENOENT') return defaultReviewTransportState();
     if (String(error?.message || '') === 'review_transport_state_invalid') throw error;
     throw new Error('review_transport_state_invalid', { cause: error });
   }
+}
+
+export async function readReviewTransportState(stateDir = defaultStateDir()) {
+  const normalized = await readReviewTransportStateReadOnly(stateDir);
+  try {
+    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed.schemaVersion !== normalized.schemaVersion) {
+      await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  return normalized;
 }
 
 export async function writeReviewTransportState(state, stateDir = defaultStateDir()) {

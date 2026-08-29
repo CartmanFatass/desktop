@@ -42,6 +42,58 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+export async function archiveReviewResponse({ responsePath, text, allowTerminalLfProjection = false }) {
+  if (typeof responsePath !== 'string' || !path.isAbsolute(responsePath) || !responsePath.trim()) {
+    fail('review_response_path_invalid');
+  }
+  if (typeof text !== 'string' || !text.trim()) fail('review_response_invalid');
+  const exactPath = path.resolve(responsePath);
+  const parent = path.dirname(exactPath);
+  const responseSha256 = sha256(text);
+  const responseBytes = Buffer.byteLength(text, 'utf8');
+  await fs.mkdir(parent, { recursive: true });
+
+  try {
+    const existing = await fs.readFile(exactPath, 'utf8');
+    const responseArchiveProjection = existing === text
+      ? 'exact'
+      : allowTerminalLfProjection === true && !text.endsWith('\n') && existing === `${text}\n`
+        ? 'terminal_lf_v1'
+        : null;
+    if (!responseArchiveProjection) fail('review_response_path_conflict');
+    return {
+      responsePath: exactPath,
+      responseSha256: sha256(existing),
+      responseBytes: Buffer.byteLength(existing, 'utf8'),
+      responseArchiveProjection
+    };
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const temporaryPath = path.join(parent, `.${path.basename(exactPath)}.tmp-${process.pid}-${crypto.randomUUID()}`);
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, 'wx');
+    await handle.writeFile(text, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporaryPath, exactPath);
+    const observed = await fs.readFile(exactPath, 'utf8');
+    if (observed !== text) fail('review_response_archive_verification_failed');
+    return {
+      responsePath: exactPath,
+      responseSha256,
+      responseBytes,
+      responseArchiveProjection: 'exact'
+    };
+  } finally {
+    await handle?.close().catch(() => {});
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 export async function resolveReviewPromptInput(
   { prompt, promptPath } = {},
   { cwd = process.cwd(), readFile = fs.readFile } = {}
@@ -55,6 +107,7 @@ export async function resolveReviewPromptInput(
 }
 
 export function validateReviewPromptSha256(prompt, promptSha256) {
+  if (promptSha256 == null) return sha256(prompt);
   if (typeof promptSha256 !== 'string' || !SHA256_RE.test(promptSha256)) {
     fail('review_prompt_sha256_invalid');
   }
@@ -169,9 +222,6 @@ function normalizeRequest(input) {
   const conversationUrl = requiredText(request.conversationUrl, 'conversationUrl', { max: 2048 });
   const conversationId = requiredText(request.conversationId, 'conversationId', { max: 256 });
   const firstBinding = request.firstBinding === true;
-  // These fields are part of the persisted v2 operation identity.  Defaulting
-  // omitted legacy callers to false preserves exact-fingerprint observation of
-  // an already submitted operation; it does not authorize a new send.
   const geminiBootstrap = request.geminiBootstrap === true;
   const geminiBootstrapContinuation = request.geminiBootstrapContinuation === true;
   const bootstrapNonScientific = request.bootstrapNonScientific === true;
@@ -197,11 +247,16 @@ function normalizeRequest(input) {
   }
   const prompt = requiredExactText(request.prompt, 'prompt', { max: 200_000 });
   const promptSha256 = validateReviewPromptSha256(prompt, request.promptSha256);
+  const verifyExisting = request.verifyExisting === true;
+  const responsePath = request.responsePath == null
+    ? null
+    : requiredText(request.responsePath, 'responsePath', { max: 32_768 });
+  if (!verifyExisting && !responsePath) fail('review_invalid_request', { field: 'responsePath' });
+  if (responsePath && !path.isAbsolute(responsePath)) fail('review_invalid_request', { field: 'responsePath' });
   const timeoutMs = Number(request.timeoutMs ?? MAX_REVIEW_TIMEOUT_MS);
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_REVIEW_TIMEOUT_MS || timeoutMs > MAX_REVIEW_TIMEOUT_MS) {
     fail('review_timeout_out_of_range');
   }
-  const verifyExisting = request.verifyExisting === true;
   const diagnoseExisting = request.diagnoseExisting === true;
   const existingTabId = request.existingTabId == null
     ? null
@@ -216,6 +271,7 @@ function normalizeRequest(input) {
     idempotencyKey,
     prompt,
     promptSha256,
+    responsePath: responsePath ? path.resolve(responsePath) : null,
     timeoutMs,
     verifyExisting,
     diagnoseExisting,
@@ -237,6 +293,7 @@ function requestFingerprint(request) {
       conversationId: request.conversationId,
       idempotencyKey: request.idempotencyKey,
       promptSha256: request.promptSha256,
+      responsePath: request.responsePath,
       timeoutMs: request.timeoutMs,
       firstBinding: request.firstBinding,
       geminiBootstrap: request.geminiBootstrap,
@@ -283,7 +340,7 @@ export async function inspectReviewAdmission({ stateDir, request: rawRequest }) 
   const fingerprint = requestFingerprint(request);
   const state = await readStateLocked(stateDir);
   const existing = state.operations[request.idempotencyKey] || null;
-  if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+  if (existing && existing.requestFingerprint !== fingerprint && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
   const exactExisting = !!existing;
   const observationOnly = request.verifyExisting || request.diagnoseExisting || exactExisting;
   return {
@@ -295,14 +352,177 @@ export async function inspectReviewAdmission({ stateDir, request: rawRequest }) 
   };
 }
 
+// Read one durable strict-operation record without accepting prompt text,
+// opening a tab, or acquiring a send-capacity slot. This is intentionally
+// narrower than verifyExisting: it establishes ledger facts only and cannot
+// promote an operation, recover a turn, or create a resend path.
+export async function observeReviewOperation({ stateDir, idempotencyKey, operationId = null }) {
+  if (!stateDir) fail('review_transport_misconfigured');
+  const key = requiredText(idempotencyKey, 'idempotencyKey', { max: 512 });
+  const expectedOperationId = operationId == null
+    ? null
+    : requiredText(operationId, 'operationId', { max: 512 });
+  const state = await readStateLocked(stateDir);
+  const operation = state.operations[key];
+  if (!operation) fail('review_operation_not_found');
+  if (expectedOperationId && operation.operationId !== expectedOperationId) {
+    fail('review_operation_identity_mismatch');
+  }
+  const zeroCommitPreClick =
+    operation.sendCount === 0 &&
+    operation.sendActionCount === 0 &&
+    noClickBoundaryResolved(operation) &&
+    !operation.userMessageId &&
+    !operation.observedUserMessageId &&
+    operation.errorData?.noClickProven === true &&
+    ['before_composer_write', 'before_send_click'].includes(operation.failureStage);
+  return {
+    observationKind: 'ledger_only',
+    operationId: operation.operationId,
+    idempotencyKey: operation.idempotencyKey,
+    requestFingerprint: operation.requestFingerprint,
+    stableKey: operation.stableKey,
+    provider: operation.provider,
+    model: operation.model,
+    conversationUrl: operation.conversationUrl,
+    conversationId: operation.conversationId,
+    observedConversationUrl: operation.observedConversationUrl || null,
+    observedConversationId: operation.observedConversationId || null,
+    tabId: operation.tabId || null,
+    status: operation.status,
+    terminalState: operation.terminalState,
+    failureStage: operation.failureStage || null,
+    sendCount: operation.sendCount,
+    sendActionCount: operation.sendActionCount,
+    newUserMessageCount: operation.newUserMessageCount || 0,
+    hasUserMessageId: !!operation.userMessageId,
+    hasObservedUserMessageId: !!operation.observedUserMessageId,
+    baselineMessageCount: Array.isArray(operation.baselineMessageIds) ? operation.baselineMessageIds.length : 0,
+    error: operation.error || null,
+    zeroCommitPreClick
+  };
+}
+
 function sameBinding(binding, request) {
   return (
     binding?.stableKey === request.stableKey &&
     binding?.provider === request.provider &&
-    binding?.model === request.model &&
     binding?.conversationUrl === request.conversationUrl &&
     binding?.conversationId === request.conversationId
   );
+}
+
+function matchesExistingObservation(existing, request) {
+  // A first binding becomes a concrete conversation after its single send.  A
+  // later verify-existing request must therefore use that concrete identity and
+  // cannot repeat the historical firstBinding/root fields.  Those fields are
+  // transport history, not identity of the already committed turn.
+  const exactOperationConversation =
+    existing.conversationUrl === request.conversationUrl &&
+    existing.conversationId === request.conversationId;
+  const exactObservedConversation =
+    existing.firstBinding === true &&
+    existing.observedConversationUrl === request.conversationUrl &&
+    existing.observedConversationId === request.conversationId;
+  return request.verifyExisting === true &&
+    existing?.stableKey === request.stableKey &&
+    existing.provider === request.provider &&
+    existing.model === request.model &&
+    existing.idempotencyKey === request.idempotencyKey &&
+    existing.promptSha256 === request.promptSha256 &&
+    (!request.responsePath || !existing.responsePath || existing.responsePath === request.responsePath) &&
+    (exactOperationConversation || exactObservedConversation);
+}
+
+function causalRecoveryEligible(existing, request) {
+  if (
+    !existing ||
+    existing.status !== 'OBSERVING' ||
+    !['COMMITMENT_UNKNOWN', 'SENT_UNREADABLE'].includes(existing.terminalState) ||
+    existing.sendCount !== 0 ||
+    existing.sendActionCount !== 1 ||
+    existing.userMessageId ||
+    !Array.isArray(existing.baselineMessageIds) ||
+    !validateReviewCausalSubmissionReceipt(existing.causalSendReceipt, {
+      prompt: request.prompt,
+      baselineMessageIds: existing.baselineMessageIds
+    })
+  ) return false;
+  if (existing.terminalState === 'SENT_UNREADABLE') {
+    return !!existing.observedUserMessageId &&
+      existing.observedCommitmentClass === 'turn_causal_exact_rendered_unreadable' &&
+      existing.observedConversationUrl === request.conversationUrl &&
+      existing.observedConversationId === request.conversationId;
+  }
+  return (
+    existing.conversationUrl === request.conversationUrl &&
+    existing.conversationId === request.conversationId
+  ) || (
+    existing.observedConversationUrl === request.conversationUrl &&
+    existing.observedConversationId === request.conversationId
+  );
+}
+
+const CHATGPT_MODEL_ROUTES = new Set([
+  'composer_reasoning_control',
+  'semantic_model_switcher',
+  'controlled_reasoning_menu'
+]);
+
+function exactModelLabelMatches(actual, expected) {
+  const normalize = (value) => String(value || '')
+    .normalize('NFKC')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  const actualLabel = normalize(actual);
+  return !!actualLabel && actualLabel === normalize(expected);
+}
+
+function requireChatgptModelSelection(value, expectedModel) {
+  const selection = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (
+    !selection ||
+    !exactModelLabelMatches(selection.expectedModel, expectedModel) ||
+    !exactModelLabelMatches(selection.matchedLabel, expectedModel) ||
+    !CHATGPT_MODEL_ROUTES.has(selection.routeEvidence) ||
+    selection.scopedMatchCount !== 1
+  ) {
+    fail('review_send_model_receipt_invalid');
+  }
+  return {
+    expectedModel: String(selection.expectedModel),
+    matchedLabel: String(selection.matchedLabel),
+    routeEvidence: String(selection.routeEvidence),
+    scopedMatchCount: 1
+  };
+}
+
+function noClickBoundaryResolved(candidate) {
+  return !candidate?.sendBoundaryEnteredAt || candidate.boundaryResolution === 'no_click_proven';
+}
+
+function operationProvesZeroSend(candidate) {
+  return candidate?.status === 'BLOCKED' &&
+    candidate.terminalState === 'ZERO_SEND_FAILED' &&
+    candidate.sendCount === 0 &&
+    candidate.sendActionCount === 0 &&
+    noClickBoundaryResolved(candidate) &&
+    !candidate.userMessageId &&
+    !candidate.observedUserMessageId &&
+    !candidate.causalSendReceipt &&
+    !candidate.submissionIdentity &&
+    candidate.errorData?.noClickProven === true;
+}
+
+function authorizedBindingModel(binding, request) {
+  if (request.geminiBootstrapContinuation === true) {
+    return binding?.model !== request.model &&
+      binding?.provider === 'gemini' &&
+      binding?.geminiBootstrap?.nonScientific === true &&
+      binding.geminiBootstrap.continuationConsumed !== true;
+  }
+  return binding?.model === request.model;
 }
 
 function validateResult(result, request, expectedUserMessageId = null) {
@@ -337,6 +557,7 @@ function validateResult(result, request, expectedUserMessageId = null) {
     assistantMessageId,
     responseText: text,
     responseSha256,
+    renderedResponseBytes: Buffer.byteLength(text, 'utf8'),
     snapshots,
     controls: {
       stop: !!controls.stop,
@@ -359,6 +580,7 @@ async function observePersistedReview({ observeReviewResponse, operation, reques
     expectedUrl: operation.conversationUrl,
     expectedConversationId: operation.conversationId,
     expectedModel: request.model,
+    submittedModelEvidence: operation.modelEvidence || operation.causalSendReceipt?.modelSelection?.matchedLabel || '',
     userMessageId: operation.userMessageId,
     expectedPrompt: request.prompt,
     expectedPromptSha256: operation.promptSha256,
@@ -370,7 +592,7 @@ async function observePersistedReview({ observeReviewResponse, operation, reques
   });
 }
 
-export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
+export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTabResolved = null }) {
   if (!stateDir || !tabs) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
   const fingerprint = requestFingerprint(request);
@@ -386,15 +608,23 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       conversationId: request.conversationId
     };
     const existing = state.operations[request.idempotencyKey];
-    if (existing && existing.requestFingerprint !== fingerprint) fail('review_idempotency_conflict');
+    if (existing && existing.requestFingerprint !== fingerprint && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
     if (request.verifyExisting) {
-      if (!existing || !existing.userMessageId) fail('review_observation_unavailable');
+      const canRecoverCausally = causalRecoveryEligible(existing, request);
+      if (!existing || (!existing.userMessageId && !canRecoverCausally)) fail('review_observation_unavailable');
+      if (!request.responsePath && existing.responsePath) request.responsePath = existing.responsePath;
+      if (!request.responsePath) fail('review_observation_unavailable');
+      if (!existing.responsePath) {
+        existing.responsePath = request.responsePath;
+        existing.requestFingerprint = fingerprint;
+        existing.updatedAt = now;
+      }
       return { existing: true, operation: { ...existing }, binding: binding ? { ...binding } : null };
     }
     if (request.firstBinding) {
       if (binding && !existing) fail('review_binding_mismatch');
     } else {
-      if (binding && !sameBinding(binding, request)) fail('review_binding_mismatch');
+      if (binding && (!sameBinding(binding, request) || !authorizedBindingModel(binding, request))) fail('review_binding_mismatch');
       if (!binding) state.bindings[request.stableKey] = { ...expectedBinding, createdAt: now, updatedAt: now };
     }
     if (request.existingTabId && !existing) {
@@ -409,6 +639,25 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     }
     if (request.diagnoseExisting && !existing) fail('review_diagnostic_operation_missing');
     if (existing) return { existing: true, operation: { ...existing }, binding: binding ? { ...binding } : null };
+    // A ChatGPT root binding ("__new__") does not name a conversation. Each
+    // accepted first-binding send creates a distinct provider conversation, so
+    // it cannot be compared with a concrete prior conversation here. HMASD's
+    // owner-level replacement policy decides whether opening that new
+    // conversation is authorized; this tool only prevents reinjection into an
+    // already identified provider conversation.
+    const conflictingOperation = request.conversationId === '__new__' ? null : Object.values(state.operations).find((candidate) => {
+      const exactOperationConversation =
+        candidate?.conversationUrl === request.conversationUrl &&
+        candidate?.conversationId === request.conversationId;
+      const exactObservedConversation =
+        candidate?.observedConversationUrl === request.conversationUrl &&
+        candidate?.observedConversationId === request.conversationId;
+      return candidate?.provider === request.provider &&
+        (exactOperationConversation || exactObservedConversation) &&
+        candidate?.promptSha256 === request.promptSha256 &&
+        !operationProvesZeroSend(candidate);
+    });
+    if (conflictingOperation) fail('review_conversation_request_nonrepeatable');
     const operation = {
       operationId: crypto.randomUUID(),
       idempotencyKey: request.idempotencyKey,
@@ -418,11 +667,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       model: request.model,
       conversationUrl: request.conversationUrl,
       conversationId: request.conversationId,
+      firstBinding: request.firstBinding,
+      geminiBootstrap: request.geminiBootstrap,
+      geminiBootstrapContinuation: request.geminiBootstrapContinuation,
+      bootstrapNonScientific: request.bootstrapNonScientific,
       promptSha256: request.promptSha256,
+      responsePath: request.responsePath,
       promptTextModel: promptIdentity.textModel,
       canonicalPromptSha256: promptIdentity.canonicalSha256,
       timeoutMs: request.timeoutMs,
-      deadlineAt: now + request.timeoutMs,
       status: 'SEND_INTENT',
       terminalState: null,
       sendCount: 0,
@@ -441,7 +694,27 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     !request.verifyExisting &&
     !request.diagnoseExisting
   ) return intake.operation;
-  const liveIdentity = intake.binding || request;
+  // A durable zero-send receipt is an immutable terminal transport fact.  A
+  // same-key replay must return that receipt without reopening a browser or
+  // passing through the generic error path, which could otherwise degrade the
+  // proven boundary into COMMITMENT_UNKNOWN.
+  if (
+    intake.existing &&
+    operationProvesZeroSend(intake.operation) &&
+    !request.diagnoseExisting
+  ) return intake.operation;
+  if (!request.responsePath && intake.operation.responsePath) request.responsePath = intake.operation.responsePath;
+  if (request.verifyExisting && request.existingTabId) {
+    await tabs.adoptTab({
+      id: request.existingTabId,
+      key: request.stableKey,
+      name: request.stableKey,
+      url: request.conversationUrl,
+      vendorId: request.provider,
+      vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT'
+    });
+  }
+  const liveIdentity = request.verifyExisting ? request : intake.binding || request;
   const tabId = await tabs.ensureTab({
     key: request.stableKey,
     name: request.stableKey,
@@ -471,12 +744,13 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     if (!request.firstBinding && (submittedUrl !== request.conversationUrl || submittedId !== request.conversationId)) {
       fail('review_conversation_identity_mismatch');
     }
-    const renderedDisplayFidelities = new Set(['exact', 'lossy_mismatch', 'unreadable']);
+    if (submitted?.renderedDisplayFidelity === 'lossy_mismatch') fail('review_user_message_content_mismatch');
+    if (submitted?.renderedDisplayFidelity === 'unreadable') fail('review_user_message_identity_unreadable');
     if (
       submitted?.sourcePromptSha256 !== request.promptSha256 ||
       submitted?.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
       submitted?.submissionIdentityMode !== REVIEW_CAUSAL_SUBMISSION_MODEL ||
-      !renderedDisplayFidelities.has(submitted?.renderedDisplayFidelity)
+      submitted?.renderedDisplayFidelity !== 'exact'
     ) {
       fail('review_user_message_identity_receipt_invalid');
     }
@@ -484,6 +758,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.status === 'COMPLETE') return;
       if (op.sendActionCount !== 1) fail('review_send_action_receipt_missing');
       if (
         !validateReviewCausalSubmissionReceipt(submitted?.causalSubmissionReceipt, {
@@ -497,6 +772,9 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       ) {
         fail('review_causal_submission_receipt_mismatch');
       }
+      const persistedModelSelection = request.provider === 'chatgpt'
+        ? requireChatgptModelSelection(op.causalSendReceipt.modelSelection, request.model)
+        : null;
       if (op.observedUserMessageId !== userMessageId) {
         fail('review_observed_user_message_identity_mismatch');
       }
@@ -514,13 +792,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         fail('review_observed_user_turn_receipt_invalid');
       }
       op.status = 'SUBMITTED';
+      op.terminalState = 'SENT_WAITING';
       op.sendCount = 1;
       op.userMessageId = userMessageId;
       op.conversationUrl = submittedUrl;
       op.conversationId = submittedId;
       op.tabId = tabId;
       op.submittedAt = submitted?.submittedAt || Date.now();
-      op.modelEvidence = submitted?.modelEvidence || null;
+      op.modelEvidence = persistedModelSelection?.matchedLabel || submitted?.modelEvidence || null;
+      if (request.geminiBootstrap && op.modelEvidence) op.model = op.modelEvidence;
       op.observedConversationUrl = submittedUrl;
       op.observedConversationId = submittedId;
       op.submissionIdentity = {
@@ -542,29 +822,68 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         textModel: promptIdentity.textModel,
         sourceSha256: request.promptSha256,
         canonicalPromptSha256: promptIdentity.canonicalSha256,
-        identityMode: submitted.renderedDisplayFidelity === 'exact'
-          ? submitted.renderedIdentityMode
-          : 'display_not_source_identity'
+        identityMode: submitted.renderedIdentityMode
       };
       op.updatedAt = Date.now();
-      if (request.firstBinding) {
+      if (op.firstBinding) {
         const now = Date.now();
         state.bindings[request.stableKey] = {
           stableKey: request.stableKey,
           provider: request.provider,
-          model: request.model,
+          model: op.modelEvidence || request.model,
           conversationUrl: submittedUrl,
           conversationId: submittedId,
           createdAt: now,
           updatedAt: now
         };
+        if (op.geminiBootstrap) {
+          state.bindings[request.stableKey].geminiBootstrap = {
+            nonScientific: true,
+            bootstrapOperationId: op.operationId,
+            bootstrapModel: op.modelEvidence || request.model,
+            continuationConsumed: false
+          };
+        }
+      } else if (request.geminiBootstrapContinuation) {
+        const bound = state.bindings[request.stableKey];
+        if (!bound || !authorizedBindingModel(bound, request)) fail('review_binding_mismatch');
+        bound.model = request.model;
+        bound.geminiBootstrap = {
+          ...bound.geminiBootstrap,
+          continuationConsumed: true,
+          continuationOperationId: op.operationId,
+          continuationModel: request.model
+        };
+        bound.updatedAt = Date.now();
       }
     });
-    if (request.firstBinding) tabs.updateTabUrl(tabId, submittedUrl);
+    if (intake.operation.firstBinding) tabs.updateTabUrl(tabId, submittedUrl);
+  };
+
+  const onSendBoundaryEntered = async (boundary) => {
+    const preSendModelEvidence = request.provider === 'chatgpt'
+      ? requireChatgptModelSelection(boundary?.modelEvidence, request.model)
+      : null;
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (!['PREPARED', 'SEND_INTENT'].includes(op.status) || op.sendCount !== 0 || op.sendActionCount !== 0 || op.userMessageId) {
+        fail('review_operation_state_invalid');
+      }
+      op.sendBoundaryEnteredAt = Number.isFinite(boundary?.enteredAt) ? boundary.enteredAt : Date.now();
+      op.boundaryResolution = 'unresolved';
+      if (preSendModelEvidence) op.preSendModelEvidence = preSendModelEvidence;
+      op.terminalState = 'COMMITMENT_UNKNOWN';
+      op.failureStage = 'send_capable_boundary';
+      op.updatedAt = Date.now();
+    });
   };
 
   const onSendAction = async (action) => {
     const clickTimeIdentity = action?.clickTimeIdentity;
+    const clickTimeModelEvidence = request.provider === 'chatgpt'
+      ? requireChatgptModelSelection(action?.clickTimeModelEvidence, request.model)
+      : null;
     if (
       Number(action?.clickCount) !== 1 ||
       Number(action?.sendActionCount) !== 1 ||
@@ -582,11 +901,17 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     return await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
-      if (!['PREPARED', 'SEND_INTENT'].includes(op.status) || op.sendActionCount !== 0 || op.userMessageId) {
+      if (!['PREPARED', 'SEND_INTENT'].includes(op.status) || !Number.isFinite(op.sendBoundaryEnteredAt) || op.sendActionCount !== 0 || op.userMessageId) {
         fail('review_operation_state_invalid');
       }
       const baselineMessageIdsSha256 = reviewBaselineMessageIdsSha256(op.baselineMessageIds);
       if (!baselineMessageIdsSha256) fail('review_submission_baseline_missing');
+      if (
+        request.provider === 'chatgpt' &&
+        JSON.stringify(op.preSendModelEvidence) !== JSON.stringify(clickTimeModelEvidence)
+      ) {
+        fail('review_send_model_receipt_mismatch');
+      }
       const causalSendReceipt = {
         ok: true,
         persisted: true,
@@ -596,13 +921,17 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         clickCount: 1,
         sourceSha256: request.promptSha256,
         canonicalPromptSha256: promptIdentity.canonicalSha256,
-        baselineMessageIdsSha256
+        baselineMessageIdsSha256,
+        ...(clickTimeModelEvidence ? { modelSelection: clickTimeModelEvidence } : {})
       };
       op.status = 'SEND_INTENT';
+      op.terminalState = 'COMMITMENT_UNKNOWN';
       op.sendActionCount = 1;
       op.clickCount = 1;
       op.clickTimeIdentity = safeClickTimeIdentity;
       op.causalSendReceipt = causalSendReceipt;
+      op.boundaryResolution = 'send_action_observed';
+      if (clickTimeModelEvidence) op.modelEvidence = clickTimeModelEvidence.matchedLabel;
       op.sendActionAt = action?.sendActionAt || Date.now();
       op.updatedAt = Date.now();
       return { ...causalSendReceipt };
@@ -638,6 +967,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.status === 'COMPLETE') return;
       if (op.sendActionCount !== 1 || op.sendCount !== 0 || op.userMessageId) {
         fail('review_operation_state_invalid');
       }
@@ -727,6 +1057,19 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
   };
 
   try {
+    await mutateState(stateDir, async (state) => {
+      const op = state.operations[request.idempotencyKey];
+      if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      op.tabId = tabId;
+      op.updatedAt = Date.now();
+    });
+    if (typeof onTabResolved === 'function') {
+      await onTabResolved({
+        tabId,
+        stableKey: request.stableKey,
+        idempotencyKey: request.idempotencyKey
+      });
+    }
     const execution = await runControllerExclusive(async () => {
       const currentState = await readStateLocked(stateDir);
       const currentOperation = currentState.operations[request.idempotencyKey];
@@ -757,49 +1100,127 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
         return { diagnosticOnly: true, diagnostic };
       }
       if (request.verifyExisting) {
-        if (!intake.existing || !currentOperation.userMessageId) {
+        if (!intake.existing) {
           fail('review_observation_unavailable');
         }
+        if (currentOperation.userMessageId) {
+          if (!observeReviewResponse) fail('review_observation_unavailable');
+          const result = await observePersistedReview({ observeReviewResponse, operation: currentOperation, request });
+          return { result, expectedUserMessageId: currentOperation.userMessageId };
+        }
+        const canRecoverCausally = causalRecoveryEligible(currentOperation, request);
+        if (!canRecoverCausally || typeof controller?.recoverReviewSubmission !== 'function') {
+          fail('review_observation_unavailable');
+        }
+        const recovery = await controller.recoverReviewSubmission({
+          prompt: request.prompt,
+          baselineMessageIds: currentOperation.baselineMessageIds,
+          expectedUrl: request.conversationUrl,
+           expectedConversationId: request.conversationId,
+           expectedModel: request.model,
+           submittedModelEvidence: currentOperation.modelEvidence || currentOperation.causalSendReceipt?.modelSelection?.matchedLabel || '',
+          timeoutMs: request.timeoutMs,
+          causalSubmissionReceipt: currentOperation.causalSendReceipt,
+          onRecovered: async (recovered) => {
+            const userMessageId = requiredText(recovered?.userMessageId, 'userMessageId', { max: 512 });
+            const conversationUrl = requiredText(recovered?.conversationUrl, 'conversationUrl', { max: 2048 });
+            const conversationId = requiredText(recovered?.conversationId, 'conversationId', { max: 256 });
+            const renderedDisplayFidelity = recovered?.renderedDisplayFidelity;
+            // This operation lost its original observed-turn anchor.  A causal
+            // click receipt alone cannot distinguish an old rendered message
+            // from the post-click turn after a later reload, so rebind only an
+            // exact visible rendering; lossy/unreadable display remains
+            // permanently observe-only without an already persisted turn ID.
+            if (renderedDisplayFidelity !== 'exact') fail('review_recovery_rendered_identity_unreadable');
+            const rendered = recovered?.renderedIdentityDiagnostic || {};
+            const commitmentClass = renderedDisplayFidelity === 'exact'
+              ? 'turn_exact'
+              : renderedDisplayFidelity === 'unreadable'
+                ? 'turn_causal_exact_rendered_unreadable'
+                : 'turn_causal_exact_rendered_mismatch';
+            const observed = {
+              observedUserMessageId: userMessageId,
+              observedAt: recovered?.submittedAt || Date.now(),
+              conversationUrl,
+              conversationId,
+              modelEvidence: recovered?.modelEvidence || null,
+              commitmentClass,
+              submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+              renderedDisplayFidelity,
+              serializerOk: rendered.serializerOk === true,
+              serializerMethod: rendered.serializerMethod || 'rendered_user_message_structural',
+              serializerError: rendered.serializerError || null,
+              serializerTag: rendered.serializerTag || null,
+              serializedLength: Number.isInteger(rendered.serializedLength) ? rendered.serializedLength : null,
+              observedLengths: Array.isArray(rendered.observedLengths) ? rendered.observedLengths : [],
+              expectedLength: request.prompt.length,
+              newUserMessageCount: 1,
+              readableCandidateCount: Number.isInteger(rendered.readableCandidateCount) ? rendered.readableCandidateCount : 0,
+              exactMatchCount: Number.isInteger(rendered.exactMatchCount) ? rendered.exactMatchCount : 0,
+              ...rendered
+            };
+            await onUserTurnObserved(observed);
+            await onSubmitted({
+              ...recovered,
+              userMessageId,
+              conversationUrl,
+              conversationId,
+              sourcePromptSha256: request.promptSha256,
+              canonicalPromptSha256: promptIdentity.canonicalSha256,
+              submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
+              causalSubmissionReceipt: currentOperation.causalSendReceipt,
+              renderedDisplayFidelity,
+              renderedDisplayEvidence: observed,
+              renderedIdentityMode: renderedDisplayFidelity === 'exact'
+                ? recovered?.identityMode || 'canonical_exact'
+                : null
+            });
+          }
+        });
+        if (
+          recovery?.status !== 'SENT_WAITING' ||
+          recovery?.conversationUrl !== request.conversationUrl ||
+          recovery?.conversationId !== request.conversationId
+        ) fail('review_recovery_receipt_invalid');
+        const reboundState = await readStateLocked(stateDir);
+        const reboundOperation = reboundState.operations[request.idempotencyKey];
+        if (
+          !reboundOperation ||
+          reboundOperation.operationId !== currentOperation.operationId ||
+          !reboundOperation.userMessageId ||
+          reboundOperation.userMessageId !== recovery.userMessageId ||
+          reboundOperation.sendCount !== 1 ||
+          reboundOperation.sendActionCount !== 1
+        ) fail('review_recovery_receipt_invalid');
         if (!observeReviewResponse) fail('review_observation_unavailable');
-        // Explicit verification is a fresh, bounded read-only attempt.  It is
-        // deliberately independent of the original submission deadline, which
-        // may have elapsed while the provider was still producing a response.
-        const result = await observePersistedReview({ observeReviewResponse, operation: currentOperation, request });
-        return { result, expectedUserMessageId: currentOperation.userMessageId };
+        const result = await observePersistedReview({
+          observeReviewResponse,
+          operation: reboundOperation,
+          request
+        });
+        return { result, expectedUserMessageId: reboundOperation.userMessageId };
       }
       if (currentOperation.status === 'COMPLETE') {
         return { completedOperation: { ...currentOperation } };
       }
-      const remainingMs = Math.floor(currentOperation.deadlineAt - Date.now());
-      if (remainingMs <= 0) fail('review_operation_deadline_exceeded');
       const result = intake.existing
         ? currentOperation.userMessageId
-          ? await controller.observeReviewResponse({
-          expectedUrl: currentOperation.conversationUrl,
-          expectedConversationId: currentOperation.conversationId,
-           expectedModel: request.model,
-           userMessageId: currentOperation.userMessageId,
-           expectedPrompt: request.prompt,
-           expectedPromptSha256: currentOperation.promptSha256,
-           baselineMessageIds: currentOperation.baselineMessageIds,
-           sendCount: currentOperation.sendCount,
-           sendActionCount: currentOperation.sendActionCount,
-           renderedDisplayFidelity: currentOperation.renderedDisplay?.fidelity || 'exact',
-           timeoutMs: remainingMs
-         })
+          ? await observePersistedReview({ observeReviewResponse, operation: currentOperation, request })
           : fail('review_operation_closed_create_fresh')
         : await controller.reviewQuery({
           prompt: request.prompt,
           expectedUrl: request.conversationUrl,
           expectedConversationId: request.conversationId,
           expectedModel: request.model,
-          timeoutMs: remainingMs,
+          timeoutMs: request.timeoutMs,
           onPrepared,
           onComposerVerified,
+          onSendBoundaryEntered,
           onSendAction,
           onUserTurnObserved,
           onSubmitted,
-          firstBinding: request.firstBinding
+          firstBinding: request.firstBinding,
+          requireModelPreflight: true
         });
       return { result, expectedUserMessageId: currentOperation.userMessageId || null };
     });
@@ -824,25 +1245,73 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
       });
     }
     if (execution.completedOperation) return execution.completedOperation;
+    if (['SENT_WAITING', 'SENT_UNREADABLE'].includes(execution.result?.status)) {
+      return await mutateState(stateDir, async (state) => {
+        const op = state.operations[request.idempotencyKey];
+        if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+        if (op.status === 'COMPLETE') return { ...op };
+        if (op.sendCount !== 1 || op.sendActionCount !== 1 || !op.userMessageId) fail('review_send_receipt_invalid');
+        op.status = 'SUBMITTED';
+        op.terminalState = execution.result.status;
+        op.lastObservedAt = Date.now();
+        op.updatedAt = op.lastObservedAt;
+        return { ...op };
+      });
+    }
     const resultRequest = request.firstBinding
       ? { ...request, conversationUrl: execution.result.conversationUrl, conversationId: execution.result.conversationId }
       : request;
     const validated = validateResult(execution.result, resultRequest, execution.expectedUserMessageId);
+    let archived;
+    try {
+      archived = await archiveReviewResponse({
+        responsePath: request.responsePath,
+        text: validated.responseText,
+        allowTerminalLfProjection:
+          request.verifyExisting === true && request.provider === 'chatgpt' && intake.existing === true
+      });
+    } catch (error) {
+      return await mutateState(stateDir, async (state) => {
+        const op = state.operations[request.idempotencyKey];
+        if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+        if (op.status === 'COMPLETE') return { ...op };
+        op.status = 'SUBMITTED';
+        op.terminalState = 'SENT_UNREADABLE';
+        op.error = String(error?.message || error);
+        op.failureStage = 'response_archive';
+        op.errorData = sanitizeReviewErrorData({
+          predicate: op.error,
+          failureStage: op.failureStage,
+          commitmentClass: op.observedCommitmentClass || null,
+          sendActionCount: op.sendActionCount || 0,
+          newUserMessageCount: op.newUserMessageCount || 0,
+          noClickProven: false
+        });
+        op.lastObservedAt = Date.now();
+        op.updatedAt = op.lastObservedAt;
+        return { ...op };
+      });
+    }
+    const { responseText: _archivedResponseText, ...validatedReceipt } = validated;
     let canonicalizedExistingBinding = false;
     const completed = await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.operationId !== intake.operation.operationId) fail('review_operation_identity_mismatch');
+      if (op.status === 'COMPLETE') return { ...op };
       if (op.sendActionCount !== 1 || op.sendCount !== 1 || !op.userMessageId) {
         fail('review_send_receipt_invalid');
       }
       op.userMessageId = validated.userMessageId;
-      Object.assign(op, validated, {
+      Object.assign(op, validatedReceipt, archived, {
         status: 'COMPLETE',
         terminalState: 'NATURAL_COMPLETION_VERIFIED',
         tabId,
         completedAt: Date.now(),
         updatedAt: Date.now()
       });
+      delete op.error;
+      delete op.errorData;
+      delete op.failureStage;
       if (op.submissionIdentity) {
         op.submissionIdentity = {
           ...op.submissionIdentity,
@@ -851,7 +1320,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
           conversationId: validated.conversationId
         };
       }
-      if (request.firstBinding && provisionalChatgptConversationId(state.bindings[request.stableKey]?.conversationId)) {
+      if (op.firstBinding && provisionalChatgptConversationId(state.bindings[request.stableKey]?.conversationId)) {
         const binding = state.bindings[request.stableKey];
         if (!binding || binding.provider !== request.provider || binding.model !== request.model) {
           fail('review_binding_mismatch');
@@ -886,32 +1355,49 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest }) {
     await mutateState(stateDir, async (state) => {
       const op = state.operations[request.idempotencyKey];
       if (!op || op.status === 'COMPLETE') return;
-      const preSendFailure =
-        op.sendActionCount === 0 &&
-        !op.userMessageId &&
-        (op.status === 'PREPARED' || !op.sendIntentAt || safeErrorData?.noClickProven === true);
+      const predicate = String(error?.message || error);
+      const noClickProven = op.sendActionCount === 0 && !op.userMessageId && (
+        safeErrorData?.noClickProven === true || !Number.isFinite(op.sendBoundaryEnteredAt)
+      );
+      if (noClickProven) op.boundaryResolution = 'no_click_proven';
+      const preSendFailure = noClickProven;
       const preComposerWriteFailure =
         preSendFailure &&
         !request.firstBinding &&
-        String(error?.message || error) === 'review_continuation_baseline_empty' &&
+        predicate === 'review_continuation_baseline_empty' &&
         safeErrorData?.noClickProven === true &&
         safeErrorData?.failureStage === 'before_composer_write';
       op.failureStage = preSendFailure
         ? preComposerWriteFailure ? 'before_composer_write' : 'before_send_click'
         : 'send_occurred_or_uncertain';
-      op.status = 'BLOCKED';
-      op.terminalState = preSendFailure ? 'IDENTITY_UNREADABLE' : 'SUBMITTED_UNVERIFIED';
-      op.error = String(error?.message || error);
+      const inputMismatch = predicate === 'review_user_message_content_mismatch';
+      const modelMismatch = predicate === 'review_model_mismatch' || predicate === 'review_model_mismatch_at_send';
+      const responseUnreadable = predicate === 'review_user_message_identity_unreadable' || predicate === 'review_recovery_rendered_identity_unreadable';
+      const exactSubmissionPersisted = op.sendCount === 1 && !!op.userMessageId && op.renderedDisplay?.fidelity === 'exact';
+      op.status = preSendFailure || inputMismatch || modelMismatch
+        ? 'BLOCKED'
+        : exactSubmissionPersisted ? 'SUBMITTED' : 'OBSERVING';
+      op.terminalState = preSendFailure
+        ? 'ZERO_SEND_FAILED'
+        : inputMismatch
+          ? 'SENT_INPUT_MISMATCH'
+          : modelMismatch
+            ? 'SENT_MODEL_MISMATCH'
+            : responseUnreadable
+              ? 'SENT_UNREADABLE'
+              : exactSubmissionPersisted ? 'SENT_WAITING' : 'COMMITMENT_UNKNOWN';
+      op.error = predicate;
       const newUserMessageCount = Number.isInteger(safeErrorData?.newUserMessageCount)
         ? safeErrorData.newUserMessageCount
         : Number.isInteger(op.newUserMessageCount) ? op.newUserMessageCount : 0;
       const mechanicalErrorData = sanitizeReviewErrorData({
         ...(safeErrorData || {}),
-        predicate: String(error?.message || error),
+        predicate,
         failureStage: op.failureStage,
         sendActionCount: op.sendActionCount || 0,
         newUserMessageCount,
-        commitmentClass: safeErrorData?.commitmentClass || op.observedCommitmentClass || null
+        commitmentClass: safeErrorData?.commitmentClass || op.observedCommitmentClass || null,
+        noClickProven
       });
       if (mechanicalErrorData) op.errorData = mechanicalErrorData;
       op.updatedAt = Date.now();

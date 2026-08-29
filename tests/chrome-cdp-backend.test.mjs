@@ -244,7 +244,7 @@ test('chrome-cdp-backend: createSession closes target if initialization fails', 
   assert.equal(calls.some((item) => item.method === 'Target.closeTarget' && item.params?.targetId === 'target-1'), true);
 });
 
-test('chrome-cdp-backend: session close is best-effort when closeTarget fails', async () => {
+test('chrome-cdp-backend: session close preserves observability when closeTarget fails', async () => {
   let closedCalls = 0;
   const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
   backend.started = true;
@@ -258,6 +258,34 @@ test('chrome-cdp-backend: session close is best-effort when closeTarget fails', 
       if (method === 'Target.attachToTarget') return { sessionId: 'session-1' };
       if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
       if (method === 'Target.closeTarget') throw new Error('chrome_cdp_disconnected');
+      return {};
+    }
+  };
+
+  const session = await backend.createSession({
+    url: 'https://chatgpt.com/',
+    onClosed: () => {
+      closedCalls += 1;
+    }
+  });
+
+  await assert.rejects(async () => await session.close(), /chrome_cdp_disconnected/);
+  assert.equal(session.isClosed(), false);
+  assert.equal(closedCalls, 0);
+});
+
+test('chrome-cdp-backend: an already missing target is successful idempotent cleanup', async () => {
+  let closedCalls = 0;
+  const backend = new ChromeCdpBrowserBackend({ stateDir: '/tmp/agentify-test-state' });
+  backend.started = true;
+  backend.client = {
+    connected: true,
+    ws: {},
+    send: async (method) => {
+      if (method === 'Target.createTarget') return { targetId: 'target-missing' };
+      if (method === 'Target.attachToTarget') return { sessionId: 'session-1' };
+      if (method === 'Browser.getWindowForTarget') return { windowId: 7 };
+      if (method === 'Target.closeTarget') throw new Error('No target with given id found');
       return {};
     }
   };
@@ -297,7 +325,7 @@ test('chrome-cdp-backend: start cleans up spawned chrome process when CDP connec
     return {
       ok: true,
       async json() {
-        return { webSocketDebuggerUrl: 'ws://127.0.0.1:45999/devtools/browser/test' };
+        return { Browser: 'Chrome/151.0.7922.138', webSocketDebuggerUrl: 'ws://127.0.0.1:45999/devtools/browser/test' };
       }
     };
   };
@@ -321,6 +349,53 @@ test('chrome-cdp-backend: start cleans up spawned chrome process when CDP connec
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.WebSocket = OriginalWebSocket;
+  }
+});
+
+test('chrome-cdp-backend: strict existing-surface mode never launches Chrome when CDP is unavailable', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-chrome-existing-missing-'));
+  const backend = new ChromeCdpBrowserBackend({
+    stateDir: tmpDir,
+    debugPort: 45997,
+    profileMode: 'existing',
+    attachExisting: true
+  });
+  backend.chromeUserDataDir = tmpDir;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error('connection_refused');
+  };
+  try {
+    await assert.rejects(async () => await backend.start(), /chrome_cdp_existing_surface_unavailable/);
+    assert.equal(backend.chromeProcess, null);
+    assert.equal(backend.started, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('chrome-cdp-backend: strict existing-surface mode rejects an Electron CDP product before attach', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-chrome-existing-electron-'));
+  const backend = new ChromeCdpBrowserBackend({
+    stateDir: tmpDir,
+    debugPort: 45996,
+    profileMode: 'existing',
+    attachExisting: true
+  });
+  backend.chromeUserDataDir = tmpDir;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return { Browser: 'Electron/39.8.7', webSocketDebuggerUrl: 'ws://127.0.0.1:45996/devtools/browser/test' };
+    }
+  });
+  try {
+    await assert.rejects(async () => await backend.start(), /chrome_cdp_surface_not_google_chrome/);
+    assert.equal(backend.chromeProcess, null);
+    assert.equal(backend.started, false);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -378,7 +453,7 @@ test('chrome-cdp-backend: start does not reuse a disconnected client as healthy 
     return {
       ok: true,
       async json() {
-        return { webSocketDebuggerUrl: 'ws://127.0.0.1:45998/devtools/browser/test' };
+        return { Browser: 'Chrome/151.0.7922.138', webSocketDebuggerUrl: 'ws://127.0.0.1:45998/devtools/browser/test' };
       }
     };
   };

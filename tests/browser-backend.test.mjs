@@ -4,12 +4,14 @@ import assert from 'node:assert/strict';
 import {
   normalizeBrowserBackend,
   resolveBrowserBackend,
+  resolveStrictTransportBrowserBackend,
   resolveChromeDebugPort,
   resolveChromeExecutablePath,
+  resolveChromeAttachExisting,
   resolveChromeProfileMode,
   resolveChromeProfileName
 } from '../browser-backend.mjs';
-import { buildChromeLaunchArgs, defaultChromeUserDataDir } from '../chrome-cdp-backend.mjs';
+import { buildChromeLaunchArgs, defaultChromeUserDataDir, isChromeCdpVersion } from '../chrome-cdp-backend.mjs';
 
 test('browser-backend: normalizes aliases', () => {
   assert.equal(normalizeBrowserBackend('chrome'), 'chrome-cdp');
@@ -26,6 +28,14 @@ test('browser-backend: argv overrides env and settings', () => {
     settings: { browserBackend: 'electron' }
   });
   assert.equal(value, 'chrome-cdp');
+});
+
+test('browser-backend: strict transport rejects Electron but permits managed or attached Chrome CDP', () => {
+  assert.throws(
+    () => resolveStrictTransportBrowserBackend({ argv: ['node', 'main.mjs', '--browser-backend', 'electron'] }),
+    /strict_transport_requires_chrome_cdp/
+  );
+  assert.equal(resolveStrictTransportBrowserBackend({ argv: ['node', 'main.mjs', '--browser-backend', 'chrome-cdp'] }), 'chrome-cdp');
 });
 
 test('browser-backend: resolves chrome debug port and binary path', () => {
@@ -61,6 +71,20 @@ test('browser-backend: resolves chrome debug port and binary path', () => {
     }),
     'Profile 3'
   );
+  assert.equal(
+    resolveChromeAttachExisting({
+      argv: ['node', 'main.mjs'],
+      env: { AGENTIFY_DESKTOP_CHROME_ATTACH_EXISTING: 'true' },
+      settings: {}
+    }),
+    true
+  );
+});
+
+test('browser-backend: accepts only a Google Chrome CDP product for strict transport', () => {
+  assert.equal(isChromeCdpVersion({ Browser: 'Chrome/151.0.7922.138' }), true);
+  assert.equal(isChromeCdpVersion({ Browser: 'Electron/39.8.7' }), false);
+  assert.equal(isChromeCdpVersion({ Browser: 'HeadlessChrome/151.0.7922.138' }), false);
 });
 
 test('browser-backend: builds chrome launch args with managed profile', () => {

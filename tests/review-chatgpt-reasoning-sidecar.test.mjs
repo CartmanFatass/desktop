@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+test('reasoning sidecar is bounded to visible semantic menu evidence and cannot compose or send', () => {
+  const source = readFileSync(new URL('../scripts/review-chatgpt-reasoning-sidecar.mjs', import.meta.url), 'utf8');
+  assert.match(source, /Target\.attachToTarget/);
+  assert.match(source, /Network\.getCookies/);
+  assert.match(source, /exactProCount/);
+  assert.match(source, /semanticChildText/);
+  assert.match(source, /nestedModeCount/);
+  assert.match(source, /showAdvancedCount/);
+  assert.match(source, /effortHighCount/);
+  assert.match(source, /onboardingCloseCount/);
+  assert.match(source, /get started/);
+  assert.match(source, /selector_unavailable_after_onboarding/);
+  assert.match(source, /openPickerMenu/);
+  assert.match(source, /attempt < 3/);
+  assert.match(source, /menuDeadline/);
+  assert.match(source, /alreadyOpen/);
+  assert.match(source, /accidentally close a valid disclosure/);
+  assert.match(source, /portal the visible picker menu inside the composer form/);
+  assert.match(source, /fallbackVisibleInteractiveCount/);
+  assert.match(source, /hasVisibleMenu/);
+  assert.match(source, /document\.elementFromPoint/);
+  assert.match(source, /\[role="menuitemradio"\], \[role="menuitem"\], \[role="option"\]/);
+  assert.match(source, /show advanced options\?\|effort\|pro/);
+  assert.doesNotMatch(source, /!root\.closest\('\[?form/);
+  assert.match(source, /show advanced options\?/);
+  assert.match(source, /semanticChildText\.some/);
+  assert.match(source, /sidecar_runtime_evaluation_failed/);
+  assert.doesNotMatch(source, /Input\.insertText|sendKey|reviewQuery|review-transport/);
+});

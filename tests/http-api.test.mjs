@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
+import { mapErrorToHttp, releaseStrictReviewTab, startHttpApi } from '../http-api.mjs';
 import { readReviewTransportState } from '../state.mjs';
 import {
   REVIEW_CAUSAL_SUBMISSION_MODEL,
@@ -20,9 +20,333 @@ test('http-api: strict pre-send busy and post-send identity ambiguity are confli
   assert.equal(mapErrorToHttp(new Error('review_user_message_content_mismatch')).code, 409);
 });
 
-test('http-api: an empty continuation baseline is an explicit no-send conflict', async (t) => {
+test('http-api: strict review releases replaceable tabs and retains only an unbound recovery handle', async () => {
+  const closed = [];
+  const tabs = {
+    async closeTab(tabId) {
+      closed.push(tabId);
+    }
+  };
+
+  const complete = await releaseStrictReviewTab({
+    tabs,
+    defaultTabId: 'default-tab',
+    receipt: {
+      status: 'COMPLETE',
+      terminalState: 'NATURAL_COMPLETION_VERIFIED',
+      tabId: 'complete-tab',
+      conversationId: 'conversation-complete'
+    }
+  });
+  const waiting = await releaseStrictReviewTab({
+    tabs,
+    defaultTabId: 'default-tab',
+    receipt: {
+      terminalState: 'SENT_WAITING',
+      tabId: 'waiting-tab',
+      conversationId: 'conversation-waiting'
+    }
+  });
+  const unbound = await releaseStrictReviewTab({
+    tabs,
+    defaultTabId: 'default-tab',
+    receipt: {
+      terminalState: 'COMMITMENT_UNKNOWN',
+      tabId: 'unbound-tab',
+      conversationId: '__new__'
+    }
+  });
+  const protectedView = await releaseStrictReviewTab({
+    tabs,
+    defaultTabId: 'default-tab',
+    receipt: {
+      terminalState: 'SENT_WAITING',
+      tabId: 'default-tab',
+      conversationId: 'conversation-default'
+    }
+  });
+
+  assert.deepEqual(closed, ['complete-tab', 'waiting-tab']);
+  assert.equal(complete.status, 'CLOSED');
+  assert.equal(waiting.status, 'CLOSED');
+  assert.equal(unbound.status, 'RETAINED_RECOVERY_HANDLE');
+  assert.equal(protectedView.status, 'RETAINED_PROTECTED');
+});
+
+test('http-api: tab cleanup failure is reported without changing the transport fact', async () => {
+  const result = await releaseStrictReviewTab({
+    tabs: {
+      async closeTab() {
+        throw new Error('chrome_cdp_disconnected');
+      }
+    },
+    defaultTabId: 'default-tab',
+    receipt: {
+      status: 'COMPLETE',
+      terminalState: 'NATURAL_COMPLETION_VERIFIED',
+      tabId: 'completed-tab',
+      conversationId: 'conversation-complete'
+    }
+  });
+
+  assert.equal(result.status, 'CLOSE_FAILED');
+  assert.equal(result.error, 'chrome_cdp_disconnected');
+});
+
+test('http-api: reasoning-mode preflight carries no prompt or strict operation surface', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-mode-'));
+  const seen = [];
+  const controller = {
+    async reviewReasoningModePreflight(args) {
+      seen.push(args);
+      return {
+        provider: 'chatgpt', conversationUrl: 'https://chatgpt.com/', reasoningModeEvidence: 'Pro',
+        reasoningModeReceipt: { selectedMode: 'Pro', promptInsertCount: 0, sendActionCount: 0 },
+        promptInsertCount: 0, sendActionCount: 0
+      };
+    }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'mode-tab', key: 'mode', vendorId: 'chatgpt' }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-mode', stateDir, getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const { res, data } = await req({
+    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-mode-preflight',
+    body: { tabId: 'mode-tab', expectedMode: 'Pro', timeoutMs: 1_000 }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.result.reasoningModeEvidence, 'Pro');
+  assert.deepEqual(seen, [{ expectedMode: 'Pro', timeoutMs: 1_000 }]);
+  assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
+});
+
+test('http-api: page-wide reasoning diagnostic has no prompt or strict operation surface', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-diagnostic-'));
+  const seen = [];
+  const controller = {
+    async reviewReasoningModeDiagnostics(args) {
+      seen.push(args);
+      return { provider: 'chatgpt', scope: args.scope, controls: [], promptInsertCount: 0, sendActionCount: 0 };
+    }
+  };
+  const tabs = { listTabs: () => [{ id: 'mode-tab', key: 'mode', vendorId: 'chatgpt' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-diagnostic', stateDir, getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const { res, data } = await req({
+    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-mode-diagnostics',
+    body: { tabId: 'mode-tab', scope: 'page', timeoutMs: 1_000 }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.result.scope, 'page');
+  assert.deepEqual(seen, [{ timeoutMs: 1_000, scope: 'page', openModeSelector: false }]);
+  assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
+});
+
+test('http-api: ChatGPT profile snapshot has no prompt or strict operation surface', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-profile-snapshot-'));
+  const seen = [];
+  const controller = {
+    async reviewChatGPTProfileSnapshot(args) {
+      seen.push(args);
+      return { provider: 'chatgpt', urlBinding: 'provider_root', cookiePresence: { supported: true, matchingCookieCount: 1 }, promptInsertCount: 0, sendActionCount: 0 };
+    }
+  };
+  const tabs = { listTabs: () => [{ id: 'profile-tab', key: 'profile', vendorId: 'chatgpt' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-profile-snapshot', stateDir, getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const { res, data } = await req({
+    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-chatgpt-profile-snapshot',
+    body: { tabId: 'profile-tab', timeoutMs: 1_000 }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.result.cookiePresence.matchingCookieCount, 1);
+  assert.deepEqual(seen, [{ timeoutMs: 1_000 }]);
+  assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
+});
+
+test('http-api: operator surface observes non-default tabs but rejects protected-default mutation', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-operator-'));
+  const calls = [];
+  const controller = {
+    async operatorObserve(args) { calls.push(['observe', args]); return { revision: 'obs:1', url: 'https://chatgpt.com/', controls: [], sendActionCount: 0 }; },
+    async operatorAct(args) { calls.push(['act', args]); return { ...args, sendActionCount: 0, operationCreated: false }; }
+  };
+  const tabs = { listTabs: () => [{ id: 't0', key: 'default' }, { id: 't1', key: 'safe' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-operator', stateDir, getStatus: async () => ({ ok: true }) });
+  t.after(() => server.close());
+  const observed = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/operator-observe', body: { tabId: 't1' } });
+  assert.equal(observed.res.status, 200);
+  const denied = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/operator-act', body: { tabId: 't0', url: 'https://chatgpt.com/', revision: 'obs:1', targetId: 'target:1', action: 'click' } });
+  assert.equal(denied.res.status, 409);
+  assert.equal(denied.data.error, 'operator_protected_default_mutation_forbidden');
+  assert.deepEqual(calls, [['observe', { tabId: 't1' }]]);
+});
+
+test('http-api: controller refresh is fixed-generation-only, refuses strict activity, and preserves failed-refresh state', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-'));
+  let generation = 0;
+  let refreshCalls = 0;
+  const digest0 = 'a'.repeat(64);
+  const digest1 = 'b'.repeat(64);
+  const runtime = () => ({ supported: true, generation, sourceDigest: generation === 0 ? digest0 : digest1, sourceModules: [] });
+  const tabs = { listTabs: () => [{ id: 't0', key: 'default', protectedTab: true }], getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh', stateDir, getStatus: async () => ({ ok: true }),
+    getControllerRuntimeState: runtime,
+    onControllerRuntimeRefresh: async ({ expectedGeneration, expectedSourceDigest }) => {
+      refreshCalls += 1;
+      if (expectedGeneration !== generation || expectedSourceDigest !== (generation === 0 ? digest0 : digest1)) {
+        throw new Error('controller_refresh_expected_generation_mismatch');
+      }
+      generation = 1;
+      return runtime();
+    }
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const status = await req({ port, token: 'secret', method: 'GET', pth: '/runtime-controller-refresh-status' });
+  assert.equal(status.res.status, 200);
+  assert.equal(status.data.runtime.controllerRuntime.generation, 0);
+  const rejected = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0, modulePath: 'evil.mjs' } });
+  assert.equal(rejected.res.status, 409);
+  assert.equal(rejected.data.error, 'controller_refresh_request_invalid');
+  const refreshed = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0 } });
+  assert.equal(refreshed.res.status, 200);
+  assert.equal(refreshCalls, 1);
+  assert.equal(refreshed.data.result.generation, 1);
+  const stale = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0 } });
+  assert.equal(stale.res.status, 409);
+  assert.equal(generation, 1);
+});
+
+test('http-api: stale durable PREPARED alone does not impersonate an active controller boundary', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-strict-'));
+  const pending = {
+    schemaVersion: 2,
+    bindings: {},
+    operations: {
+      pending: {
+        operationId: 'pending-operation', idempotencyKey: 'pending', requestFingerprint: 'b'.repeat(64), stableKey: 'pending-stable-key',
+        provider: 'chatgpt', model: 'Pro', conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true,
+        promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
+        timeoutMs: 2700000, status: 'PREPARED', terminalState: null, sendCount: 0,
+        sendActionCount: 0, baselineMessageIds: [], createdAt: Date.now(), updatedAt: Date.now()
+      }
+    }
+  };
+  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(pending));
+  let calls = 0;
+  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-strict', stateDir, getStatus: async () => ({ ok: true }),
+    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
+    onControllerRuntimeRefresh: async () => { calls += 1; return {}; }
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
+  assert.equal(result.res.status, 200);
+  assert.equal(calls, 1);
+});
+
+test('http-api: controller refresh can repair an idle already-submitted strict observer', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-submitted-'));
+  const submitted = {
+    schemaVersion: 2,
+    bindings: {},
+    operations: {
+      submitted: {
+        operationId: 'submitted-operation', idempotencyKey: 'submitted', requestFingerprint: 'b'.repeat(64), stableKey: 'submitted-stable-key',
+        provider: 'chatgpt', model: 'Pro', conversationUrl: 'https://chatgpt.com/c/submitted', conversationId: 'submitted', firstBinding: false,
+        promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
+        timeoutMs: 2700000, status: 'SUBMITTED', terminalState: 'SENT_WAITING', sendCount: 1,
+        sendActionCount: 1, userMessageId: 'submitted-user', baselineMessageIds: [], createdAt: Date.now(), updatedAt: Date.now()
+      }
+    }
+  };
+  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(submitted));
+  let calls = 0;
+  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-submitted', stateDir, getStatus: async () => ({ ok: true }),
+    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
+    onControllerRuntimeRefresh: async () => { calls += 1; return { generation: 1, sourceDigest: 'b'.repeat(64) }; }
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
+  assert.equal(result.res.status, 200);
+  assert.equal(calls, 1);
+});
+
+test('http-api: provider admission is rejected while controller refresh is held', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-held-'));
+  let sendCalls = 0;
+  let releaseRefresh;
+  let markRefreshStarted;
+  const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
+  const refreshHeld = new Promise((resolve) => { releaseRefresh = resolve; });
+  const controller = {
+    async send() { sendCalls += 1; return { ok: true }; }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 't0', key: 'default', protectedTab: true }],
+    getControllerById: () => controller
+  };
+  const server = await startHttpApi({
+    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-held', stateDir, getStatus: async () => ({ ok: true }),
+    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
+    onControllerRuntimeRefresh: async () => {
+      markRefreshStarted();
+      await refreshHeld;
+      return { generation: 1, sourceDigest: 'b'.repeat(64) };
+    }
+  });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const refreshRequest = req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
+  await refreshStarted;
+  let concurrentSend;
+  try {
+    concurrentSend = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'must not send', tabId: 't0' } });
+  } finally {
+    releaseRefresh();
+  }
+  const refreshed = await refreshRequest;
+  assert.equal(concurrentSend.res.status, 409);
+  assert.equal(concurrentSend.data.error, 'controller_refresh_in_progress');
+  assert.equal(sendCalls, 0);
+  assert.equal(refreshed.res.status, 200);
+});
+
+test('http-api: stale durable send-intent alone does not impersonate an active refresh boundary', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-intent-'));
+  const now = Date.now();
+  const state = {
+    schemaVersion: 2, bindings: {}, operations: {
+      intent: {
+        operationId: 'intent-operation', idempotencyKey: 'intent', requestFingerprint: 'b'.repeat(64), stableKey: 'intent-stable-key', provider: 'chatgpt', model: 'Pro',
+        conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true, promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
+        timeoutMs: 2700000, status: 'SEND_INTENT', terminalState: null, sendCount: 0, sendActionCount: 0, createdAt: now, updatedAt: now
+      }
+    }
+  };
+  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(state));
+  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
+  const server = await startHttpApi({
+    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-intent', stateDir, getStatus: async () => ({ ok: true }),
+    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
+    onControllerRuntimeRefresh: async () => ({ generation: 1, sourceDigest: 'b'.repeat(64) })
+  });
+  t.after(() => server.close());
+  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
+  assert.equal(result.res.status, 200);
+});
+
+test('http-api: an empty continuation baseline returns a typed zero-send fact', async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-empty-baseline-'));
   let composerWrites = 0;
+  const closedTabs = [];
   const controller = {
     async reviewQuery(args) {
       await args.onPrepared({
@@ -37,6 +361,7 @@ test('http-api: an empty continuation baseline is an explicit no-send conflict',
   const tabs = {
     ensureTab: async () => 'review-tab',
     getControllerById: () => controller,
+    closeTab: async (tabId) => { closedTabs.push(tabId); },
     listTabs: () => []
   };
   const server = await startHttpApi({
@@ -65,18 +390,104 @@ test('http-api: an empty continuation baseline is an explicit no-send conflict',
       idempotencyKey: 'empty-baseline-continuation-op',
       prompt,
       promptSha256,
+      responsePath: path.join(stateDir, 'empty-baseline-response.md'),
       timeoutMs: 60_000,
       firstBinding: false
     }
   });
-  assert.equal(res.status, 409);
-  assert.equal(data.error, 'review_continuation_baseline_empty');
+  assert.equal(res.status, 200);
+  assert.equal(data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(data.receipt.zeroCommitPreClick, true);
+  assert.equal(data.receipt.tabId, 'review-tab');
+  assert.equal(data.receipt.tabLifecycle.status, 'CLOSED');
+  assert.deepEqual(closedTabs, ['review-tab']);
   assert.equal(composerWrites, 0);
   const operation = (await readReviewTransportState(stateDir)).operations['empty-baseline-continuation-op'];
   assert.equal(operation.failureStage, 'before_composer_write');
   assert.equal(operation.sendActionCount, 0);
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.userMessageId, undefined);
+});
+
+test('http-api: strict typed-failure cleanup retains the tab scope until close completes', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-cleanup-scope-'));
+  let closeStartedResolve;
+  const closeStarted = new Promise((resolve) => { closeStartedResolve = resolve; });
+  let releaseClose;
+  const closeGate = new Promise((resolve) => { releaseClose = resolve; });
+  let ordinaryCalls = 0;
+  const controller = {
+    runExclusive: async (fn) => await fn(),
+    async reviewQuery(args) {
+      await args.onPrepared({
+        baselineMessageIds: [],
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+    },
+    async query() {
+      ordinaryCalls += 1;
+      return { text: 'must not run during cleanup' };
+    }
+  };
+  const tabs = {
+    ensureTab: async () => 'cleanup-tab',
+    getControllerById: () => controller,
+    closeTab: async () => {
+      closeStartedResolve();
+      await closeGate;
+    },
+    listTabs: () => [{ id: 'cleanup-tab', key: 'cleanup-key' }]
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default-tab',
+    serverId: 'sid-review-cleanup-scope',
+    stateDir,
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => { releaseClose?.(); server.close(); });
+  const port = server.address().port;
+  const prompt = 'typed zero-send cleanup';
+  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  const strict = req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/review-query',
+    body: {
+      stableKey: 'cleanup-key',
+      provider: 'chatgpt',
+      model: 'GPT-5.6 Pro',
+      conversationUrl: 'https://chatgpt.com/c/cleanup-scope',
+      conversationId: 'cleanup-scope',
+      idempotencyKey: 'cleanup-scope-op',
+      prompt,
+      promptSha256,
+      responsePath: path.join(stateDir, 'cleanup-response.md'),
+      timeoutMs: 60_000,
+      firstBinding: false
+    }
+  });
+  await closeStarted;
+  const ordinary = await req({
+    port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/query',
+    body: { key: 'cleanup-key', prompt: 'must be rejected while close is pending' }
+  });
+  assert.equal(ordinary.res.status, 409);
+  assert.equal(ordinary.data.error, 'tab_busy');
+  assert.equal(ordinaryCalls, 0);
+  releaseClose();
+  const completed = await strict;
+  assert.equal(completed.res.status, 200);
+  assert.equal(completed.data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(completed.data.receipt.tabLifecycle.status, 'CLOSED');
 });
 
 async function req({ port, token, method, pth, body, headers = {} }) {
@@ -135,13 +546,14 @@ test('http-api: rejects unauthorized', async (t) => {
   assert.equal(data.error, 'unauthorized');
 });
 
-test('http-api: strict review query returns a durable receipt and does not duplicate the send', async (t) => {
+test('http-api: strict review send returns SENT_WAITING and later observes the same operation to COMPLETE', async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-'));
   let sends = 0;
   const response = 'REVIEW_SMOKE_OK';
   const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
   const prompt = 'Return REVIEW_SMOKE_OK.';
   const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
+  let observations = 0;
   const controller = {
     async reviewQuery(args) {
       sends += 1;
@@ -169,6 +581,13 @@ test('http-api: strict review query returns a durable receipt and does not dupli
         observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         identityMode: 'canonical_exact'
       });
+      const modelEvidence = {
+        expectedModel: args.expectedModel,
+        matchedLabel: 'GPT-5.6 Pro',
+        routeEvidence: 'semantic_model_switcher',
+        scopedMatchCount: 1
+      };
+      await args.onSendBoundaryEntered?.({ modelEvidence });
       const causalSubmissionReceipt = await args.onSendAction({
         clickCount: 1,
         sendActionCount: 1,
@@ -180,7 +599,8 @@ test('http-api: strict review query returns a durable receipt and does not dupli
           sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
           canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
           observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
-        }
+        },
+        clickTimeModelEvidence: modelEvidence
       });
       const observedTurn = {
         observedUserMessageId: 'user-http-1',
@@ -206,7 +626,17 @@ test('http-api: strict review query returns a durable receipt and does not dupli
         renderedIdentityMode: 'canonical_exact'
       });
       return {
+        status: 'SENT_WAITING',
         userMessageId: 'user-http-1',
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      };
+    },
+    async observeReviewResponse(args) {
+      observations += 1;
+      return {
+        userMessageId: args.userMessageId,
         assistantMessageId: 'assistant-http-1',
         text: response,
         snapshots: [
@@ -245,17 +675,105 @@ test('http-api: strict review query returns a durable receipt and does not dupli
     idempotencyKey: 'hmasd-agentify-transport-smoke',
     prompt,
     promptSha256,
+    responsePath: path.join(stateDir, 'strict-review-response.md'),
     timeoutMs: 45 * 60_000
   };
   const first = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
   assert.equal(first.res.status, 200);
-  assert.equal(first.data.receipt.status, 'COMPLETE');
+  assert.equal(first.data.receipt.status, 'SUBMITTED');
+  assert.equal(first.data.receipt.terminalState, 'SENT_WAITING');
   assert.equal(first.data.receipt.sendActionCount, 1);
-  assert.equal(first.data.receipt.responseSha256, responseSha256);
   const duplicate = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
   assert.equal(duplicate.res.status, 200);
   assert.equal(duplicate.data.receipt.operationId, first.data.receipt.operationId);
+  assert.equal(duplicate.data.receipt.status, 'COMPLETE');
+  assert.equal(duplicate.data.receipt.responseSha256, responseSha256);
+  assert.equal(duplicate.data.receipt.responsePath, body.responsePath);
+  assert.equal(await fs.readFile(body.responsePath, 'utf8'), response);
   assert.equal(sends, 1);
+  assert.equal(observations, 1);
+});
+
+test('http-api: a crash after the send-capable boundary returns COMMITMENT_UNKNOWN as a retained fact', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-unknown-'));
+  let calls = 0;
+  const controller = {
+    async reviewQuery(args) {
+      calls += 1;
+      await args.onPrepared({
+        baselineMessageIds: ['historical-user-1'],
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId,
+        modelEvidence: 'GPT-5.6 Pro'
+      });
+      await args.onComposerVerified({
+        ok: true,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerKind: 'contenteditable',
+        clearMethod: 'already_empty',
+        selectionVerified: true,
+        deleteKeyCount: 0,
+        emptyVerified: true,
+        emptySnapshotCount: 2,
+        caretVerified: true,
+        caretMethod: 'contenteditable_collapsed_range',
+        promptInsertCount: 1,
+        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
+        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
+        identityMode: 'canonical_exact'
+      });
+      await args.onSendBoundaryEntered({
+        modelEvidence: {
+          expectedModel: args.expectedModel,
+          matchedLabel: 'GPT-5.6 Pro',
+          routeEvidence: 'semantic_model_switcher',
+          scopedMatchCount: 1
+        }
+      });
+      throw new Error('simulated_boundary_crash');
+    }
+  };
+  const tabs = {
+    ensureTab: async () => 'review-tab',
+    getControllerById: () => controller,
+    listTabs: () => []
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 't0',
+    serverId: 'sid-review-unknown',
+    stateDir,
+    getStatus: async () => ({ ok: true })
+  });
+  t.after(() => server.close());
+  const prompt = 'Exact frozen transport question.';
+  const { res, data } = await req({
+    port: server.address().port,
+    token: 'secret',
+    method: 'POST',
+    pth: '/review-query',
+    body: {
+      stableKey: 'unknown-boundary-key',
+      provider: 'chatgpt',
+      model: 'GPT-5.6 Pro',
+      conversationUrl: 'https://chatgpt.com/c/unknown-boundary',
+      conversationId: 'unknown-boundary',
+      idempotencyKey: 'unknown-boundary-operation',
+      prompt,
+      responsePath: path.join(stateDir, 'unknown-boundary-response.md'),
+      timeoutMs: 60_000
+    }
+  });
+  assert.equal(res.status, 200);
+  assert.equal(data.receipt.status, 'OBSERVING');
+  assert.equal(data.receipt.terminalState, 'COMMITMENT_UNKNOWN');
+  assert.equal(data.receipt.sendCount, 0);
+  assert.equal(data.receipt.sendActionCount, 0);
+  assert.equal(calls, 1);
 });
 
 test('http-api: status returns getStatus output', async (t) => {
@@ -599,6 +1117,7 @@ test('http-api: conversation routes list sessions and open a clean composer on t
     ensureTab: async () => 't0',
     createTab: async () => 't0',
     closeTab: async () => true,
+    updateTabUrl: (tabId, conversationUrl) => calls.push(['url', tabId, conversationUrl]),
     getControllerById: () => controller
   };
   const server = await startHttpApi({
@@ -620,7 +1139,7 @@ test('http-api: conversation routes list sessions and open a clean composer on t
   assert.equal(listed.res.status, 200);
   assert.deepEqual(listed.data.conversations, [{ title: 'Review A', url: 'https://chatgpt.com/c/review-a' }]);
   assert.equal(created.data.url, 'https://chatgpt.com/');
-  assert.deepEqual(calls, [['list', 25], ['new']]);
+  assert.deepEqual(calls, [['list', 25], ['new'], ['url', 't0', 'https://chatgpt.com/']]);
 });
 
 test('http-api: status invalid tabId returns 404', async (t) => {
@@ -2870,7 +3389,7 @@ test('http-api: shared max inflight blocks a fresh strict send behind an ordinar
     getStatus: async () => ({ ok: true }),
     getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
   });
-  t.after(() => server.close());
+  t.after(() => { releaseOrdinary?.(); server.close(); });
   const port = server.address().port;
   const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary', prompt: 'hold capacity' } });
   for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -2891,6 +3410,7 @@ test('http-api: shared max inflight blocks a fresh strict send behind an ordinar
       idempotencyKey: 'strict-blocked-by-ordinary-op',
       prompt,
       promptSha256,
+      responsePath: path.join(stateDir, 'strict-blocked-response.md'),
       timeoutMs: 60_000
     }
   });
@@ -2905,6 +3425,13 @@ test('http-api: shared max inflight blocks a fresh strict send behind an ordinar
 });
 
 test('http-api: fresh strict reserves shared capacity while exact verifyExisting bypasses send admission', async (t) => {
+  const bounded = async (promise, label) => await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label)), 2_000);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-strict-governor-'));
   const response = 'STRICT_GOVERNOR_OK';
   const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
@@ -2951,6 +3478,13 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
         observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
         identityMode: 'canonical_exact'
       });
+      const modelEvidence = {
+        expectedModel: args.expectedModel,
+        matchedLabel: 'GPT-5.6 Pro',
+        routeEvidence: 'semantic_model_switcher',
+        scopedMatchCount: 1
+      };
+      await args.onSendBoundaryEntered?.({ modelEvidence });
       const causalSubmissionReceipt = await args.onSendAction({
         clickCount: 1,
         sendActionCount: 1,
@@ -2962,7 +3496,8 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
           sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
           canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
           observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
-        }
+        },
+        clickTimeModelEvidence: modelEvidence
       });
       const observedTurn = {
         observedUserMessageId: strictResult.userMessageId,
@@ -3004,7 +3539,8 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
   const tabs = {
     listTabs: () => [{ id: 'strict-tab', key: 'strict-governor-key' }, { id: 'ordinary-tab', key: 'ordinary-after-strict' }],
     ensureTab: async ({ key }) => key === 'strict-governor-key' ? 'strict-tab' : 'ordinary-tab',
-    getControllerById: (id) => id === 'strict-tab' ? strictController : ordinaryController
+    getControllerById: (id) => id === 'strict-tab' ? strictController : ordinaryController,
+    closeTab: async () => true
   };
   const server = await startHttpApi({
     port: 0,
@@ -3016,7 +3552,11 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
     getStatus: async () => ({ ok: true }),
     getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
   });
-  t.after(() => server.close());
+  t.after(() => {
+    releaseStrict?.();
+    releaseOrdinary?.();
+    server.close();
+  });
   const port = server.address().port;
   const strictBody = {
     stableKey: 'strict-governor-key',
@@ -3027,28 +3567,42 @@ test('http-api: fresh strict reserves shared capacity while exact verifyExisting
     idempotencyKey: 'strict-governor-op',
     prompt,
     promptSha256,
+    responsePath: path.join(stateDir, 'strict-governor-response.md'),
     timeoutMs: 60_000
   };
   const strict = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: strictBody });
   for (let i = 0; i < 50 && strictStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  const ordinaryBlocked = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'blocked by strict' } });
+  if (strictStarted !== 1) {
+    const early = await bounded(strict, 'fresh strict request neither started nor returned');
+    assert.fail(`fresh strict request returned before controller start: ${JSON.stringify(early)}`);
+  }
+  const ordinaryBlocked = await bounded(
+    req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'blocked by strict' } }),
+    'ordinary admission did not return while strict was active'
+  );
   assert.equal(ordinaryBlocked.res.status, 429);
   assert.equal(ordinaryBlocked.data.reason, 'max_inflight');
-  const activeVerified = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } });
+  const activeVerified = await bounded(
+    req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } }),
+    'active strict observation did not return'
+  );
   assert.equal(activeVerified.res.status, 200);
   assert.equal(activeVerified.data.receipt.userMessageId, strictResult.userMessageId);
 
   releaseStrict();
-  assert.equal((await strict).res.status, 200);
+  assert.equal((await bounded(strict, 'fresh strict request did not return')).res.status, 200);
 
   const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'hold while observing' } });
   for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  const verified = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } });
+  const verified = await bounded(
+    req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } }),
+    'post-completion strict observation did not return'
+  );
   assert.equal(verified.res.status, 200);
   assert.equal(verified.data.receipt.operationId, (await readReviewTransportState(stateDir)).operations[strictBody.idempotencyKey].operationId);
 
   releaseOrdinary();
-  assert.equal((await ordinary).res.status, 200);
+  assert.equal((await bounded(ordinary, 'ordinary query did not return')).res.status, 200);
 });
 
 test('http-api: query pacing returns 429 with retryAfterMs when max wait is 0', async (t) => {

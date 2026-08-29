@@ -6,9 +6,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  archiveReviewResponse,
   prepareReviewPromptInput,
   resolveReviewPromptInput,
   inspectReviewAdmission,
+  observeReviewOperation,
   runReviewQuery,
   sanitizeReviewErrorData
 } from '../review-transport.mjs';
@@ -26,6 +28,8 @@ async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
   const calls = { review: 0, reviewPrompts: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
+  let failAfterSendBoundary = false;
+  let postBoundaryFailure = null;
   let postClickFailure = null;
   let failAfterSubmittedReceipt = false;
   let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
@@ -33,9 +37,11 @@ async function fixture() {
   let sendControlFailure = null;
   let observedTurnFailure = null;
   let observeFailure = null;
+  let observeResultOverride = null;
   let diagnosticResult = null;
   let submissionDiagnosticResult = null;
   let renderedDisplayFidelity = 'exact';
+  let returnWaitingAfterSubmission = false;
   let fixturePrompt = '';
   const composerIdentityFields = () => ({
     composerPromptSha256: sha256(fixturePrompt),
@@ -130,6 +136,17 @@ async function fixture() {
       });
       if (reviewFailure) throw reviewFailure;
       if (sendControlFailure) throw sendControlFailure;
+      await args.onSendBoundaryEntered?.({
+        enteredAt: 85,
+        modelEvidence: {
+          expectedModel: args.expectedModel,
+          matchedLabel: 'GPT-5.6 Pro',
+          routeEvidence: 'semantic_model_switcher',
+          scopedMatchCount: 1
+        }
+      });
+      if (failAfterSendBoundary) throw new Error('simulated_crash_after_send_boundary');
+      if (postBoundaryFailure) throw postBoundaryFailure;
       const causalSubmissionReceipt = await args.onSendAction({
         clickCount: 1,
         sendActionCount: 1,
@@ -144,6 +161,12 @@ async function fixture() {
           observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
           serializedLength: args.prompt.length,
           expectedLength: args.prompt.length
+        },
+        clickTimeModelEvidence: {
+          expectedModel: args.expectedModel,
+          matchedLabel: 'GPT-5.6 Pro',
+          routeEvidence: 'semantic_model_switcher',
+          scopedMatchCount: 1
         }
       });
       if (postClickFailure) throw postClickFailure;
@@ -191,6 +214,15 @@ async function fixture() {
         ...exactIdentityFields()
       });
       if (failAfterSubmittedReceipt) throw new Error('simulated_crash_after_submitted_receipt');
+      if (returnWaitingAfterSubmission) {
+        return {
+          status: 'SENT_WAITING',
+          userMessageId: 'user-1',
+          conversationUrl: submittedUrl,
+          conversationId: submittedId,
+          modelEvidence: 'GPT-5.6 Pro'
+        };
+      }
       return {
         userMessageId: 'user-1',
         assistantMessageId: 'assistant-1',
@@ -209,6 +241,7 @@ async function fixture() {
       calls.observe += 1;
       calls.observeArgs.push(args);
       if (observeFailure) throw observeFailure;
+      if (observeResultOverride) return await observeResultOverride(args);
       const recoveredUrl = args.expectedConversationId?.startsWith('WEB:')
         ? 'https://chatgpt.com/c/canonical-bound'
         : args.expectedUrl;
@@ -239,17 +272,12 @@ async function fixture() {
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro',
+        renderedDisplayFidelity: 'exact',
         ...exactIdentityFields()
       });
       return {
+        status: 'SENT_WAITING',
         userMessageId: 'user-1',
-        assistantMessageId: 'assistant-1',
-        text: 'SMOKE_OK',
-        snapshots: [
-          { observedAt: 9000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
-          { observedAt: 12100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
-        ],
-        controls: { stop: false, continue: false, retry: false, answerNow: false },
         conversationUrl: args.expectedUrl,
         conversationId: args.expectedConversationId,
         modelEvidence: 'GPT-5.6 Pro'
@@ -291,7 +319,8 @@ async function fixture() {
     idempotencyKey: 'hmasd-agentify-transport-smoke',
     prompt,
     promptSha256: sha256(prompt),
-    timeoutMs: 45 * 60_000
+    responsePath: path.join(stateDir, 'response.md'),
+    timeoutMs: 240_000
   };
   return {
     stateDir,
@@ -300,6 +329,12 @@ async function fixture() {
     request,
     setFailBeforeSubmittedReceipt(value) {
       failBeforeSubmittedReceipt = !!value;
+    },
+    setFailAfterSendBoundary(value) {
+      failAfterSendBoundary = !!value;
+    },
+    setPostBoundaryFailure(error) {
+      postBoundaryFailure = error;
     },
     setPostClickFailure(error) {
       postClickFailure = error;
@@ -323,6 +358,9 @@ async function fixture() {
     setObserveFailure(error) {
       observeFailure = error;
     },
+    setObserveResultOverride(fn) {
+      observeResultOverride = fn;
+    },
     armForbiddenControls() {
       for (const method of ['reviewQuery', 'send', 'input', 'click', 'Continue', 'Retry', 'Stop', 'answerNow', 'inspectReviewComposerIdentity']) {
         controller[method] = async () => {
@@ -336,9 +374,91 @@ async function fixture() {
     },
     setRenderedDisplayFidelity(value) {
       renderedDisplayFidelity = value;
+    },
+    setReturnWaitingAfterSubmission(value) {
+      returnWaitingAfterSubmission = !!value;
     }
   };
 }
+
+test('review response archive: atomically commits and verifies the exact full text', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-response-'));
+  const responsePath = path.join(tempDir, 'nested', 'response.md');
+  const text = 'Full response\nwith Unicode: 科研\n';
+  try {
+    const archived = await archiveReviewResponse({ responsePath, text });
+    assert.equal(archived.responsePath, responsePath);
+    assert.equal(archived.responseSha256, sha256(text));
+    assert.equal(archived.responseBytes, Buffer.byteLength(text, 'utf8'));
+    assert.equal(await fs.readFile(responsePath, 'utf8'), text);
+    assert.equal((await fs.readdir(path.dirname(responsePath))).some((name) => name.includes('.tmp-')), false);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('review response archive: preserves one durable terminal LF projection without rewriting', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-response-lf-'));
+  const responsePath = path.join(tempDir, 'response.md');
+  const renderedText = 'Full rendered response\nwith Unicode: 科研';
+  const durableText = `${renderedText}\n`;
+  try {
+    await fs.writeFile(responsePath, durableText, 'utf8');
+    await assert.rejects(
+      archiveReviewResponse({ responsePath, text: renderedText }),
+      /review_response_path_conflict/
+    );
+    const archived = await archiveReviewResponse({
+      responsePath,
+      text: renderedText,
+      allowTerminalLfProjection: true
+    });
+    assert.equal(archived.responsePath, responsePath);
+    assert.equal(archived.responseSha256, sha256(durableText));
+    assert.equal(archived.responseBytes, Buffer.byteLength(durableText, 'utf8'));
+    assert.equal(archived.responseArchiveProjection, 'terminal_lf_v1');
+    assert.equal(await fs.readFile(responsePath, 'utf8'), durableText);
+    for (const invalidExisting of [`${renderedText}\r\n`, `${renderedText}\n\n`, `prefix\n${renderedText}`]) {
+      await fs.writeFile(responsePath, invalidExisting, 'utf8');
+      await assert.rejects(
+        archiveReviewResponse({ responsePath, text: renderedText, allowTerminalLfProjection: true }),
+        /review_response_path_conflict/
+      );
+    }
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('review response archive conflict records the current archive-stage predicate', async () => {
+  const f = await fixture();
+  try {
+    await fs.writeFile(f.request.responsePath, 'SMOKE_OK\n', 'utf8');
+    const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+    assert.equal(receipt.status, 'SUBMITTED');
+    assert.equal(receipt.terminalState, 'SENT_UNREADABLE');
+    assert.equal(receipt.error, 'review_response_path_conflict');
+    assert.equal(receipt.failureStage, 'response_archive');
+    assert.equal(receipt.errorData?.predicate, 'review_response_path_conflict');
+    assert.equal(receipt.errorData?.failureStage, 'response_archive');
+
+    const recovered = await runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, verifyExisting: true }
+    });
+    assert.equal(recovered.status, 'COMPLETE');
+    assert.equal(recovered.terminalState, 'NATURAL_COMPLETION_VERIFIED');
+    assert.equal('error' in recovered, false);
+    assert.equal('errorData' in recovered, false);
+    assert.equal('failureStage' in recovered, false);
+    assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK\n');
+    assert.equal(f.calls.review, 1);
+    assert.equal(f.calls.observe, 1);
+  } finally {
+    await fs.rm(f.stateDir, { recursive: true, force: true });
+  }
+});
 
 test('review prompt input: reads exact UTF-8 promptPath once from relative or absolute paths', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-prompt-'));
@@ -430,6 +550,8 @@ test('review transport: adopts an exact existing tab before the normal send life
   const request = { ...f.request, existingTabId: 'tab-existing' };
   const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
   assert.equal(receipt.status, 'COMPLETE');
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal('deadlineAt' in operation, false);
   assert.deepEqual(f.calls.adopt, [{
     id: 'tab-existing',
     key: request.stableKey,
@@ -509,14 +631,14 @@ test('review transport: composer mismatch persists observe-only sanitized diagno
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.sendActionCount, 0);
   assert.equal(operation.failureStage, 'before_send_click');
-  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
+  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
   assert.equal(operation.errorData.serializerTag, 'PRE');
   assert.deepEqual(operation.errorData.tagHistogram, { CODE: 8, DIV: 2, PRE: 8 });
   assert.equal(JSON.stringify(operation.errorData).includes('must-not-persist'), false);
   assert.equal(f.calls.inspect, 1);
 });
 
-test('review transport: expired blocked operation permits one metadata-only submission diagnosis', async () => {
+test('review transport: blocked operation permits one metadata-only submission diagnosis', async () => {
   const f = await fixture();
   const error = new Error('review_user_message_identity_unreadable');
   f.setReviewFailure(error, null);
@@ -524,9 +646,6 @@ test('review transport: expired blocked operation permits one metadata-only subm
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
     /review_user_message_identity_unreadable/
   );
-  const expired = await readReviewTransportState(f.stateDir);
-  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
-  await writeReviewTransportState(expired, f.stateDir);
   f.setSubmissionDiagnostic({
     ok: false,
     serializerOk: false,
@@ -593,8 +712,38 @@ test('review transport: deterministic send-control rejection remains an eligible
   assert.equal(operation.sendActionCount, 0);
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.failureStage, 'before_send_click');
-  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
+  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
   assert.equal(operation.errorData.noClickProven, true);
+});
+
+test('review transport: ledger-only observation exposes the durable zero-commit fact and mechanical view locator', async () => {
+  const f = await fixture();
+  const error = new Error('chrome_cdp_disconnected');
+  error.data = { failureStage: 'before_send_click', newUserMessageCount: 0, sendActionCount: 0 };
+  f.setReviewFailure(error, null);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /chrome_cdp_disconnected/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  const operation = state.operations[f.request.idempotencyKey];
+  const observed = await observeReviewOperation({
+    stateDir: f.stateDir,
+    idempotencyKey: f.request.idempotencyKey,
+    operationId: operation.operationId
+  });
+  assert.equal(observed.observationKind, 'ledger_only');
+  assert.equal(observed.zeroCommitPreClick, true);
+  assert.equal(observed.sendCount, 0);
+  assert.equal(observed.sendActionCount, 0);
+  assert.equal(observed.hasUserMessageId, false);
+  assert.equal(observed.tabId, 'tab-1');
+  assert.equal(observed.observedConversationId, null);
+  assert.equal(f.calls.review, 1);
+  await assert.rejects(
+    observeReviewOperation({ stateDir: f.stateDir, idempotencyKey: f.request.idempotencyKey, operationId: 'wrong-operation' }),
+    /review_operation_identity_mismatch/
+  );
 });
 
 test('review transport: one unreadable visible user turn is durably anchored before terminal failure', async () => {
@@ -630,8 +779,8 @@ test('review transport: one unreadable visible user turn is durably anchored bef
     /review_user_message_identity_unreadable/
   );
   const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(operation.status, 'OBSERVING');
+  assert.equal(operation.terminalState, 'SENT_UNREADABLE');
   assert.equal(operation.sendActionCount, 1);
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.userMessageId, undefined);
@@ -705,7 +854,64 @@ test('review transport: click with no observed turn remains distinct and has no 
   assert.equal(operation.errorData.commitmentClass, 'click_no_turn');
   assert.equal(operation.errorData.newUserMessageCount, 0);
   assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(operation.terminalState, 'COMMITMENT_UNKNOWN');
+});
+
+test('review transport: crash after entering the send-capable boundary is commitment unknown, never proven zero-send', async () => {
+  const f = await fixture();
+  f.setFailAfterSendBoundary(true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /simulated_crash_after_send_boundary/
+  );
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.ok(Number.isFinite(operation.sendBoundaryEnteredAt));
+  assert.equal(operation.sendCount, 0);
+  assert.equal(operation.sendActionCount, 0);
+  assert.equal(operation.terminalState, 'COMMITMENT_UNKNOWN');
+  const observed = await observeReviewOperation({
+    stateDir: f.stateDir,
+    idempotencyKey: f.request.idempotencyKey,
+    operationId: operation.operationId
+  });
+  assert.equal(observed.zeroCommitPreClick, false);
+});
+
+test('review transport: durable no-click proof resolves an entered boundary and releases the exact conversation prompt', async () => {
+  const f = await fixture();
+  const error = new Error('review_model_mismatch_at_send');
+  error.data = { noClickProven: true };
+  f.setPostBoundaryFailure(error);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_model_mismatch_at_send/
+  );
+  const blocked = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.ok(Number.isFinite(blocked.sendBoundaryEnteredAt));
+  assert.equal(blocked.boundaryResolution, 'no_click_proven');
+  assert.equal(blocked.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(blocked.sendActionCount, 0);
+
+  const replayed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(replayed.operationId, blocked.operationId);
+  assert.equal(replayed.status, 'BLOCKED');
+  assert.equal(replayed.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(replayed.boundaryResolution, 'no_click_proven');
+  assert.equal(replayed.errorData.noClickProven, true);
+  assert.equal(f.calls.review, 1);
+
+  f.setPostBoundaryFailure(null);
+  const replacement = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: {
+      ...f.request,
+      idempotencyKey: `${f.request.idempotencyKey}-after-zero-send`,
+      responsePath: path.join(f.stateDir, 'replacement-response.md')
+    }
+  });
+  assert.equal(replacement.status, 'COMPLETE');
+  assert.equal(f.calls.review, 2);
 });
 
 test('review transport: one send persists a complete receipt and duplicate returns it', async () => {
@@ -727,6 +933,13 @@ test('review transport: one send persists a complete receipt and duplicate retur
   assert.equal(first.renderedIdentity.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
   assert.equal(first.clickTimeIdentity.recoveredExact, true);
   assert.equal(first.clickTimeIdentity.sourceSha256, f.request.promptSha256);
+  assert.deepEqual(first.causalSendReceipt.modelSelection, {
+    expectedModel: 'GPT-5.6 Pro',
+    matchedLabel: 'GPT-5.6 Pro',
+    routeEvidence: 'semantic_model_switcher',
+    scopedMatchCount: 1
+  });
+  assert.equal(first.modelEvidence, 'GPT-5.6 Pro');
   assert.equal('submissionIdentityMode' in first, false);
   assert.equal('composerPromptSha256' in first, false);
   assert.equal(f.calls.review, 1);
@@ -809,19 +1022,95 @@ test('review transport: Gemini uses the same strict receipt lifecycle with provi
   assert.equal(f.calls.review, 1);
 });
 
-test('review transport: causal exact submission completes with lossy rendered Markdown stored only as display evidence', async () => {
+test('review transport: a stale waiting observer cannot regress a completed operation', async () => {
+  const f = await fixture();
+  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(completed.status, 'COMPLETE');
+  f.setObserveResultOverride(async (args) => ({
+    status: 'SENT_WAITING',
+    userMessageId: args.userMessageId,
+    conversationUrl: args.expectedUrl,
+    conversationId: args.expectedConversationId,
+    modelEvidence: args.submittedModelEvidence
+  }));
+  const observed = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(observed.status, 'COMPLETE');
+  const persisted = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(persisted.status, 'COMPLETE');
+  assert.equal(persisted.terminalState, 'NATURAL_COMPLETION_VERIFIED');
+});
+
+test('review transport: send phase returns SENT_WAITING and a later observe completes without another send', async () => {
+  const f = await fixture();
+  f.setReturnWaitingAfterSubmission(true);
+
+  const submitted = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(submitted.status, 'SUBMITTED');
+  assert.equal(submitted.terminalState, 'SENT_WAITING');
+  assert.equal(submitted.sendCount, 1);
+  assert.equal(submitted.sendActionCount, 1);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 0);
+
+  f.setReturnWaitingAfterSubmission(false);
+  const completed = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(completed.status, 'COMPLETE');
+  assert.equal(completed.terminalState, 'NATURAL_COMPLETION_VERIFIED');
+  assert.equal(completed.responsePath, f.request.responsePath);
+  assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+});
+
+test('review transport: verifyExisting certifies one durable terminal LF without another send', async () => {
+  const f = await fixture();
+  try {
+    f.setReturnWaitingAfterSubmission(true);
+    const submitted = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+    assert.equal(submitted.terminalState, 'SENT_WAITING');
+    await fs.writeFile(f.request.responsePath, 'SMOKE_OK\n', 'utf8');
+
+    f.setReturnWaitingAfterSubmission(false);
+    const completed = await runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, verifyExisting: true }
+    });
+    assert.equal(completed.status, 'COMPLETE');
+    assert.equal(completed.terminalState, 'NATURAL_COMPLETION_VERIFIED');
+    assert.equal(completed.responseArchiveProjection, 'terminal_lf_v1');
+    assert.equal(completed.responseSha256, sha256('SMOKE_OK\n'));
+    assert.equal(completed.snapshots[0].textSha256, sha256('SMOKE_OK'));
+    assert.equal(completed.snapshots[1].textSha256, sha256('SMOKE_OK'));
+    assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK\n');
+    assert.equal(f.calls.review, 1);
+    assert.equal(f.calls.observe, 1);
+  } finally {
+    await fs.rm(f.stateDir, { recursive: true, force: true });
+  }
+});
+
+test('review transport: lossy provider-visible input is isolated and cannot become COMPLETE', async () => {
   const f = await fixture();
   f.setRenderedDisplayFidelity('lossy_mismatch');
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(receipt.status, 'COMPLETE');
-  assert.equal(receipt.sendActionCount, 1);
-  assert.equal(receipt.sendCount, 1);
-  assert.equal(receipt.observedCommitmentClass, 'turn_causal_exact_rendered_mismatch');
-  assert.equal(receipt.submissionIdentity.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
-  assert.equal(receipt.submissionIdentity.sourceSha256, f.request.promptSha256);
-  assert.equal(receipt.submissionIdentity.userMessageId, 'user-1');
-  assert.equal(receipt.renderedDisplay.fidelity, 'lossy_mismatch');
-  assert.equal(receipt.renderedIdentity.identityMode, 'display_not_source_identity');
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_content_mismatch/
+  );
+  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(operation.status, 'BLOCKED');
+  assert.equal(operation.terminalState, 'SENT_INPUT_MISMATCH');
+  assert.equal(operation.sendActionCount, 1);
+  assert.equal(operation.sendCount, 0);
+  await assert.rejects(fs.access(f.request.responsePath));
 });
 
 test('review transport: composer replacement receipt is mandatory before strict submission', async () => {
@@ -881,13 +1170,16 @@ test('review transport: an empty continuation baseline fails before composer wri
   assert.equal(composerVerified, 0);
   assert.equal(sendAction, 0);
   assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.terminalState, 'IDENTITY_UNREADABLE');
+  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
   assert.equal(operation.failureStage, 'before_composer_write');
   assert.equal(operation.sendActionCount, 0);
   assert.equal(operation.sendCount, 0);
   assert.equal(operation.userMessageId, undefined);
   assert.equal(operation.errorData.noClickProven, true);
   assert.equal(operation.errorData.baselineMessageCount, 0);
+  const observed = await observeReviewOperation({ stateDir: f.stateDir, idempotencyKey: f.request.idempotencyKey });
+  assert.equal(observed.zeroCommitPreClick, true);
+  assert.equal(observed.failureStage, 'before_composer_write');
 });
 
 test('review transport: admission distinguishes a fresh send from exact existing observation', async () => {
@@ -915,6 +1207,100 @@ test('review transport: admission distinguishes a fresh send from exact existing
     }),
     /review_idempotency_conflict/
   );
+});
+
+test('review transport: first Gemini binding captures the created app identity after one strict send', async () => {
+  const f = await fixture();
+  f.setFirstBindingSubmittedUrl('https://gemini.google.com/app/created-gemini-conversation');
+  const request = {
+    ...f.request,
+    stableKey: 'gemini-first-binding-key',
+    idempotencyKey: 'gemini-first-binding-op',
+    provider: 'gemini',
+    model: 'Pro',
+    conversationUrl: 'https://gemini.google.com/app',
+    conversationId: '__new__',
+    firstBinding: true,
+    existingTabId: 'gemini-clean-tab'
+  };
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  assert.equal(receipt.provider, 'gemini');
+  assert.equal(receipt.conversationUrl, 'https://gemini.google.com/app/created-gemini-conversation');
+  assert.equal(receipt.conversationId, 'created-gemini-conversation');
+  assert.equal(receipt.sendCount, 1);
+  assert.equal(f.calls.review, 1);
+  assert.deepEqual(f.calls.adopt, [{
+    id: 'gemini-clean-tab',
+    key: request.stableKey,
+    name: request.stableKey,
+    url: request.conversationUrl,
+    vendorId: 'gemini',
+    vendorName: 'Gemini'
+  }]);
+});
+
+test('review transport: an opt-in non-scientific Gemini bootstrap permits exactly one model-specific continuation', async () => {
+  const f = await fixture();
+  const url = 'https://gemini.google.com/app/bootstrap-bound';
+  f.setFirstBindingSubmittedUrl(url);
+  const bootstrap = {
+    ...f.request,
+    stableKey: 'gemini-bootstrap-key', idempotencyKey: 'gemini-bootstrap-op', provider: 'gemini',
+    model: 'Gemini 3.1 Pro', conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__',
+    firstBinding: true, geminiBootstrap: true, bootstrapNonScientific: true
+  };
+  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: bootstrap });
+  assert.equal(first.sendCount, 1);
+  const prompt = 'actual model-specific turn';
+  const continuation = {
+    ...bootstrap,
+    idempotencyKey: 'gemini-bootstrap-pro-op', prompt, promptSha256: sha256(prompt),
+    model: 'Gemini 3.1 Pro extended', conversationUrl: url, conversationId: 'bootstrap-bound',
+    firstBinding: false, geminiBootstrap: false, geminiBootstrapContinuation: true, bootstrapNonScientific: false
+  };
+  const second = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: continuation });
+  const state = await readReviewTransportState(f.stateDir);
+  assert.equal(second.model, 'Gemini 3.1 Pro extended');
+  assert.equal(second.sendCount, 1);
+  assert.equal(state.operations['gemini-bootstrap-op'].geminiBootstrap, true);
+  assert.equal(state.operations['gemini-bootstrap-pro-op'].geminiBootstrapContinuation, true);
+  assert.equal(state.bindings['gemini-bootstrap-key'].model, 'Gemini 3.1 Pro extended');
+  assert.equal(state.bindings['gemini-bootstrap-key'].geminiBootstrap.continuationConsumed, true);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: { ...continuation, idempotencyKey: 'gemini-bootstrap-third-op', prompt: 'third', promptSha256: sha256('third') } }),
+    /review_binding_mismatch/
+  );
+  assert.equal(f.calls.review, 2);
+});
+
+test('review transport: dynamic Gemini bootstrap persists only the observed selected-model receipt', async () => {
+  const f = await fixture();
+  f.setFirstBindingSubmittedUrl('https://gemini.google.com/app/dynamic-bootstrap');
+  const request = {
+    ...f.request,
+    stableKey: 'gemini-dynamic-bootstrap-key', idempotencyKey: 'gemini-dynamic-bootstrap-op', provider: 'gemini',
+    model: '__selected__', conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__',
+    firstBinding: true, geminiBootstrap: true, bootstrapNonScientific: true
+  };
+  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
+  const state = await readReviewTransportState(f.stateDir);
+  assert.equal(receipt.model, 'GPT-5.6 Pro');
+  assert.equal(state.operations[request.idempotencyKey].model, 'GPT-5.6 Pro');
+  assert.equal(state.bindings[request.stableKey].model, 'GPT-5.6 Pro');
+  assert.equal(state.bindings[request.stableKey].geminiBootstrap.bootstrapModel, 'GPT-5.6 Pro');
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: model changes stay rejected without the one-time Gemini bootstrap authorization', async () => {
+  const f = await fixture();
+  const first = { ...f.request, provider: 'gemini', model: 'Gemini 3.1 Pro', conversationUrl: 'https://gemini.google.com/app/locked', conversationId: 'locked' };
+  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: first });
+  const prompt = 'different model';
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: { ...first, idempotencyKey: 'locked-second', model: 'Gemini 3.1 Pro extended', prompt, promptSha256: sha256(prompt) } }),
+    /review_binding_mismatch/
+  );
+  assert.equal(f.calls.review, 1);
 });
 
 test('review transport: conflicting idempotency payload is rejected without another send', async () => {
@@ -1008,17 +1394,13 @@ test('review transport: missing verifyExisting is rejected before state, tab, or
   assert.equal(f.calls.forbidden, 0);
 });
 
-test('review transport: verifyExisting observes a persisted submission after its original deadline', async () => {
+test('review transport: verifyExisting observes a persisted submission in a fresh wait window', async () => {
   const f = await fixture();
   f.setFailAfterSubmittedReceipt(true);
   await assert.rejects(
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
     /simulated_crash_after_submitted_receipt/
   );
-  const expired = await readReviewTransportState(f.stateDir);
-  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
-  await writeReviewTransportState(expired, f.stateDir);
-
   f.setFailAfterSubmittedReceipt(false);
   const verified = await runReviewQuery({
     stateDir: f.stateDir,
@@ -1039,10 +1421,6 @@ test('review transport: bounded failed verification preserves its single submitt
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
     /simulated_crash_after_submitted_receipt/
   );
-  const expired = await readReviewTransportState(f.stateDir);
-  expired.operations[f.request.idempotencyKey].deadlineAt = Date.now() - 1;
-  await writeReviewTransportState(expired, f.stateDir);
-
   f.setObserveFailure(new Error('timeout_waiting_for_response'));
   await assert.rejects(
     runReviewQuery({
@@ -1057,11 +1435,162 @@ test('review transport: bounded failed verification preserves its single submitt
   assert.deepEqual(Object.keys(state.operations), [f.request.idempotencyKey]);
   assert.equal(operation.sendCount, 1);
   assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(operation.status, 'SUBMITTED');
+  assert.equal(operation.terminalState, 'SENT_WAITING');
   assert.equal(f.calls.review, 1);
   assert.equal(f.calls.observe, 1);
   assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
+});
+
+test('review transport: first-bound operations accept only an exact-conversation verify-existing request', async () => {
+  const f = await fixture();
+  const firstBinding = {
+    ...f.request,
+    stableKey: 'first-bound-observation-key',
+    idempotencyKey: 'first-bound-observation-op',
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    firstBinding: true
+  };
+  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: firstBinding });
+  const verified = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: {
+      ...f.request,
+      stableKey: firstBinding.stableKey,
+      idempotencyKey: firstBinding.idempotencyKey,
+      conversationUrl: first.conversationUrl,
+      conversationId: first.conversationId,
+      verifyExisting: true
+    }
+  });
+  assert.equal(verified.operationId, first.operationId);
+  assert.equal(verified.sendCount, 1);
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.observe, 1);
+});
+
+test('review transport: verifyExisting may causally rebind one submitted-unverified operation without another send', async () => {
+  const f = await fixture();
+  const ambiguous = new Error('review_user_message_identity_ambiguous');
+  ambiguous.data = { newUserMessageCount: 2 };
+  f.setPostClickFailure(ambiguous);
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    /review_user_message_identity_ambiguous/
+  );
+  const blocked = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
+  assert.equal(blocked.sendActionCount, 1);
+  assert.equal(blocked.sendCount, 0);
+  assert.equal(blocked.userMessageId, undefined);
+  assert.equal(blocked.terminalState, 'COMMITMENT_UNKNOWN');
+  assert.equal(blocked.causalSendReceipt.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
+
+  f.setPostClickFailure(null);
+  const recovered = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: { ...f.request, verifyExisting: true }
+  });
+  assert.equal(recovered.status, 'COMPLETE');
+  assert.equal(recovered.sendActionCount, 1);
+  assert.equal(recovered.sendCount, 1);
+  assert.equal(recovered.userMessageId, 'user-1');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.recover, 1);
+  assert.equal(f.calls.observe, 1);
+});
+
+test('review transport: verifyExisting recovers one first-bound SENT_UNREADABLE turn from its exact observed conversation without another send', async () => {
+  const f = await fixture();
+  const concreteUrl = 'https://chatgpt.com/c/recovered-first-bound';
+  const initial = {
+    ...f.request,
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    firstBinding: true
+  };
+  f.setFirstBindingSubmittedUrl(concreteUrl);
+  f.setRenderedDisplayFidelity('unreadable');
+
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: initial }),
+    /review_user_message_identity_unreadable/
+  );
+  const blocked = (await readReviewTransportState(f.stateDir)).operations[initial.idempotencyKey];
+  assert.equal(blocked.status, 'OBSERVING');
+  assert.equal(blocked.terminalState, 'SENT_UNREADABLE');
+  assert.equal(blocked.sendActionCount, 1);
+  assert.equal(blocked.sendCount, 0);
+  assert.equal(blocked.userMessageId, undefined);
+  assert.equal(blocked.observedUserMessageId, 'user-1');
+  assert.equal(blocked.observedConversationUrl, concreteUrl);
+  assert.equal(blocked.observedConversationId, 'recovered-first-bound');
+
+  const recovered = await runReviewQuery({
+    stateDir: f.stateDir,
+    tabs: f.tabs,
+    request: {
+      ...initial,
+      conversationUrl: concreteUrl,
+      conversationId: 'recovered-first-bound',
+      firstBinding: false,
+      verifyExisting: true,
+      existingTabId: 'reopened-tab',
+      responsePath: undefined
+    }
+  });
+
+  assert.equal(recovered.status, 'COMPLETE');
+  assert.equal(recovered.terminalState, 'NATURAL_COMPLETION_VERIFIED');
+  assert.equal(recovered.sendActionCount, 1);
+  assert.equal(recovered.sendCount, 1);
+  assert.equal(recovered.userMessageId, 'user-1');
+  assert.equal(recovered.conversationUrl, concreteUrl);
+  assert.equal(recovered.conversationId, 'recovered-first-bound');
+  assert.equal(recovered.responsePath, initial.responsePath);
+  assert.equal(await fs.readFile(initial.responsePath, 'utf8'), 'SMOKE_OK');
+  assert.equal(f.calls.review, 1);
+  assert.equal(f.calls.recover, 1);
+  assert.equal(f.calls.observe, 1);
+  assert.equal(f.calls.ensure.at(-1).url, concreteUrl);
+
+  const state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings[initial.stableKey].conversationUrl, concreteUrl);
+  assert.equal(state.bindings[initial.stableKey].conversationId, 'recovered-first-bound');
+});
+
+test('review transport: first-bound SENT_UNREADABLE observation blocks a new key from reinjecting the same prompt into its observed conversation', async () => {
+  const f = await fixture();
+  const concreteUrl = 'https://chatgpt.com/c/observed-first-bound';
+  const initial = {
+    ...f.request,
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    firstBinding: true
+  };
+  f.setFirstBindingSubmittedUrl(concreteUrl);
+  f.setRenderedDisplayFidelity('unreadable');
+
+  await assert.rejects(
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: initial }),
+    /review_user_message_identity_unreadable/
+  );
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: {
+        ...f.request,
+        conversationUrl: concreteUrl,
+        conversationId: 'observed-first-bound',
+        idempotencyKey: 'forbidden-second-operation'
+      }
+    }),
+    /review_conversation_request_nonrepeatable/
+  );
+  assert.equal(f.calls.review, 1);
 });
 
 test('review transport: observer completion cannot promote a ledger without one persisted send action', async () => {
@@ -1173,7 +1702,7 @@ test('review transport: timeout above 45 minutes is rejected before tab or send'
   assert.equal(f.calls.ensure.length, 0);
 });
 
-test('review transport: failed operation stays closed and one fresh recovery operation may resend', async () => {
+test('review transport: commitment unknown blocks a fresh operation from reinjecting the same prompt into the same conversation', async () => {
   const f = await fixture();
   f.setFailBeforeSubmittedReceipt(true);
   await assert.rejects(
@@ -1181,8 +1710,8 @@ test('review transport: failed operation stays closed and one fresh recovery ope
     /simulated_crash_after_send_intent/
   );
   const uncertain = await readReviewTransportState(f.stateDir);
-  assert.equal(uncertain.operations[f.request.idempotencyKey].status, 'BLOCKED');
-  assert.equal(uncertain.operations[f.request.idempotencyKey].terminalState, 'SUBMITTED_UNVERIFIED');
+  assert.equal(uncertain.operations[f.request.idempotencyKey].status, 'OBSERVING');
+  assert.equal(uncertain.operations[f.request.idempotencyKey].terminalState, 'COMMITMENT_UNKNOWN');
   assert.equal(uncertain.operations[f.request.idempotencyKey].sendActionCount, 1);
   assert.equal(uncertain.operations[f.request.idempotencyKey].sendCount, 0);
   assert.equal(uncertain.operations[f.request.idempotencyKey].failureStage, 'send_occurred_or_uncertain');
@@ -1191,15 +1720,60 @@ test('review transport: failed operation stays closed and one fresh recovery ope
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
     /review_operation_closed_create_fresh/
   );
-  const recovered = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, idempotencyKey: 'fresh-recovery' }
-  });
-  assert.equal(recovered.status, 'COMPLETE');
-  assert.equal(recovered.sendCount, 1);
-  assert.equal(f.calls.review, 2);
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, idempotencyKey: 'fresh-recovery' }
+    }),
+    /review_conversation_request_nonrepeatable/
+  );
+  assert.equal(f.calls.review, 1);
   assert.equal(f.calls.recover, 0);
+});
+
+test('review transport: completed prompt cannot be reinjected into the same concrete conversation under a new operation', async () => {
+  const f = await fixture();
+  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(completed.status, 'COMPLETE');
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, idempotencyKey: 'second-operation-after-complete' }
+    }),
+    /review_conversation_request_nonrepeatable/
+  );
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: concurrent different operations for the same concrete conversation and prompt admit one sender', async () => {
+  const f = await fixture();
+  const competing = { ...f.request, idempotencyKey: 'competing-operation' };
+  const settled = await Promise.allSettled([
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
+    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: competing })
+  ]);
+  assert.equal(settled.filter((entry) => entry.status === 'fulfilled').length, 1);
+  const rejected = settled.find((entry) => entry.status === 'rejected');
+  assert.match(String(rejected?.reason?.message || rejected?.reason), /review_conversation_request_nonrepeatable/);
+  assert.equal(f.calls.review, 1);
+});
+
+test('review transport: responsePath is immutable operation input for every ordinary duplicate', async () => {
+  const f = await fixture();
+  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
+  assert.equal(completed.responsePath, f.request.responsePath);
+  await assert.rejects(
+    runReviewQuery({
+      stateDir: f.stateDir,
+      tabs: f.tabs,
+      request: { ...f.request, responsePath: path.join(f.stateDir, 'redirected-response.md') }
+    }),
+    /review_idempotency_conflict/
+  );
+  assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK');
+  await assert.rejects(fs.access(path.join(f.stateDir, 'redirected-response.md')));
 });
 
 test('review transport: concurrent identical calls re-read terminal state and send once', async () => {
@@ -1209,8 +1783,11 @@ test('review transport: concurrent identical calls re-read terminal state and se
     runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request })
   ]);
   assert.equal(first.operationId, second.operationId);
-  assert.equal(first.status, 'COMPLETE');
-  assert.equal(second.status, 'COMPLETE');
+  assert.ok(['SUBMITTED', 'COMPLETE'].includes(first.status));
+  assert.ok(['SUBMITTED', 'COMPLETE'].includes(second.status));
+  const persisted = await readReviewTransportState(f.stateDir);
+  assert.equal(persisted.operations[f.request.idempotencyKey].status, 'COMPLETE');
+  assert.equal(persisted.operations[f.request.idempotencyKey].terminalState, 'NATURAL_COMPLETION_VERIFIED');
   assert.equal(f.calls.review, 1);
   assert.equal(f.calls.recover, 0);
 });

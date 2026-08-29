@@ -68,6 +68,27 @@ test('tab-manager: createTab closes session if controller creation fails', async
   assert.deepEqual(manager.listTabs(), []);
 });
 
+test('tab-manager: failed close retains the tab for observable cleanup recovery', async () => {
+  const browserBackend = {
+    async createSession() {
+      return {
+        page: {},
+        presenter: {},
+        isClosed: () => false,
+        close: async () => {
+          throw new Error('chrome_cdp_disconnected');
+        }
+      };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({ key: 'cleanup-observation', url: 'https://gemini.google.com/app' });
+
+  await assert.rejects(async () => await manager.closeTab(tabId), /chrome_cdp_disconnected/);
+  assert.equal(manager.listTabs().length, 1);
+  assert.equal(manager.listTabs()[0].id, tabId);
+});
+
 test('tab-manager: exact stable binding rejects another conversation URL for the same key', async () => {
   const browserBackend = {
     async createSession() {
@@ -113,6 +134,42 @@ test('tab-manager: repeated exact stable binding reuses one live tab session', a
   assert.equal(manager.listTabs().length, 1);
 });
 
+test('tab-manager: ensureTab replaces a stale closed tab instead of reusing its locator', async () => {
+  let creates = 0;
+  const sessions = [];
+  const manager = new TabManager({
+    browserBackend: {
+      async createSession() {
+        creates += 1;
+        const session = {
+          page: {},
+          presenter: {},
+          closed: false,
+          isClosed() { return this.closed; },
+          async close() { this.closed = true; }
+        };
+        sessions.push(session);
+        return session;
+      }
+    },
+    createController: async () => ({})
+  });
+  const first = await manager.ensureTab({
+    key: 'recoverable-tab',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/persistent-conversation'
+  });
+  sessions[0].closed = true;
+  const replacement = await manager.ensureTab({
+    key: 'recoverable-tab',
+    vendorId: 'chatgpt',
+    url: 'https://chatgpt.com/c/persistent-conversation'
+  });
+  assert.notEqual(replacement, first);
+  assert.equal(creates, 2);
+  assert.deepEqual(manager.listTabs().map((tab) => tab.id), [replacement]);
+});
+
 test('tab-manager: first binding updates the stable tab to the created conversation URL', async () => {
   const browserBackend = {
     async createSession() {
@@ -151,6 +208,45 @@ test('tab-manager: scoped status wires its successful live URL read into reconci
   assert.match(source, /if \(url\) tabs\.reconcileLiveTabUrl\(resolvedTabId, url\)/);
 });
 
+test('tab-manager: tab rows disclose Chrome-CDP provenance and reject Electron eligibility', async () => {
+  const chromeManager = new TabManager({
+    browserBackend: {
+      getState: () => ({
+        kind: 'chrome-cdp',
+        browserProduct: 'Chrome/151.0.7922.138',
+        debugPort: 9222,
+        attachedToExisting: true,
+        launchedByAgentify: false
+      }),
+      async createSession() {
+        return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+      }
+    },
+    createController: async () => ({})
+  });
+  await chromeManager.createTab({ key: 'chrome-origin', url: 'https://chatgpt.com/' });
+  assert.deepEqual(chromeManager.listTabs()[0].browser, {
+    kind: 'chrome-cdp',
+    browserProduct: 'Chrome/151.0.7922.138',
+    debugPort: 9222,
+    attachedToExisting: true,
+    launchedByAgentify: false,
+    strictTransportEligible: true
+  });
+
+  const electronManager = new TabManager({
+    browserBackend: {
+      getState: () => ({ kind: 'electron', attachedToExisting: false, launchedByAgentify: true }),
+      async createSession() {
+        return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+      }
+    },
+    createController: async () => ({})
+  });
+  await electronManager.createTab({ key: 'electron-origin', url: 'https://chatgpt.com/' });
+  assert.equal(electronManager.listTabs()[0].browser.strictTransportEligible, false);
+});
+
 test('tab-manager: adopts the exact default tab without creating or navigating', async () => {
   let sessionCreates = 0;
   const browserBackend = {
@@ -182,4 +278,44 @@ test('tab-manager: adopts the exact default tab without creating or navigating',
     url: 'https://chatgpt.com/c/conversation-a',
     exactUrl: true
   }), tabId);
+});
+
+test('tab-manager: refreshControllers atomically rebinds live sessions and rolls back on prepare failure', async () => {
+  let creates = 0;
+  const sessions = [];
+  const manager = new TabManager({
+    browserBackend: {
+      async createSession() {
+        creates += 1;
+        const session = { page: { session: creates }, presenter: {}, isClosed: () => false, close: async () => {} };
+        sessions.push(session);
+        return session;
+      }
+    },
+    createController: async ({ page }) => ({ generation: 0, page })
+  });
+  const defaultId = await manager.createTab({ key: 'default', url: 'https://chatgpt.com/', protectedTab: true });
+  const tabId = await manager.createTab({ key: 'disposable', url: 'https://chatgpt.com/' });
+  const before = [manager.getControllerById(defaultId), manager.getControllerById(tabId)];
+  const result = await manager.refreshControllers({
+    createController: async ({ page }) => ({ generation: 1, page }),
+    validateController: async ({ controller }) => assert.equal(controller.generation, 1)
+  });
+  assert.deepEqual(result.reboundTabIds.sort(), [defaultId, tabId].sort());
+  assert.equal(creates, 2);
+  assert.equal(manager.getControllerById(defaultId).generation, 1);
+  assert.equal(manager.getControllerById(tabId).generation, 1);
+  const refreshed = [manager.getControllerById(defaultId), manager.getControllerById(tabId)];
+  await assert.rejects(
+    manager.refreshControllers({
+      createController: async ({ tabId: candidateTabId }) => {
+        if (candidateTabId === tabId) throw new Error('candidate_load_failed');
+        return { generation: 2 };
+      }
+    }),
+    /candidate_load_failed/
+  );
+  assert.equal(manager.getControllerById(defaultId), refreshed[0]);
+  assert.equal(manager.getControllerById(tabId), refreshed[1]);
+  assert.notEqual(refreshed[0], before[0]);
 });

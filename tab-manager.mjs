@@ -33,6 +33,23 @@ function tabMatchesVendor(tab, { vendorId = null, url = null } = {}) {
   return false;
 }
 
+function browserProvenance(browserBackend) {
+  const raw = browserBackend?.getState?.();
+  if (!raw || typeof raw !== 'object' || typeof raw.then === 'function') {
+    return { kind: 'unobserved', attachedToExisting: false, launchedByAgentify: null };
+  }
+  const kind = String(raw.kind || '').trim() || 'unobserved';
+  return {
+    kind,
+    browserProduct: typeof raw.browserProduct === 'string' ? raw.browserProduct : null,
+    debugPort: Number.isInteger(raw.debugPort) ? raw.debugPort : null,
+    attachedToExisting: raw.attachedToExisting === true,
+    launchedByAgentify: raw.launchedByAgentify === true,
+    strictTransportEligible:
+      kind === 'chrome-cdp' && typeof raw.browserProduct === 'string' && /^Chrome\/\d+(?:\.\d+){1,3}$/.test(raw.browserProduct)
+  };
+}
+
 export class TabManager {
   constructor({ browserBackend, createController, maxTabs = 12, onNeedsAttention, onChanged }) {
     this.browserBackend = browserBackend;
@@ -116,8 +133,10 @@ export class TabManager {
     const existing = this.keyToId.get(key);
     if (existing) {
       const tab = this.tabs.get(existing);
-      if (!tab) {
+      if (!tab || tab.session?.isClosed?.()) {
         this.keyToId.delete(key);
+        if (tab) this.tabs.delete(existing);
+        this.onChanged?.();
         return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
       }
       if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('key_vendor_mismatch');
@@ -125,6 +144,24 @@ export class TabManager {
       return existing;
     }
     return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
+  }
+
+  async refreshControllers({ createController, validateController = null } = {}) {
+    if (typeof createController !== 'function') throw new Error('controller_refresh_factory_missing');
+    return await this.mutex.run(async () => {
+      const prepared = [];
+      for (const tab of this.tabs.values()) {
+        if (tab.session?.isClosed?.()) throw new Error('controller_refresh_tab_closed');
+        const controller = await createController({ tabId: tab.id, page: tab.session.page, session: tab.session, previousController: tab.controller });
+        if (!controller || typeof controller !== 'object') throw new Error('controller_refresh_controller_invalid');
+        if (typeof validateController === 'function') await validateController({ tab, controller });
+        prepared.push({ tab, controller });
+      }
+      for (const item of prepared) item.tab.controller = item.controller;
+      this.createController = createController;
+      this.onChanged?.();
+      return { reboundTabIds: prepared.map(({ tab }) => tab.id) };
+    });
   }
 
   async adoptTab({ id, key, name, url, vendorId, vendorName } = {}) {
@@ -181,6 +218,7 @@ export class TabManager {
 
   listTabs() {
     const out = [];
+    const backend = browserProvenance(this.browserBackend);
     for (const t of this.tabs.values()) {
       out.push({
         id: t.id,
@@ -189,6 +227,7 @@ export class TabManager {
         vendorId: t.vendorId || null,
         vendorName: t.vendorName || null,
         url: t.url || null,
+        browser: backend,
         protectedTab: !!t.protectedTab,
         createdAt: t.createdAt,
         lastUsedAt: t.lastUsedAt
@@ -218,12 +257,13 @@ export class TabManager {
     return await this.mutex.run(async () => {
       const tab = this.tabs.get(id);
       if (!tab) throw new Error('tab_not_found');
+      // Keep the registry entry until the browser backend has confirmed the
+      // close.  A failed CDP close must remain observable and retryable rather
+      // than being reported as a successful cleanup after its tab was dropped.
+      await tab.session?.close?.();
       if (tab.key) this.keyToId.delete(tab.key);
       this.tabs.delete(id);
       this.forcedFocusTabs.delete(id);
-      try {
-        await tab.session?.close?.();
-      } catch {}
       this.onChanged?.();
       return true;
     });

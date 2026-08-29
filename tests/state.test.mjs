@@ -53,7 +53,6 @@ function completeReviewState({ schemaVersion = 2, includeSendActionCount = true 
     modelEvidence: 'GPT-5.6 Pro',
     createdAt: now,
     updatedAt: now + 3_100,
-    deadlineAt: now + 10_000,
     completedAt: now + 3_100
   };
   if (includeSendActionCount) operation.sendActionCount = 1;
@@ -97,6 +96,7 @@ test('state: normalizeSettings defaults allowAuthPopups to true', () => {
   assert.equal(s.browserBackend, 'chrome-cdp');
   assert.equal(s.chromeDebugPort, 9222);
   assert.equal(s.chromeProfileMode, 'isolated');
+  assert.equal(s.chromeAttachExisting, false);
   assert.equal(s.chromeProfileName, 'Default');
 });
 
@@ -279,6 +279,7 @@ test('state: fresh strict admission succeeds after valid legacy migration withou
       idempotencyKey: 'fresh-strict-operation',
       prompt,
       promptSha256: crypto.createHash('sha256').update(prompt, 'utf8').digest('hex'),
+      responsePath: path.join(dir, 'fresh-strict-response.md'),
       timeoutMs: 60_000
     }
   });
@@ -328,7 +329,6 @@ test('state: incomplete parseable COMPLETE review receipt fails closed', async (
         assistantMessageId: 'assistant-1',
         createdAt: now,
         updatedAt: now,
-        deadlineAt: now + 10_000
       }
     }
   };

@@ -135,7 +135,7 @@ registerTool(
   'agentify_review_query',
   {
     description:
-      'Strict receipt-bearing ChatGPT or Gemini review transport. Binds one stable key to one exact conversation/model, submits at most once per idempotency key, never activates Continue/Retry/Answer now, and verifies natural completion from exact message identities.',
+      'Strict receipt-bearing ChatGPT or Gemini review transport. Binds one stable key to one exact provider conversation, records immutable model evidence per operation, submits at most once per idempotency key, and verifies natural completion from exact message identities.',
     inputSchema: {
       stableKey: z.string().describe('Persistent stable binding key.'),
       provider: z.enum(['chatgpt', 'gemini']).describe('Exact provider identity.'),
@@ -145,10 +145,14 @@ registerTool(
       idempotencyKey: z.string().describe('Immutable operation idempotency key.'),
       prompt: z.string().optional().describe('Exact prompt bytes to submit once. Use either prompt or promptPath.'),
       promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is submitted once. Use either promptPath or prompt.'),
-      promptSha256: z.string().describe('Lowercase SHA-256 of the exact UTF-8 prompt.'),
-      timeoutMs: z.number().optional().describe('Single absolute operation deadline, maximum 45 minutes.'),
+      promptSha256: z.string().optional().describe('Optional tool-local integrity check. When omitted Agentify computes it internally.'),
+      responsePath: z.string().describe('Absolute local path for the full naturally completed response. COMPLETE is unavailable until this exact file is atomically committed and verified.'),
+      timeoutMs: z.number().optional().describe('Natural-completion wait window, up to 45 minutes. Agentify returns a nonterminal state when generation continues.'),
       verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.'),
       firstBinding: z.boolean().optional().describe('Bind a clean provider-root conversation to its concrete identity created by the one send.'),
+      geminiBootstrap: z.boolean().optional().describe('Gemini-only, non-scientific first-binding bootstrap. Requires firstBinding and bootstrapNonScientific.'),
+      geminiBootstrapContinuation: z.boolean().optional().describe('Gemini-only one-time authorized continuation after a committed non-scientific bootstrap; allows one recorded model transition.'),
+      bootstrapNonScientific: z.boolean().optional().describe('Required true for geminiBootstrap; records that the bootstrap is not the scientific request.'),
       existingTabId: z.string().optional().describe('Adopt this exact already-inspected provider tab for a new operation.')
     }
   },
@@ -162,9 +166,13 @@ registerTool(
     prompt,
     promptPath,
     promptSha256,
+    responsePath,
     timeoutMs,
     verifyExisting,
     firstBinding,
+    geminiBootstrap,
+    geminiBootstrapContinuation,
+    bootstrapNonScientific,
     existingTabId
   }) => {
     const exactPrompt = await prepareReviewPromptInput({ prompt, promptPath, promptSha256 });
@@ -182,16 +190,248 @@ registerTool(
         idempotencyKey,
         prompt: exactPrompt,
         promptSha256,
+        responsePath,
         timeoutMs: timeoutMs ?? 45 * 60_000,
         verifyExisting: verifyExisting === true,
         firstBinding: firstBinding === true,
+        geminiBootstrap: geminiBootstrap === true,
+        geminiBootstrapContinuation: geminiBootstrapContinuation === true,
+        bootstrapNonScientific: bootstrapNonScientific === true,
         existingTabId: existingTabId || undefined
       }
     });
     const receipt = data.receipt || null;
+    const { responseText: _inlineResponse, ...publicReceipt } = receipt || {};
     return {
-      content: [{ type: 'text', text: receipt?.responseText || JSON.stringify(receipt || {}, null, 2) }],
-      structuredContent: { receipt }
+      content: [{ type: 'text', text: JSON.stringify(publicReceipt, null, 2) }],
+      structuredContent: { receipt: publicReceipt }
+    };
+  }
+);
+
+// This deliberately has no prompt input and therefore cannot enter a provider
+// turn.  It exposes the strict controller's genuine Gemini picker preflight
+// through the same native MCP boundary used by production transport.
+registerTool(
+  'agentify_review_preflight',
+  {
+    description:
+      'Non-sending strict Gemini model preflight on an already inspected Agentify tab. Verifies the visible selected model and thinking controls without creating a review operation, editing a composer, or sending a provider turn.',
+    inputSchema: {
+      expectedModel: z.string().describe('Exact Gemini model/mode required by the later strict review.'),
+      tabId: z.string().describe('Exact existing Gemini tab to inspect; this tool never creates a tab.'),
+      timeoutMs: z.number().optional().describe('Bounded preflight timeout, maximum one minute.')
+    }
+  },
+  async ({ expectedModel, tabId, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-preflight',
+      body: {
+        expectedModel,
+        tabId,
+        timeoutMs: timeoutMs ?? 20_000
+      }
+    });
+    const result = data.result || null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
+      structuredContent: { tabId: data.tabId || tabId, result }
+    };
+  }
+);
+
+// No prompt, stable key, or idempotency key is accepted here. This native
+// primitive can only normalize ChatGPT's visible High/Pro reasoning mode and
+// returns before any composer, ledger, or Send surface.
+registerTool(
+  'agentify_review_reasoning_mode_preflight',
+  {
+    description:
+      'Non-sending ChatGPT reasoning-mode preflight on an already inspected tab. A fresh tab may read High; it selects exact Pro only from one unambiguous visible controlled-menu option and returns a zero-send receipt.',
+    inputSchema: {
+      expectedMode: z.string().describe('Exact ChatGPT reasoning mode required before a later strict review.'),
+      tabId: z.string().describe('Exact existing ChatGPT tab to inspect; this tool never creates a tab.'),
+      timeoutMs: z.number().optional().describe('Bounded preflight timeout, maximum one minute.')
+    }
+  },
+  async ({ expectedMode, tabId, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-reasoning-mode-preflight',
+      body: { expectedMode, tabId, timeoutMs: timeoutMs ?? 20_000 }
+    });
+    const result = data.result || null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
+      structuredContent: { tabId: data.tabId || tabId, result }
+    };
+  }
+);
+
+// Read-only visible-control observer for the same no-send reasoning-mode
+// surface. It has no composer, prompt, ledger, or Send input.
+registerTool(
+  'agentify_review_reasoning_mode_diagnostics',
+  {
+    description:
+      'Visible ChatGPT reasoning-control diagnostic. scope=page reports only visible interactive role/name/ARIA/controlled-menu relationships; optional openModeSelector opens exactly one visible High/Pro or Model Selector control to inspect its rendered menu, never edits a composer or sends.',
+    inputSchema: {
+      tabId: z.string().describe('Exact existing ChatGPT tab to inspect; this tool never creates a tab.'),
+      scope: z.enum(['composer', 'page']).optional().describe('Visible control scope; page includes header/topbar and composer.'),
+      openModeSelector: z.boolean().optional().describe('When true with scope=page, opens only one unambiguous visible High/Pro or Model Selector control and reports visible menu controls; it never types or sends.'),
+      timeoutMs: z.number().optional().describe('Bounded diagnostic timeout, maximum one minute.')
+    }
+  },
+  async ({ tabId, scope, openModeSelector, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-reasoning-mode-diagnostics',
+      body: { tabId, scope: scope ?? 'composer', openModeSelector: openModeSelector === true, timeoutMs: timeoutMs ?? 20_000 }
+    });
+    const result = data.result || null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
+      structuredContent: { tabId: data.tabId || tabId, result }
+    };
+  }
+);
+
+// Aggregate-only ChatGPT profile/session observer. It deliberately cannot
+// return cookie values or create/send a provider operation.
+registerTool(
+  'agentify_review_chatgpt_profile_snapshot',
+  {
+    description:
+      'Non-sending ChatGPT profile/root-binding snapshot for one existing tab. Returns visible control state and aggregate cookie-presence metadata only; never cookie values, composer input, or provider turns.',
+    inputSchema: {
+      tabId: z.string().describe('Exact existing ChatGPT tab to inspect; this tool never creates a tab.'),
+      timeoutMs: z.number().optional().describe('Bounded snapshot timeout, maximum one minute.')
+    }
+  },
+  async ({ tabId, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-chatgpt-profile-snapshot',
+      body: { tabId, timeoutMs: timeoutMs ?? 20_000 }
+    });
+    const result = data.result || null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
+      structuredContent: { tabId: data.tabId || tabId, result }
+    };
+  }
+);
+
+// Closed-loop, result-blind native UI control. Observation returns only visible
+// control metadata/composer hashes. Mutation rejects the protected default,
+// stale URL/revision, ambiguous or forbidden response controls.
+registerTool(
+  'agentify_operator_observe',
+  {
+    description: 'Observe one existing Agentify tab for closed-loop UI control. Returns current URL, visible hit-tested controls, nested rendered High/Pro reasoning-text mappings only when they resolve to one actionable ancestor, composer metadata, generation controls, and an action-bound observation revision; it never sends.',
+    inputSchema: { tabId: z.string().describe('Exact existing tab; this tool never creates or mutates a tab.') }
+  },
+  async ({ tabId }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/operator-observe', body: { tabId } });
+    return { content: [{ type: 'text', text: JSON.stringify(data.result || {}, null, 2) }], structuredContent: { tabId: data.tabId || tabId, result: data.result || null } };
+  }
+);
+
+registerTool(
+  'agentify_operator_act',
+  {
+    description: 'Perform one native pointer, key, text, or paste action only on a current observed visible target. It rejects protected-default mutation, stale URL/revision, ambiguous/hidden targets, and Send/Stop/Retry/Continue controls; returns an after-action observation receipt.',
+    inputSchema: {
+      tabId: z.string(), url: z.string(), revision: z.string(), targetId: z.string(), action: z.enum(['click', 'key', 'text', 'paste']),
+      key: z.string().optional(), modifiers: z.array(z.string()).optional(), textPath: z.string().optional(), textSha256: z.string().optional()
+    }
+  },
+  async ({ tabId, url, revision, targetId, action, key, modifiers, textPath, textSha256 }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/operator-act', body: { tabId, url, revision, targetId, action, key, modifiers, textPath, textSha256 } });
+    return { content: [{ type: 'text', text: JSON.stringify(data.result || {}, null, 2) }], structuredContent: { tabId: data.tabId || tabId, result: data.result || null } };
+  }
+);
+
+registerTool(
+  'agentify_operator_wait',
+  {
+    description: 'Boundedly re-observe one existing tab with backoff until visible interactive state or an exact visible target predicate settles. A timeout is LOAD_OR_POSTCONDITION_UNRESOLVED with its result-blind observation timeline; it never acts or sends.',
+    inputSchema: { tabId: z.string(), url: z.string().optional(), role: z.string().optional(), label: z.string().optional(), selected: z.boolean().optional(), timeoutMs: z.number().optional() }
+  },
+  async ({ tabId, url, role, label, selected, timeoutMs }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/operator-wait', body: { tabId, url, role, label, selected, timeoutMs } });
+    return { content: [{ type: 'text', text: JSON.stringify(data.result || {}, null, 2) }], structuredContent: { tabId: data.tabId || tabId, result: data.result || null } };
+  }
+);
+
+// Native local lifecycle control. It has no tab, provider, prompt, or source
+// path input and therefore cannot become a transport or browser-control path.
+registerTool(
+  'agentify_runtime_controller_refresh_status',
+  {
+    description: 'Read the loaded Agentify controller generation and fixed-source digest. This is local runtime metadata only and never opens or changes a tab.',
+    inputSchema: {}
+  },
+  async () => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'GET', path: '/runtime-controller-refresh-status' });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
+  }
+);
+
+registerTool(
+  'agentify_runtime_controller_refresh',
+  {
+    description: 'Locally refresh the fixed Agentify controller/observer modules without restarting Agentify, Chrome, profile, or tabs. Requires the exact currently loaded generation and source digest; refuses while any query or strict operation is active. It cannot send or create a provider operation.',
+    inputSchema: {
+      expectedGeneration: z.number().int().nonnegative(),
+      expectedSourceDigest: z.string().regex(/^[0-9a-f]{64}$/)
+    }
+  },
+  async ({ expectedGeneration, expectedSourceDigest }) => {
+    const conn = await getConn();
+    const data = await requestJson({ ...conn, method: 'POST', path: '/runtime-controller-refresh', body: { expectedGeneration, expectedSourceDigest } });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
+  }
+);
+
+// This ledger-only operation deliberately has no page or prompt input. It
+// exposes durable strict-operation facts without providing a route to prepare,
+// send, or recover a provider turn.
+registerTool(
+  'agentify_review_observe',
+  {
+    description:
+      'Observe one durable strict-review ledger operation without opening a tab, reading a prompt, editing a composer, or sending a provider turn.',
+    inputSchema: {
+      idempotencyKey: z.string().describe('Exact immutable strict operation key.'),
+      operationId: z.string().optional().describe('Optional exact durable operation id for identity cross-check.')
+    }
+  },
+  async ({ idempotencyKey, operationId }) => {
+    const conn = await getConn();
+    const data = await requestJson({
+      ...conn,
+      method: 'POST',
+      path: '/review-observe',
+      body: { idempotencyKey, operationId }
+    });
+    const result = data.result || null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
+      structuredContent: { result }
     };
   }
 );
@@ -382,7 +622,7 @@ registerTool(
 registerTool(
   'agentify_status',
   {
-    description: 'Get current URL and blocked/ready status for the Agentify Desktop window.',
+    description: 'Get current URL, blocked/ready state, and actual provider-browser provenance. Strict transport requires attached existing Google Chrome CDP; Electron control-center state is not provider provenance.',
     inputSchema: {
       model: z.string().optional().describe('Target model/provider hint (e.g., "chatgpt").'),
       tabId: z.string().optional().describe('Tab/session id to inspect.'),

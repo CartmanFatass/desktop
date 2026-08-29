@@ -143,6 +143,20 @@ async function readJson(url) {
   return await response.json();
 }
 
+export function isChromeCdpVersion(version) {
+  return /^Chrome\/\d+(?:\.\d+){1,3}$/.test(String(version?.Browser || '').trim());
+}
+
+function assertChromeCdpVersion(version, { debugPort } = {}) {
+  if (isChromeCdpVersion(version)) return String(version.Browser).trim();
+  const error = new Error('chrome_cdp_surface_not_google_chrome');
+  error.data = {
+    debugPort: Math.floor(Number(debugPort)) || null,
+    browserProduct: String(version?.Browser || '').trim().slice(0, 128) || null
+  };
+  throw error;
+}
+
 export class ChromeCdpConnection {
   constructor(wsUrl, { wsFactory } = {}) {
     this.wsUrl = wsUrl;
@@ -297,7 +311,7 @@ export class ChromeCdpConnection {
   }
 }
 
-class ChromeCdpPageAdapter {
+export class ChromeCdpPageAdapter {
   constructor({ client, targetId, sessionId, windowId = null }) {
     this.client = client;
     this.targetId = targetId;
@@ -350,6 +364,31 @@ class ChromeCdpPageAdapter {
       this.sessionId
     );
     return result?.result?.value;
+  }
+
+  // Session diagnostics deliberately expose presence/count metadata only.
+  // Cookie values, names, paths, expiry timestamps, and other secret-bearing
+  // attributes must never cross the controller/MCP boundary.
+  async getCookiePresenceMetadata({ url = 'https://chatgpt.com/' } = {}) {
+    const targetUrl = String(url || 'https://chatgpt.com/');
+    const host = new URL(targetUrl).hostname;
+    const result = await this.client.send('Network.getCookies', { urls: [targetUrl] }, this.sessionId);
+    const cookies = Array.isArray(result?.cookies) ? result.cookies : [];
+    const scoped = cookies.filter((cookie) => {
+      const domain = String(cookie?.domain || '').replace(/^\./, '').toLowerCase();
+      return domain === host || host.endsWith(`.${domain}`);
+    });
+    return {
+      supported: true,
+      host,
+      matchingCookieCount: scoped.length,
+      secureCookieCount: scoped.filter((cookie) => cookie?.secure === true).length,
+      httpOnlyCookieCount: scoped.filter((cookie) => cookie?.httpOnly === true).length,
+      sessionCookieCount: scoped.filter((cookie) => Number(cookie?.expires) < 0).length,
+      persistentCookieCount: scoped.filter((cookie) => Number(cookie?.expires) >= 0).length,
+      // Presence is diagnostic metadata only, never authentication proof.
+      nonEmpty: scoped.length > 0
+    };
   }
 
   async getUrl() {
@@ -454,9 +493,22 @@ class ChromeCdpPageAdapter {
 
   async close() {
     if (this.closed) return;
+    let result;
     try {
-      await this.client.send('Target.closeTarget', { targetId: this.targetId });
-    } catch {}
+      result = await this.client.send('Target.closeTarget', { targetId: this.targetId });
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (!/No target with given id found/i.test(message)) throw error;
+      // The browser already released the target. Treat the requested local
+      // cleanup as complete so TabManager can discard its stale registry row.
+      this.closed = true;
+      return;
+    }
+    if (result?.success === false) {
+      const error = new Error('chrome_cdp_target_close_rejected');
+      error.data = { targetId: this.targetId };
+      throw error;
+    }
     this.closed = true;
   }
 }
@@ -500,7 +552,7 @@ class ChromeCdpPresenter {
 }
 
 export class ChromeCdpBrowserBackend {
-  constructor({ stateDir, userAgent, onChanged, executablePath = null, debugPort = 9222, profileMode = 'isolated', profileName = 'Default' } = {}) {
+  constructor({ stateDir, userAgent, onChanged, executablePath = null, debugPort = 9222, profileMode = 'isolated', profileName = 'Default', attachExisting = false } = {}) {
     this.stateDir = stateDir;
     this.userAgent = typeof userAgent === 'string' && userAgent.trim() ? userAgent.trim() : null;
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
@@ -508,6 +560,7 @@ export class ChromeCdpBrowserBackend {
     this.debugPort = Math.floor(Number(debugPort)) || 9222;
     this.profileMode = String(profileMode || '').trim().toLowerCase() === 'existing' ? 'existing' : 'isolated';
     this.profileName = String(profileName || '').trim() || 'Default';
+    this.attachExisting = attachExisting === true;
     this.chromeProcess = null;
     this.client = null;
     this.started = false;
@@ -515,6 +568,7 @@ export class ChromeCdpBrowserBackend {
     this.chromeUserDataDir =
       this.profileMode === 'existing' ? defaultChromeUserDataDir() : path.join(this.stateDir, 'chrome-user-data');
     this.boundTargetDestroyed = null;
+    this.browserProduct = null;
   }
 
   async start() {
@@ -522,6 +576,11 @@ export class ChromeCdpBrowserBackend {
       return this.getState();
     }
 
+    if (this.attachExisting && this.profileMode !== 'existing') {
+      const error = new Error('chrome_attach_requires_existing_profile_mode');
+      error.data = { profileMode: this.profileMode };
+      throw error;
+    }
     if (this.profileMode === 'isolated') {
       await fs.mkdir(this.chromeUserDataDir, { recursive: true });
     } else if (!(await pathExists(this.chromeUserDataDir))) {
@@ -537,7 +596,7 @@ export class ChromeCdpBrowserBackend {
     } catch {
       portOccupied = false;
     }
-    if (portOccupied) {
+    if (portOccupied && !this.attachExisting) {
       const err = new Error('chrome_debug_port_in_use');
       err.data = {
         debugPort: this.debugPort,
@@ -547,24 +606,32 @@ export class ChromeCdpBrowserBackend {
     }
 
     try {
-      const executable = await findChromeExecutable(this.executablePath);
-      const args = buildChromeLaunchArgs({
-        debugPort: this.debugPort,
-        userDataDir: this.chromeUserDataDir,
-        profileName: this.profileName,
-        startUrl: 'about:blank'
-      });
-      this.chromeProcess = spawn(executable, args, chromeSpawnOptions());
-      this.chromeProcess.unref?.();
-
       let version;
-      const start = Date.now();
-      while (Date.now() - start < 15_000) {
-        try {
-          version = await readJson(`http://127.0.0.1:${this.debugPort}/json/version`);
-          break;
-        } catch {
-          await sleep(250);
+      if (portOccupied && this.attachExisting) {
+        version = await readJson(`http://127.0.0.1:${this.debugPort}/json/version`);
+      } else {
+        if (this.attachExisting) {
+          const error = new Error('chrome_cdp_existing_surface_unavailable');
+          error.data = { debugPort: this.debugPort };
+          throw error;
+        }
+        const executable = await findChromeExecutable(this.executablePath);
+        const args = buildChromeLaunchArgs({
+          debugPort: this.debugPort,
+          userDataDir: this.chromeUserDataDir,
+          profileName: this.profileName,
+          startUrl: 'about:blank'
+        });
+        this.chromeProcess = spawn(executable, args, chromeSpawnOptions());
+        this.chromeProcess.unref?.();
+        const start = Date.now();
+        while (Date.now() - start < 15_000) {
+          try {
+            version = await readJson(`http://127.0.0.1:${this.debugPort}/json/version`);
+            break;
+          } catch {
+            await sleep(250);
+          }
         }
       }
       if (!version) {
@@ -580,6 +647,8 @@ export class ChromeCdpBrowserBackend {
             : { profileMode: this.profileMode, userDataDir: this.chromeUserDataDir };
         throw err;
       }
+
+      this.browserProduct = assertChromeCdpVersion(version, { debugPort: this.debugPort });
 
       const wsUrl = String(version?.webSocketDebuggerUrl || '').trim();
       if (!wsUrl) throw new Error('chrome_cdp_missing_ws_url');
@@ -623,6 +692,8 @@ export class ChromeCdpBrowserBackend {
       userDataDir: this.chromeUserDataDir,
       profileMode: this.profileMode,
       profileName: this.profileName,
+      browserProduct: this.browserProduct,
+      attachedToExisting: this.attachExisting && !this.chromeProcess,
       managedProfile: this.profileMode !== 'existing',
       launchedByAgentify: !!this.chromeProcess
     };
@@ -662,10 +733,8 @@ export class ChromeCdpBrowserBackend {
         page,
         presenter: new ChromeCdpPresenter(page),
         close: async () => {
+          await page.close();
           this.tabClosers.delete(targetId);
-          try {
-            await page.close();
-          } catch {}
           onClosed?.();
         },
         isClosed: () => page.isClosed()

@@ -25,9 +25,30 @@ test('mcp-server registers agentify_* tools only', async () => {
   assert.ok(src.includes("path: '/wait-response'"), 'expected wait-response endpoint forwarding');
   assert.ok(src.includes("'agentify_review_query'"), 'expected strict agentify_review_query tool');
   assert.ok(src.includes("path: '/review-query'"), 'expected strict review-query endpoint forwarding');
-  for (const field of ['stableKey', 'provider', 'model', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'verifyExisting']) {
+  assert.ok(src.includes("'agentify_review_preflight'"), 'expected native non-sending strict preflight tool');
+  assert.ok(src.includes("path: '/review-preflight'"), 'expected native review-preflight endpoint forwarding');
+  assert.ok(src.includes("'agentify_review_reasoning_mode_preflight'"), 'expected native no-send ChatGPT reasoning-mode preflight tool');
+  assert.ok(src.includes("path: '/review-reasoning-mode-preflight'"), 'expected native reasoning-mode endpoint forwarding');
+  assert.ok(src.includes("'agentify_review_reasoning_mode_diagnostics'"), 'expected native read-only ChatGPT reasoning-mode diagnostic tool');
+  assert.ok(src.includes("path: '/review-reasoning-mode-diagnostics'"), 'expected native reasoning-mode diagnostic endpoint forwarding');
+  assert.ok(src.includes("'agentify_review_chatgpt_profile_snapshot'"), 'expected native aggregate-only ChatGPT profile snapshot tool');
+  assert.ok(src.includes("path: '/review-chatgpt-profile-snapshot'"), 'expected native profile snapshot endpoint forwarding');
+  assert.ok(src.includes("'agentify_operator_observe'"), 'expected closed-loop native operator observation tool');
+  assert.ok(src.includes("'agentify_operator_act'"), 'expected closed-loop native operator action tool');
+  assert.ok(src.includes("'agentify_operator_wait'"), 'expected latency-aware native operator wait tool');
+  assert.ok(src.includes("path: '/operator-observe'"), 'expected operator observation endpoint forwarding');
+  assert.ok(src.includes("path: '/operator-act'"), 'expected operator action endpoint forwarding');
+  assert.ok(src.includes("path: '/operator-wait'"), 'expected operator wait endpoint forwarding');
+  assert.equal(src.includes("'agentify_review_prompt_sha256_preflight'"), false, 'caller SHA preflight must stay absent');
+  assert.equal(src.includes("'agentify_review_cancel_prepared'"), false, 'redundant zero-send retirement tool must stay absent');
+  assert.ok(src.includes("'agentify_review_observe'"), 'expected native ledger-only strict observation tool');
+  assert.ok(src.includes("path: '/review-observe'"), 'expected native review-observe endpoint forwarding');
+  for (const field of ['stableKey', 'provider', 'model', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'responsePath', 'verifyExisting', 'firstBinding', 'existingTabId']) {
     assert.ok(src.includes(`${field}:`), `expected ${field} review field`);
   }
+  assert.ok(src.includes('promptSha256: z.string().optional()'), 'expected caller prompt hash to be optional and tool-local');
+  assert.ok(src.includes('responsePath: z.string()'), 'expected an explicit full-response archive path');
+  assert.ok(src.includes("z.enum(['chatgpt', 'gemini'])"), 'expected strict Gemini provider support');
   assert.ok(src.includes("'agentify_download_images'"), 'expected agentify_download_images tool');
   assert.ok(src.includes("'agentify_list_watch_folders'"), 'expected agentify_list_watch_folders tool');
   assert.ok(src.includes("'agentify_add_watch_folder'"), 'expected agentify_add_watch_folder tool');

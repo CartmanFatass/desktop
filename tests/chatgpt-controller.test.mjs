@@ -5,11 +5,14 @@ import { readFileSync } from 'node:fs';
 
 import {
   ChatGPTController,
+  canonicalizeReviewMessageNodes,
   canonicalizeGeminiReviewMessageNodes,
   canonicalizeGeminiModelEvidence,
   classifyBlockedSignals,
   classifyReviewControls,
   deduplicateReviewModelEvidence,
+  geminiModelLabelMatches,
+  geminiThinkingLabelMatches,
   looksLikeBlockedPage,
   geminiMenuItemSelected,
   geminiMenuItemSemanticLabel,
@@ -209,6 +212,18 @@ test('chatgpt-controller: Gemini canonical model evidence requires two visible s
   assert.equal(valid.modelLabel, '3.1 Pro');
   assert.equal(valid.thinkingMode, 'Extended thinking');
 
+  const koreanShortLabels = canonicalizeGeminiModelEvidence([
+    { label: 'Pro', visible: true, scoped: true, selected: true, source: 'menu' },
+    { label: '확장', visible: true, scoped: true, selected: true, source: 'menu' }
+  ], expected);
+  assert.equal(koreanShortLabels.matched, true);
+  assert.equal(koreanShortLabels.matchedLabel, expected);
+  assert.equal(koreanShortLabels.modelLabel, '3.1 Pro');
+  assert.equal(koreanShortLabels.thinkingMode, 'Extended thinking');
+  assert.equal(geminiModelLabelMatches('Pro', '3.1 Pro'), true);
+  assert.equal(geminiModelLabelMatches('Pro', '3.0 Pro'), false);
+  assert.equal(geminiThinkingLabelMatches('확장'), true);
+
   for (const invalid of [
     [
       { label: '3.1 Pro', visible: false, scoped: true, selected: true, source: 'menu' },
@@ -217,10 +232,6 @@ test('chatgpt-controller: Gemini canonical model evidence requires two visible s
     [
       { label: '3.1 Pro', visible: true, scoped: false, selected: true, source: 'menu' },
       { label: 'Extended thinking', visible: true, scoped: false, selected: true, source: 'menu' }
-    ],
-    [
-      { label: 'Pro', visible: true, scoped: true, selected: true, source: 'menu' },
-      { label: 'Extended thinking', visible: true, scoped: true, selected: true, source: 'menu' }
     ],
     [
       { label: '3.1 Pro', visible: true, scoped: true, selected: false, dataActive: true, source: 'menu' },
@@ -497,7 +508,7 @@ test('chatgpt-controller: composer mismatch diagnostics identify the first code-
         isContentEditable: true,
         innerText: observedPrompt,
         textContent: observedPrompt,
-        matches() { return false; },
+        matches(selector) { return selector === '#prompt'; },
         getAttribute(name) { return name === 'contenteditable' ? 'true' : null; },
         getBoundingClientRect() { return { width: 500, height: 60, y: 600 }; }
       };
@@ -576,7 +587,8 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
   assert.equal(composerReceipt.emptyVerified, true);
   assert.equal(composerReceipt.emptySnapshotCount, 2);
   assert.equal(composerReceipt.promptInsertCount, 1);
-  assert.equal(result.text, 'DONE');
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(result.userMessageId, 'draft-user');
 });
 
 test('chatgpt-controller: asynchronously rehydrated draft fails before prompt insertion or Send', async () => {
@@ -782,7 +794,8 @@ test('chatgpt-controller: click-time reversible NBSP receipt performs exactly on
     onComposerVerified: async () => { composer.replace(browserPrompt); }
   });
   assert.equal(clicked, 1);
-  assert.equal(result.text, 'DONE');
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(result.userMessageId, 'nbsp-user');
 });
 
 test('chatgpt-controller: submission diagnosis injects the structure summarizer dependency', async () => {
@@ -793,6 +806,7 @@ test('chatgpt-controller: submission diagnosis injects the structure summarizer 
     async evaluate(js) {
       assert.equal(js.includes('reviewSnapshotMarker'), true);
       assert.equal(js.includes('const summarizeReviewComposerStructure ='), true);
+      assert.equal(js.includes('renderedProjection: serialized.renderedProjection || null'), true);
       return {
         messages: [{
           order: 0,
@@ -864,6 +878,26 @@ test('chatgpt-controller: submission diagnosis rejects multiple new user message
   assert.equal(result.exactMatchCount, 2);
 });
 
+test('chatgpt-controller: canonical turn entries collapse duplicate ChatGPT user wrappers but retain distinct turns', () => {
+  const turn = (id) => ({ getAttribute: (name) => name === 'data-message-id' ? id : null });
+  const node = ({ id, outer = null, inner = null }) => ({
+    id: '',
+    matches: (selector) => selector === '[data-message-author-role="user"]',
+    closest: () => turn(id),
+    contains: (other) => other === inner || (outer && other === outer)
+  });
+  const inner = node({ id: 'same-turn' });
+  const outer = node({ id: 'same-turn', inner });
+  const distinct = node({ id: 'different-turn' });
+  const entries = canonicalizeReviewMessageNodes(
+    [inner, outer, distinct],
+    '[data-message-author-role="user"]'
+  );
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].node, outer);
+  assert.deepEqual(entries.map((entry) => entry.identity), ['same-turn', 'different-turn']);
+});
+
 test('chatgpt-controller: user-message identity reads the unique content leaf and excludes controls', () => {
   const content = elementNode('DIV', textNode('alpha\n\nbeta'));
   content.querySelectorAll = () => [];
@@ -881,6 +915,165 @@ test('chatgpt-controller: user-message identity reads the unique content leaf an
     maxDepth: 1,
     tagHistogram: { DIV: 1 }
   });
+});
+
+test('chatgpt-controller: user-message identity selects the trusted collapsible content sibling', () => {
+  const prompt = 'Read https://example.test/repo\nReturn a bounded scientific assessment.';
+  const link = elementNode('A', textNode('https://example.test/repo'));
+  const toggle = elementNode('BUTTON', textNode('Show moreShow less'));
+  toggle.getAttribute = (name) => ({
+    'data-testid': 'collapsible-user-message-toggle',
+    type: 'button',
+    'aria-controls': 'collapsed-content'
+  }[name] || null);
+  const content = elementNode(
+    'DIV',
+    elementNode('P', textNode('Read '), link),
+    elementNode('P', textNode('Return a bounded scientific assessment.'))
+  );
+  content.id = 'collapsed-content';
+  content.innerText = prompt;
+  content.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-content' : null;
+  content.querySelectorAll = () => [];
+  content.contains = (candidate) => candidate === content || candidate === link;
+  const collapsibleRoot = elementNode('DIV', content, toggle);
+  collapsibleRoot.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-root' : null;
+  const outer = elementNode('DIV', collapsibleRoot);
+  outer.querySelectorAll = (selector) => selector.includes('collapsible-user-message-root')
+    ? [collapsibleRoot]
+    : [content];
+  const result = serializeReviewUserMessage(outer);
+  assert.equal(result.ok, true);
+  assert.equal(result.text, prompt);
+  assert.equal(result.tagHistogram.BUTTON, undefined);
+  assert.equal(result.tagHistogram.A, 1);
+  assert.equal(result.renderedProjection, 'collapsible_inner_text_v1');
+});
+
+test('chatgpt-controller: trusted collapsible rendering uses innerText after structural validation', () => {
+  const prompt = [
+    'Read the remote research context.',
+    '',
+    'Assess the mechanism and its discriminator.',
+    ''
+  ].join('\n');
+  const paragraphs = Array.from({ length: 9 }, (_, index) => {
+    const inline = index === 0
+      ? elementNode('A', textNode('remote research context'))
+      : textNode(`paragraph-${index}`);
+    return elementNode(
+      'P',
+      inline,
+      ...Array.from({ length: index < 8 ? 8 : 7 }, () => elementNode('BR'))
+    );
+  });
+  const content = elementNode('DIV', ...paragraphs);
+  content.id = 'collapsed-live-shape';
+  content.innerText = prompt.slice(0, -1);
+  content.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-content' : null;
+  content.querySelectorAll = () => [];
+  const toggle = elementNode('BUTTON', textNode('Show moreShow less'));
+  toggle.getAttribute = (name) => ({
+    'data-testid': 'collapsible-user-message-toggle',
+    type: 'button',
+    'aria-controls': content.id
+  }[name] || null);
+  const collapsibleRoot = elementNode('DIV', content, toggle);
+  collapsibleRoot.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-root' : null;
+  const outer = elementNode('DIV', collapsibleRoot);
+  outer.querySelectorAll = (selector) => selector.includes('collapsible-user-message-root')
+    ? [collapsibleRoot]
+    : [content];
+
+  assert.notEqual(serializeReviewComposer(content).text, content.innerText);
+  const result = serializeReviewUserMessage(outer);
+  assert.equal(result.ok, true);
+  assert.equal(result.text, prompt.slice(0, -1));
+  assert.equal(result.renderedProjection, 'collapsible_inner_text_v1');
+  assert.deepEqual(result.tagHistogram, { A: 1, BR: 71, DIV: 1, P: 9 });
+});
+
+test('chatgpt-controller: collapsible innerText projection never bypasses structural controls', () => {
+  for (const control of [
+    elementNode('BUTTON', textNode('hidden button')),
+    Object.assign(elementNode('DIV', textNode('hidden role control')), {
+      getAttribute: (name) => name === 'role' ? 'button' : null
+    }),
+    elementNode('IMG')
+  ]) {
+    const content = elementNode('DIV', textNode('exact prompt'), control);
+    content.id = 'controlled-content';
+    content.innerText = 'exact prompt';
+    content.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-content' : null;
+    content.querySelectorAll = () => [];
+    const toggle = elementNode('BUTTON', textNode('Show moreShow less'));
+    toggle.getAttribute = (name) => ({
+      'data-testid': 'collapsible-user-message-toggle',
+      type: 'button',
+      'aria-controls': content.id
+    }[name] || null);
+    const collapsibleRoot = elementNode('DIV', content, toggle);
+    collapsibleRoot.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-root' : null;
+    const outer = elementNode('DIV', collapsibleRoot);
+    outer.querySelectorAll = (selector) => selector.includes('collapsible-user-message-root')
+      ? [collapsibleRoot]
+      : [content];
+
+    const result = serializeReviewUserMessage(outer);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /review_(?:composer_element_unsupported|collapsible_message_structure_unreadable)/);
+    assert.equal(JSON.stringify(result).includes('hidden'), false);
+  }
+});
+
+test('chatgpt-controller: collapsible message chrome fails closed unless it is an exact external sibling', () => {
+  const toggle = elementNode('BUTTON', textNode('Show moreShow less'));
+  toggle.getAttribute = (name) => ({
+    'data-testid': 'collapsible-user-message-toggle',
+    type: 'button',
+    'aria-controls': 'collapsed-content'
+  }[name] || null);
+  const content = elementNode('DIV', textNode('prompt'), toggle);
+  content.id = 'collapsed-content';
+  content.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-content' : null;
+  const collapsibleRoot = elementNode('DIV', content);
+  collapsibleRoot.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-root' : null;
+  const outer = elementNode('DIV', collapsibleRoot);
+  outer.querySelectorAll = (selector) => selector.includes('collapsible-user-message-root')
+    ? [collapsibleRoot]
+    : [content];
+  assert.deepEqual(serializeReviewUserMessage(outer), {
+    ok: false,
+    error: 'review_collapsible_message_structure_unreadable'
+  });
+
+  const validContent = elementNode('DIV', textNode('prompt'));
+  validContent.id = 'valid-content';
+  validContent.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-content' : null;
+  const validToggle = elementNode('BUTTON', textNode('Show moreShow less'));
+  validToggle.getAttribute = (name) => ({
+    'data-testid': 'collapsible-user-message-toggle',
+    type: 'button',
+    'aria-controls': 'valid-content'
+  }[name] || null);
+  const extraRoleButton = elementNode('DIV', textNode('unexpected control'));
+  extraRoleButton.getAttribute = (name) => name === 'role' ? 'button' : null;
+  for (const extraSibling of [
+    elementNode('DIV', textNode('unexpected content')),
+    elementNode('BUTTON', textNode('unexpected button')),
+    extraRoleButton
+  ]) {
+    const rootWithExtraSibling = elementNode('DIV', validContent, validToggle, extraSibling);
+    rootWithExtraSibling.getAttribute = (name) => name === 'data-testid' ? 'collapsible-user-message-root' : null;
+    const outerWithExtraSibling = elementNode('DIV', rootWithExtraSibling);
+    outerWithExtraSibling.querySelectorAll = (selector) => selector.includes('collapsible-user-message-root')
+      ? [rootWithExtraSibling]
+      : [validContent];
+    assert.deepEqual(serializeReviewUserMessage(outerWithExtraSibling), {
+      ok: false,
+      error: 'review_collapsible_message_structure_unreadable'
+    });
+  }
 });
 
 test('chatgpt-controller: exact PRE/CODE rendered wrapper preserves the complete structural prompt byte-for-text identity', () => {
@@ -1038,11 +1231,303 @@ test('chatgpt-controller: strict control classifier rejects bare Continue and Re
   assert.equal(classifyReviewControls(['Continue with Google']).continue, false);
 });
 
-test('chatgpt-controller: Pro aliases match but High never satisfies Pro', () => {
+test('chatgpt-controller: strict model labels match only after whitespace and case normalization', () => {
   assert.equal(modelLabelMatches('Pro', 'Pro'), true);
-  assert.equal(modelLabelMatches('GPT-5.6 Pro', 'Pro'), true);
-  assert.equal(modelLabelMatches('Pro', 'GPT-5.6 Pro'), true);
+  assert.equal(modelLabelMatches('  PRO  ', 'Pro'), true);
+  assert.equal(modelLabelMatches('GPT-5.6 Pro', 'Pro'), false);
+  assert.equal(modelLabelMatches('Pro', 'GPT-5.6 Pro'), false);
+  assert.equal(modelLabelMatches('Pro Extended', 'Pro'), false);
+  assert.equal(modelLabelMatches('Pro Standard', 'Pro Extended'), false);
   assert.equal(modelLabelMatches('High', 'Pro'), false);
+});
+
+test('chatgpt-controller: unrelated visible Pro account control cannot satisfy reasoning-mode proof', async () => {
+  let inserted = 0;
+  let sendBoundaryReached = false;
+  const accountMenu = {
+    querySelectorAll() { return [{ getAttribute() { return null; }, textContent: 'Account settings' }]; }
+  };
+  const composerRoot = { contains(node) { return node === reasoningHigh; } };
+  const promptNode = {
+    closest(selector) { return selector === 'form' ? composerRoot : null; },
+    parentElement: null,
+    getBoundingClientRect() { return { width: 500, height: 80, top: 700, bottom: 780, left: 300, right: 800 }; }
+  };
+  const control = ({ label, testId = null, controls = null, rect }) => ({
+    textContent: label,
+    getAttribute(name) {
+      if (name === 'aria-label') return label;
+      if (name === 'data-testid') return testId;
+      if (name === 'aria-controls') return controls;
+      return null;
+    },
+    getBoundingClientRect() { return rect; },
+    closest() { return null; }
+  });
+  const reasoningHigh = control({
+    label: 'High',
+    testId: 'model-switcher-dropdown-button',
+    rect: { width: 80, height: 32, top: 720, bottom: 752, left: 330, right: 410 }
+  });
+  const unrelatedAccountPro = control({
+    label: 'Pro',
+    controls: 'account-menu',
+    // Deliberately adjacent to the composer. Geometry alone must not authorize it.
+    rect: { width: 80, height: 32, top: 716, bottom: 748, left: 720, right: 800 }
+  });
+  const document = {
+    querySelector() { return promptNode; },
+    querySelectorAll() { return [reasoningHigh, unrelatedAccountPro]; },
+    getElementById(id) { return id === 'account-menu' ? accountMenu : null; }
+  };
+  const window = {
+    getComputedStyle() { return { visibility: 'visible', display: 'block' }; }
+  };
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) {
+        const observed = await Function('document', 'window', `return ${js}`)(document, window);
+        assert.equal(observed.matched, false);
+        assert.deepEqual(observed.labels, ['High']);
+        assert.equal(observed.scopedMatchCount, 0);
+        return observed;
+      }
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: false, error: 'reasoning_mode_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenPageReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_page_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenUnboundPageReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_unbound_page_selector_unavailable', pickerCount: 0 };
+      if (js.includes('reviewSendOnceMarker')) { sendBoundaryReached = true; }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { inserted += 1; },
+    async sendKey() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  await assert.rejects(
+    controller.reviewQuery({
+      prompt: 'must remain unsent',
+      expectedUrl: 'https://chatgpt.com/',
+      expectedConversationId: '__new__',
+      expectedModel: 'Pro',
+      timeoutMs: 1_000,
+      firstBinding: true,
+      requireModelPreflight: true
+    }),
+    /reasoning_mode_unbound_page_selector_unavailable/
+  );
+  assert.equal(inserted, 0);
+  assert.equal(sendBoundaryReached, false);
+});
+
+test('chatgpt-controller: reasoning-mode preflight normalizes High to Pro with zero prompt or Send', async () => {
+  let selected = false;
+  let clicks = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: selected, labels: [selected ? 'Pro' : 'High'], matchedLabel: selected ? 'Pro' : null };
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: true, controlledIds: ['mode-menu'], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      if (js.includes('agentifyChooseModelMarker')) return { ok: true, labels: ['Pro'], rect: { x: 20, y: 20, w: 20, h: 20 } };
+      if (js.includes('reviewSnapshotMarker')) return { messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'], controlText: [], selectorStop: false, sendVisible: false };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; selected = true; }, async mouseUp() {},
+    async insertText() { throw new Error('reasoning_preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('reasoning_preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 });
+  assert.equal(clicks, 2);
+  assert.equal(result.reasoningModeEvidence, 'Pro');
+  assert.equal(result.reasoningModeReceipt.selectionMethod, 'visible_exact_reasoning_mode_option');
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+});
+
+test('chatgpt-controller: reasoning-mode preflight no-ops on Pro and fails closed when Pro is unavailable', async () => {
+  let clicks = 0;
+  const alreadyPro = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: true, labels: ['Pro'], matchedLabel: 'Pro' };
+      if (js.includes('reviewSnapshotMarker')) return { messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'], controlText: [], selectorStop: false, sendVisible: false };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; }, async mouseUp() {},
+    async insertText() { throw new Error('reasoning_preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('reasoning_preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page: alreadyPro, selectors: {} });
+  const receipt = await controller.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 });
+  assert.equal(clicks, 0);
+  assert.equal(receipt.reasoningModeReceipt.selectionMethod, 'already_selected_visible_reasoning_mode');
+
+  const unavailable = {
+    ...alreadyPro,
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: false, labels: ['High'], matchedLabel: null };
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: false, error: 'reasoning_mode_menu_unbound', pickerCount: 1 };
+      if (js.includes('agentifyOpenUnboundLocalReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_unbound_local_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenPageReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_page_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenUnboundPageReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_unbound_page_selector_unavailable', pickerCount: 0 };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    }
+  };
+  const unavailableController = new ChatGPTController({ page: unavailable, selectors: {} });
+  await assert.rejects(unavailableController.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 }), /reasoning_mode_unbound_local_selector_unavailable/);
+  assert.equal(clicks, 0);
+});
+
+test('chatgpt-controller: reasoning-mode preflight uses one visible controlled top-level ChatGPT trigger only after local mode control is absent', async () => {
+  let selected = false;
+  let clicks = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: selected, labels: [selected ? 'Pro' : 'High'], matchedLabel: selected ? 'Pro' : null };
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: false, error: 'reasoning_mode_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenPageReasoningModePickerMarker')) return { ok: true, route: 'page_visible_top_level_controlled_menu', controlledIds: ['chatgpt-mode-menu'], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      if (js.includes('agentifyChooseModelMarker')) return { ok: true, labels: ['High', 'Pro'], rect: { x: 20, y: 20, w: 20, h: 20 } };
+      if (js.includes('reviewSnapshotMarker')) return { messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'], controlText: [], selectorStop: false, sendVisible: false };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; selected = true; }, async mouseUp() {},
+    async insertText() { throw new Error('page_reasoning_preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('page_reasoning_preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 });
+  assert.equal(clicks, 2);
+  assert.equal(result.reasoningModeReceipt.selectionMethod, 'page_visible_top_level_controlled_menu_exact_reasoning_mode_option');
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+});
+
+test('chatgpt-controller: reasoning-mode preflight accepts the unique visible unbound Model Selector only with one exact Pro option', async () => {
+  let selected = false;
+  let clicks = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: selected, labels: [selected ? 'Pro' : 'High'], matchedLabel: selected ? 'Pro' : null };
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: false, error: 'reasoning_mode_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenPageReasoningModePickerMarker')) return { ok: false, error: 'reasoning_mode_page_selector_unavailable', pickerCount: 0 };
+      if (js.includes('agentifyOpenUnboundPageReasoningModePickerMarker')) return { ok: true, route: 'page_visible_semantic_model_selector', controlledIds: [], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      if (js.includes('agentifyChooseModelMarker')) return { ok: true, labels: ['High', 'Pro'], rect: { x: 20, y: 20, w: 20, h: 20 } };
+      if (js.includes('reviewSnapshotMarker')) return { messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'], controlText: [], selectorStop: false, sendVisible: false };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; selected = true; }, async mouseUp() {},
+    async insertText() { throw new Error('unbound_model_selector_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('unbound_model_selector_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 });
+  assert.equal(clicks, 2);
+  assert.equal(result.reasoningModeReceipt.selectionMethod, 'page_visible_semantic_model_selector_exact_reasoning_mode_option');
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+});
+
+test('chatgpt-controller: reasoning-mode preflight accepts one visible unbound High control only with one exact Pro option', async () => {
+  let selected = false;
+  let clicks = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return { matched: selected, labels: [selected ? 'Pro' : 'High'], matchedLabel: selected ? 'Pro' : null };
+      if (js.includes('agentifyOpenModelPickerMarker')) return { ok: false, error: 'reasoning_mode_menu_unbound', pickerCount: 1 };
+      if (js.includes('agentifyOpenUnboundLocalReasoningModePickerMarker')) return { ok: true, route: 'local_visible_unbound_reasoning_mode', controlledIds: [], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      if (js.includes('agentifyChooseModelMarker')) return { ok: true, labels: ['High', 'Pro'], rect: { x: 20, y: 20, w: 20, h: 20 } };
+      if (js.includes('reviewSnapshotMarker')) return { messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'], controlText: [], selectorStop: false, sendVisible: false };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; selected = true; }, async mouseUp() {},
+    async insertText() { throw new Error('unbound_high_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('unbound_high_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModePreflight({ expectedMode: 'Pro', timeoutMs: 5_000 });
+  assert.equal(clicks, 2);
+  assert.equal(result.reasoningModeReceipt.selectionMethod, 'local_visible_unbound_reasoning_mode_exact_option');
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+});
+
+test('chatgpt-controller: page reasoning-mode diagnostic is read-only and labels regions', async () => {
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('reviewReasoningModeDiagnosticMarker')) {
+        assert.match(js, /requestedScope = "page"/);
+        assert.match(js, /header_or_topbar/);
+        return { scope: 'page', composerFound: true, composerCandidateCount: 1, controls: [{ name: 'ChatGPT', region: 'header_or_topbar', semanticModeTrigger: true, ariaHasPopup: 'menu', ariaControls: 'mode-menu' }] };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { throw new Error('diagnostic_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('diagnostic_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModeDiagnostics({ scope: 'page', timeoutMs: 5_000 });
+  assert.equal(result.scope, 'page');
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+  await assert.rejects(controller.reviewReasoningModeDiagnostics({ scope: 'hidden' }), /diagnostic_scope_invalid/);
+});
+
+test('chatgpt-controller: page reasoning diagnostic opens only the unique semantic Model Selector without composer input', async () => {
+  let clicks = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyOpenReasoningDiagnosticPickerMarker')) return { ok: true, rect: { x: 10, y: 10, w: 20, h: 20 } };
+      if (js.includes('reviewReasoningModeDiagnosticMarker')) return { scope: 'page', composerFound: true, controls: [{ name: 'Pro', role: 'menuitemradio', region: 'page_other' }] };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {}, async mouseDown() { clicks += 1; }, async mouseUp() {},
+    async insertText() { throw new Error('open_diagnostic_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('open_diagnostic_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewReasoningModeDiagnostics({ scope: 'page', openModeSelector: true, timeoutMs: 5_000 });
+  assert.equal(clicks, 1);
+  assert.equal(result.pickerOpened, true);
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
+  await assert.rejects(controller.reviewReasoningModeDiagnostics({ scope: 'composer', openModeSelector: true }), /open_requires_page_scope/);
+});
+
+test('chatgpt-controller: ChatGPT profile snapshot reports aggregate cookie presence and root binding without composer input', async () => {
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async getCookiePresenceMetadata() {
+      return { supported: true, host: 'chatgpt.com', matchingCookieCount: 3, secureCookieCount: 3, httpOnlyCookieCount: 2, sessionCookieCount: 2, persistentCookieCount: 1, nonEmpty: true };
+    },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('reviewReasoningModeDiagnosticMarker')) return { scope: 'page', composerFound: true, controls: [{ name: 'High', semanticModeTrigger: true }] };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { throw new Error('profile_snapshot_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('profile_snapshot_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewChatGPTProfileSnapshot({ timeoutMs: 5_000 });
+  assert.equal(result.urlBinding, 'provider_root');
+  assert.equal(result.cookiePresence.matchingCookieCount, 3);
+  assert.equal(result.cookiePresence.nonEmpty, true);
+  assert.equal(result.visibleControls.promptInsertCount, 0);
+  assert.equal(result.sendActionCount, 0);
 });
 
 test('chatgpt-controller: send falls back to requestSubmit on the active composer before Enter', async () => {
@@ -1116,7 +1601,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('agentifyModelStateMarker')) {
-        assert.match(js, /data-composer-transition-slot/);
+        assert.doesNotMatch(js, /data-composer-transition-slot/);
         return {
           matched: modelSelected,
           labels: [modelSelected ? 'Pro' : 'High'],
@@ -1124,7 +1609,7 @@ test('chatgpt-controller: public query inserts a multiline prompt once', async (
         };
       }
       if (js.includes('agentifyOpenModelPickerMarker')) {
-        assert.match(js, /data-composer-transition-slot/);
+        assert.doesNotMatch(js, /data-composer-transition-slot/);
         assert.doesNotMatch(js, /textContent[^;]*===/);
         assert.doesNotMatch(js, /picker\.click\(\)/);
         modelPickerClicks += 1;
@@ -1329,13 +1814,14 @@ test('chatgpt-controller: wait response recovers the completed latest exchange f
   assert.equal(result.meta.latestUserText, 'current scientific question');
 });
 
-test('chatgpt-controller: strict review submits with one send control and returns two stable exact-message snapshots', async () => {
+test('chatgpt-controller: strict review submits once and returns SENT_WAITING without waiting for the assistant', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   const prompt = 'x';
   const keys = [];
   let strictClicks = 0;
   let reviewSnapshotCalls = 0;
   let submitted = 0;
+  let sendBoundaryEntered = 0;
   let prepared = 0;
   let insertedPrompt = '';
   const response = 'STRICT_OK';
@@ -1410,6 +1896,9 @@ test('chatgpt-controller: strict review submits with one send control and return
       prepared += 1;
       assert.deepEqual(baselineMessageIds, ['historical-user-1']);
     },
+    onSendBoundaryEntered: async () => {
+      sendBoundaryEntered += 1;
+    },
     onSubmitted: async () => {
       submitted += 1;
     }
@@ -1418,15 +1907,12 @@ test('chatgpt-controller: strict review submits with one send control and return
   assert.equal(insertedPrompt, prompt);
   assert.equal(prepared, 1);
   assert.equal(submitted, 1);
+  assert.equal(sendBoundaryEntered, 1);
   assert.equal(keys.includes('Enter'), false);
   assert.equal(result.userMessageId, 'user-1');
-  assert.equal(result.assistantMessageId, 'assistant-1');
-  assert.equal(result.text, response);
-  assert.equal(result.snapshots.length, 2);
-  assert.ok(result.snapshots[1].observedAt - result.snapshots[0].observedAt >= 3_000);
-  assert.equal(result.snapshots[0].textSha256, crypto.createHash('sha256').update(response).digest('hex'));
-  assert.deepEqual(result.clickedControls, []);
-  assert.equal(result.controls.answerNow, false);
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(result.assistantMessageId, undefined);
+  assert.equal(result.text, undefined);
 });
 
 test('chatgpt-controller: continuation with an empty baseline fails before composer write', async () => {
@@ -1570,7 +2056,7 @@ test('chatgpt-controller: strict review recognizes a Gemini app conversation ide
   assert.equal(result.ok, true);
 });
 
-test('chatgpt-controller: Gemini strict review inserts once and completes on the same app identity', async () => {
+test('chatgpt-controller: Gemini strict review inserts once and returns SENT_WAITING on the same app identity', async () => {
   const url = 'https://gemini.google.com/app/gemini-strict';
   const prompt = 'scientific question';
   let insertCalls = 0;
@@ -1579,6 +2065,11 @@ test('chatgpt-controller: Gemini strict review inserts once and completes on the
     async getUrl() { return url; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyGeminiModelStateMarker')) return {
+        menuFound: true, menuOpen: true, menuRoot: 'gem-menu', closedLabels: ['Gemini 2.5 Pro'],
+        modelCandidates: [{ label: 'Gemini 2.5 Pro', selected: true, target: null }],
+        thinkingCandidates: [], evidence: { matched: true, matchedLabel: 'Gemini 2.5 Pro', modelLabel: 'Gemini 2.5 Pro', thinkingMode: null }
+      };
       const legacyComposer = legacyStrictComposerEval(js);
       if (legacyComposer) return legacyComposer;
       if (js.includes('observedLengths')) return { ok: true, observedLengths: [prompt.length], expectedLength: prompt.length };
@@ -1621,7 +2112,8 @@ test('chatgpt-controller: Gemini strict review inserts once and completes on the
   });
   assert.equal(insertCalls, 1);
   assert.equal(strictClicks, 1);
-  assert.equal(result.text, 'GEMINI_OK');
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(result.userMessageId, 'user:0');
 });
 
 test('chatgpt-controller: Gemini strict preflight selects model and Extended thinking through the shared adapter', async () => {
@@ -1655,6 +2147,7 @@ test('chatgpt-controller: Gemini strict preflight selects model and Extended thi
         pendingSelection = js.includes('"thinking" === \'thinking\'') ? 'thinking' : 'model';
         return { ok: true, labels: ['3.1 Pro', 'Extended thinking'], rect: { x: 10, y: 10, w: 20, h: 20 } };
       }
+      if (js.includes('agentifyGeminiFallbackModelPartMarker')) return { activated: false, selected: false };
       if (js.includes('reviewComposerDiagnosticMarker')) {
         return { ok: true, serializerOk: true, serializedLength: prompt.length, expectedLength: prompt.length };
       }
@@ -1699,6 +2192,97 @@ test('chatgpt-controller: Gemini strict preflight selects model and Extended thi
   assert.deepEqual(selectionOrder, ['model', 'thinking']);
   assert.equal(strictClicks, 1);
   assert.equal(result.modelEvidence, expectedModel);
+});
+
+test('chatgpt-controller: non-sending Gemini review preflight uses the strict picker adapter without a Send action', async () => {
+  const url = 'https://gemini.google.com/app/gemini-preflight';
+  const expectedModel = 'Gemini 3.1 Pro extended';
+  let selectedModel = false;
+  let selectedThinking = false;
+  let menuClosedAfterSelection = false;
+  let pendingSelection = null;
+  let mouseDowns = 0;
+  let fallbackThinkingActivations = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyGeminiModelStateMarker')) {
+        return {
+          matched: selectedModel && selectedThinking && !menuClosedAfterSelection,
+          labels: menuClosedAfterSelection ? [] : [selectedModel ? '3.1 Pro' : '2.5 Pro', ...(selectedThinking ? ['Extended thinking'] : [])],
+          matchedLabel: selectedModel && selectedThinking && !menuClosedAfterSelection ? expectedModel : null,
+          modelLabel: selectedModel && !menuClosedAfterSelection ? '3.1 Pro' : null,
+          thinkingMode: selectedThinking && !menuClosedAfterSelection ? 'Extended thinking' : null
+        };
+      }
+      if (js.includes('agentifyGeminiChooseModelPartMarker')) {
+        pendingSelection = js.includes('"thinking" === \'thinking\'') ? 'thinking' : 'model';
+        return { ok: true, labels: ['3.1 Pro', 'Extended thinking'], rect: { x: 10, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('agentifyGeminiFallbackModelPartMarker')) {
+        if (pendingSelection === 'model') selectedModel = true;
+        if (pendingSelection === 'thinking') {
+          fallbackThinkingActivations += 1;
+          selectedThinking = true;
+          menuClosedAfterSelection = true;
+        }
+        pendingSelection = null;
+        return { activated: true, selected: true };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async moveMouse() {},
+    async mouseDown() {
+      mouseDowns += 1;
+      if (pendingSelection === 'model') selectedModel = true;
+      pendingSelection = null;
+    },
+    async mouseUp() {},
+    async insertText() { throw new Error('preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  const result = await controller.reviewPreflight({ expectedModel, timeoutMs: 10_000 });
+  assert.equal(mouseDowns, 0);
+  assert.equal(fallbackThinkingActivations, 1);
+  assert.deepEqual(result, {
+    provider: 'gemini', conversationUrl: url, modelEvidence: expectedModel,
+    sendActionCount: 0, promptInsertCount: 0
+  });
+});
+
+test('chatgpt-controller: non-sending ChatGPT review preflight reads the selected Pro model without input or Send', async () => {
+  const url = 'https://chatgpt.com/';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) {
+        return { matched: true, labels: ['Pro'], matchedLabel: 'Pro', visibleExactLabels: [] };
+      }
+      if (js.includes('reviewSnapshotMarker')) {
+        return {
+          messages: [],
+          modelEvidence: 'Pro',
+          modelEvidenceCandidates: ['Pro'],
+          controlText: [],
+          selectorStop: false,
+          sendVisible: false
+        };
+      }
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { throw new Error('preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' } });
+  const result = await controller.reviewPreflight({ expectedModel: 'Pro', timeoutMs: 10_000 });
+  assert.deepEqual(result, {
+    provider: 'chatgpt', conversationUrl: url, modelEvidence: 'Pro',
+    modelEvidenceCandidates: ['Pro'], modelEvidenceDiagnostics: [], preflightVerified: true,
+    sendActionCount: 0, promptInsertCount: 0
+  });
 });
 
 test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
@@ -1891,7 +2475,7 @@ test('chatgpt-controller: post-send rendered user mismatch is ambiguous and neve
   assert.equal(submitted, false);
 });
 
-test('chatgpt-controller: exact click-bound submission binds one Markdown-rendered turn while display fidelity remains lossy', async () => {
+test('chatgpt-controller: click-bound source cannot accept a lossy provider-visible user turn', async () => {
   let currentUrl = 'https://chatgpt.com/';
   const canonicalUrl = 'https://chatgpt.com/c/rendered-markdown-loss';
   const prompt = [
@@ -1957,26 +2541,21 @@ test('chatgpt-controller: exact click-bound submission binds one Markdown-render
     page,
     selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
   });
-  const result = await controller.reviewQuery({
-    prompt,
-    expectedUrl: 'https://chatgpt.com/',
-    expectedConversationId: '__new__',
-    expectedModel: 'GPT-5.6 Pro',
-    timeoutMs: 8_000,
-    firstBinding: true,
-    onSendAction: async () => receipt,
-    onUserTurnObserved: async (value) => { observed = value; },
-    onSubmitted: async (value) => { submitted = value; }
-  });
+  await assert.rejects(controller.reviewQuery({
+      prompt,
+      expectedUrl: 'https://chatgpt.com/',
+      expectedConversationId: '__new__',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 8_000,
+      firstBinding: true,
+      onSendAction: async () => receipt,
+      onUserTurnObserved: async (value) => { observed = value; },
+      onSubmitted: async (value) => { submitted = value; }
+    }), /review_user_message_content_mismatch/);
   assert.equal(strictClicks, 1);
   assert.equal(observed.commitmentClass, 'turn_causal_exact_rendered_mismatch');
   assert.equal(observed.renderedDisplayFidelity, 'lossy_mismatch');
-  assert.equal(submitted.submissionIdentityMode, REVIEW_CAUSAL_SUBMISSION_MODEL);
-  assert.equal(submitted.causalSubmissionReceipt, receipt);
-  assert.equal(submitted.renderedDisplayFidelity, 'lossy_mismatch');
-  assert.equal(submitted.conversationUrl, canonicalUrl);
-  assert.equal(result.userMessageId, 'rendered-markdown-user');
-  assert.equal(result.text, 'PRECODE_CG_OK');
+  assert.equal(submitted, null);
 });
 
 test('chatgpt-controller: ambiguous send control fails before a click', async () => {
@@ -2133,8 +2712,13 @@ test('chatgpt-controller: click with no visible new user turn has a distinct ter
         return { ok: true, serializerOk: true, serializedLength: 6, expectedLength: 6 };
       }
       if (js.includes('reviewSendOnceMarker')) {
-        strictClicks += 1;
-        return { ok: true, clickCount: 1, label: 'Send prompt' };
+        return {
+          ok: true,
+          nativePointer: true,
+          rect: { x: 10, y: 10, w: 20, h: 20 },
+          label: 'Send prompt',
+          clickTimeIdentity: { ok: true, recoveredExact: true, textModel: 'agentify_review_plain_text_v1', identityMode: 'canonical_exact' }
+        };
       }
       if (js.includes('reviewSnapshotMarker')) return {
         messages: [{ order: 0, role: 'user', id: 'no-turn-history', text: 'history', textIdentityReadable: true }],
@@ -2144,7 +2728,7 @@ test('chatgpt-controller: click with no visible new user turn has a distinct ter
       };
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
-    async sendKey() {}, async insertText() {}, async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+    async sendKey() {}, async insertText() {}, async moveMouse() {}, async mouseDown() { strictClicks += 1; }, async mouseUp() {}
   };
   const controller = new ChatGPTController({
     page,
@@ -2208,7 +2792,7 @@ test('chatgpt-controller: fresh strict review fails busy on an active prior turn
   assert.equal(snapshots, 1);
 });
 
-test('chatgpt-controller: crash recovery excludes historical identical prompts by persisted baseline', async () => {
+test('chatgpt-controller: crash recovery uses persisted send-time model evidence despite replacement-tab drift', async () => {
   const url = 'https://chatgpt.com/c/conversation-1';
   const prompt = 'same prompt';
   let recoveredId = null;
@@ -2226,8 +2810,8 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
           { order: 2, role: 'user', id: 'current-user', text: prompt },
           { order: 3, role: 'assistant', id: 'current-assistant', text: 'new' }
         ],
-        modelEvidence: 'GPT-5.6 Pro',
-        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        modelEvidence: 'High',
+        modelEvidenceCandidates: ['High'],
         controlText: [],
         selectorStop: false,
         sendVisible: true
@@ -2249,6 +2833,7 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
     expectedUrl: url,
     expectedConversationId: 'conversation-1',
     expectedModel: 'GPT-5.6 Pro',
+    submittedModelEvidence: 'GPT-5.6 Pro',
     timeoutMs: 5_000,
     causalSubmissionReceipt: causalReceipt(prompt, ['historical-user', 'historical-assistant']),
     onRecovered: async ({ userMessageId }) => {
@@ -2256,12 +2841,95 @@ test('chatgpt-controller: crash recovery excludes historical identical prompts b
     }
   });
   assert.equal(recoveredId, 'current-user');
+  assert.equal(result.status, 'SENT_WAITING');
   assert.equal(result.userMessageId, 'current-user');
-  assert.equal(result.assistantMessageId, 'current-assistant');
-  assert.equal(result.text, 'new');
+  assert.equal(result.assistantMessageId, undefined);
+  assert.equal(result.modelEvidence, 'GPT-5.6 Pro');
 });
 
-test('chatgpt-controller: crash recovery accepts one attachment-backed message under exact composer causality', async () => {
+test('chatgpt-controller: causal recovery accepts only the trusted collapsed-view terminal-LF projection', async () => {
+  const url = 'https://chatgpt.com/c/collapsed-terminal-lf';
+  const prompt = 'first paragraph\n\nsecond paragraph\n';
+  let recovered = null;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      assert.equal(js.includes('.click()'), false);
+      return {
+        messages: [{
+          order: 0,
+          role: 'user',
+          id: 'collapsed-user',
+          text: prompt.slice(0, -1),
+          textLength: prompt.length - 1,
+          textIdentityReadable: true,
+          textIdentityDiagnostic: { renderedProjection: 'collapsible_inner_text_v1' }
+        }],
+        modelEvidence: 'High',
+        modelEvidenceCandidates: ['High'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.recoverReviewSubmission({
+    prompt,
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'collapsed-terminal-lf',
+    expectedModel: 'Pro',
+    submittedModelEvidence: 'Pro',
+    timeoutMs: 5_000,
+    causalSubmissionReceipt: causalReceipt(prompt),
+    onRecovered: async (value) => { recovered = value; }
+  });
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(recovered.renderedDisplayFidelity, 'exact');
+  assert.equal(
+    recovered.renderedIdentityDiagnostic.identityMode,
+    'causal_collapsible_inner_text_terminal_lf_projection'
+  );
+});
+
+test('chatgpt-controller: collapsed-view terminal-LF projection never applies without a causal receipt', async () => {
+  const url = 'https://chatgpt.com/c/collapsed-terminal-lf-negative';
+  const prompt = 'scientific prompt\n';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate() {
+      return {
+        messages: [{
+          order: 0,
+          role: 'user',
+          id: 'collapsed-user',
+          text: prompt.slice(0, -1),
+          textLength: prompt.length - 1,
+          textIdentityReadable: true,
+          textIdentityDiagnostic: { renderedProjection: 'collapsible_inner_text_v1' }
+        }],
+        modelEvidence: 'Pro',
+        modelEvidenceCandidates: ['Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  await assert.rejects(controller.recoverReviewSubmission({
+    prompt,
+    baselineMessageIds: [],
+    expectedUrl: url,
+    expectedConversationId: 'collapsed-terminal-lf-negative',
+    expectedModel: 'Pro',
+    timeoutMs: 5_000,
+    causalSubmissionReceipt: null
+  }), /review_composer_causal_binding_missing/);
+});
+
+test('chatgpt-controller: crash recovery rejects an unreadable attachment-backed user turn', async () => {
   const url = 'https://chatgpt.com/c/conversation-attachment';
   const prompt = 'long exact prompt';
   let receipt = null;
@@ -2291,21 +2959,19 @@ test('chatgpt-controller: crash recovery accepts one attachment-backed message u
     }
   };
   const controller = new ChatGPTController({ page, selectors: {} });
-  const result = await controller.recoverReviewSubmission({
-    prompt,
-    baselineMessageIds: [],
-    expectedUrl: url,
-    expectedConversationId: 'conversation-attachment',
-    expectedModel: 'GPT-5.6 Pro',
-    timeoutMs: 5_000,
-    causalSubmissionReceipt: causalReceipt(prompt),
-    onRecovered: async (value) => { receipt = value; }
-  });
+  await assert.rejects(controller.recoverReviewSubmission({
+      prompt,
+      baselineMessageIds: [],
+      expectedUrl: url,
+      expectedConversationId: 'conversation-attachment',
+      expectedModel: 'GPT-5.6 Pro',
+      timeoutMs: 5_000,
+      causalSubmissionReceipt: causalReceipt(prompt),
+      onRecovered: async (value) => { receipt = value; }
+    }), /review_recovery_rendered_identity_unreadable/);
   assert.equal(receipt.identityMode, REVIEW_CAUSAL_SUBMISSION_MODEL);
   assert.equal(receipt.newUserMessageCount, 1);
   assert.equal(receipt.renderedIdentityDiagnostic.renderedContentCandidateCount, 4);
-  assert.equal(result.userMessageId, 'attachment-user');
-  assert.equal(result.assistantMessageId, 'attachment-assistant');
 });
 
 test('chatgpt-controller: crash recovery rejects missing causal receipt and ambiguous new messages', async () => {
@@ -2383,15 +3049,91 @@ test('chatgpt-controller: observe-only review never activates continuation contr
       assistantMessage: '[data-message-author-role="assistant"]'
     }
   });
-  await assert.rejects(
-    controller.observeReviewResponse({
+  const observed = await controller.observeReviewResponse({
       expectedUrl: url,
       expectedConversationId: 'conversation-1',
       expectedModel: 'GPT-5.6 Pro',
       userMessageId: 'user-1',
       timeoutMs: 650
-    }),
-    /timeout_waiting_for_response/
-  );
+    });
+  assert.equal(observed.status, 'SENT_WAITING');
+  assert.equal(observed.userMessageId, 'user-1');
   assert.ok(evalCalls >= 1);
+});
+
+test('chatgpt-controller: observing a sent Pro turn ignores replacement-tab composer mode drift', async () => {
+  const url = 'https://chatgpt.com/c/replacement-tab-mode-drift';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      assert.equal(js.includes('.click()'), false);
+      return {
+        messages: [
+          { order: 0, role: 'user', id: 'sent-pro-user', text: 'frozen prompt', textIdentityReadable: true },
+          { order: 1, role: 'assistant', id: 'sent-pro-assistant', text: 'complete answer' }
+        ],
+        // This is the next-send composer state in the replacement tab. It is
+        // not evidence about the already submitted turn.
+        modelEvidence: 'High',
+        modelEvidenceCandidates: ['High'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const observed = await controller.observeReviewResponse({
+    expectedUrl: url,
+    expectedConversationId: 'replacement-tab-mode-drift',
+    expectedModel: 'Pro',
+    submittedModelEvidence: 'Pro',
+    userMessageId: 'sent-pro-user',
+    expectedPrompt: 'frozen prompt',
+    expectedPromptSha256: crypto.createHash('sha256').update('frozen prompt', 'utf8').digest('hex'),
+    baselineMessageIds: [],
+    sendCount: 1,
+    sendActionCount: 1,
+    renderedDisplayFidelity: 'exact',
+    timeoutMs: 5_000
+  });
+  assert.equal(observed.assistantMessageId, 'sent-pro-assistant');
+  assert.equal(observed.modelEvidence, 'Pro');
+});
+
+test('chatgpt-controller: a lossy one-turn committed prompt remains isolated despite a causal receipt', async () => {
+  const url = 'https://chatgpt.com/c/lossy-single-turn';
+  const page = {
+    async getUrl() { return url; },
+    async evaluate() {
+      return {
+        messages: [
+          { order: 0, role: 'user', id: 'provider-rebound-user', text: 'display loses source formatting', textIdentityReadable: true },
+          { order: 1, role: 'assistant', id: 'assistant-1', text: 'complete observed answer' }
+        ],
+        modelEvidence: 'GPT-5.6 Pro',
+        modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [],
+        selectorStop: false,
+        sendVisible: true
+      };
+    }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  await assert.rejects(
+    controller.observeReviewResponse({
+      expectedUrl: url,
+      expectedConversationId: 'lossy-single-turn',
+      expectedModel: 'GPT-5.6 Pro',
+      userMessageId: 'persisted-user-id',
+      expectedPrompt: 'exact frozen prompt',
+      expectedPromptSha256: crypto.createHash('sha256').update('exact frozen prompt', 'utf8').digest('hex'),
+      baselineMessageIds: [],
+      sendCount: 1,
+      sendActionCount: 1,
+      renderedDisplayFidelity: 'lossy_mismatch',
+      timeoutMs: 15_000
+    }),
+    /review_user_message_content_mismatch/
+  );
 });
