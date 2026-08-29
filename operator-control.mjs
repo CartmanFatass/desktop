@@ -27,8 +27,9 @@ function targetId(url, item) {
 // This is deliberately a small, data-only resolver so that the same strict
 // admission rule is used by the page snapshot and its offline fixtures. Text
 // alone is never a target: it must resolve to one current, visible, hit-tested
-// actionable ancestor. High is a picker trigger; Pro is an item in its already
-// rendered menu. Both branches fail closed on ambiguity.
+// actionable ancestor. High is a picker trigger; Pro is an exact item in its
+// already rendered menu. Both branches fail closed on ambiguity so that an
+// unrelated account/profile popup cannot masquerade as the reasoning option.
 export function resolveVisibleReasoningTargets(candidates = []) {
   const exact = new Set(['High', 'Pro']);
   const eligible = (c) => exact.has(String(c?.text || ''))
@@ -175,6 +176,7 @@ export class NativeOperatorControl {
       const b = target[0].bounds; await this.page.moveMouse(b.x + b.w / 2, b.y + b.h / 2); await this.page.mouseDown(b.x + b.w / 2, b.y + b.h / 2, { button: 'left', clickCount: 1 }); await this.page.mouseUp(b.x + b.w / 2, b.y + b.h / 2, { button: 'left', clickCount: 1 });
     } else if (kind === 'key') {
       if (!target[0].focused || !KEY_ALLOWLIST.has(String(key || ''))) fail('operator_key_target_not_focused');
+      if (target[0].kind === 'editable' && String(key) === 'Enter') fail('operator_send_capable_key_forbidden');
       await this.page.sendKey(String(key), { modifiers: Array.isArray(modifiers) ? modifiers : [] });
     } else if (kind === 'text' || kind === 'paste') {
       if (target[0].kind !== 'editable' || !textPath || !textSha256 || !path.isAbsolute(String(textPath))) fail('operator_text_preparation_invalid');

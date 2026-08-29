@@ -139,6 +139,7 @@ export function sanitizeReviewErrorData(value) {
     'predicate', 'failureStage', 'textModel', 'identityMode', 'mismatchClass',
     'firstMismatchExpectedCodePoint', 'firstMismatchObservedCodePoint',
     'replacementModel', 'composerKind', 'clearMethod', 'caretMethod',
+    'composerPreparationMode',
     'commitmentClass', 'submissionIdentityMode', 'renderedDisplayFidelity', 'identityModel'
   ]) {
     if (data[field] === null) {
@@ -465,6 +466,7 @@ function causalRecoveryEligible(existing, request) {
 
 const CHATGPT_MODEL_ROUTES = new Set([
   'composer_reasoning_control',
+  'composer_model_control',
   'semantic_model_switcher',
   'controlled_reasoning_menu'
 ]);
@@ -989,20 +991,32 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
   };
 
   const onComposerVerified = async (identity) => {
+    const retainedExact =
+      identity?.composerPreparationMode === 'retained_exact' &&
+      identity.clearMethod === 'not_required_exact_existing' &&
+      identity.selectionVerified === false &&
+      identity.deleteKeyCount === 0 &&
+      identity.emptyVerified === false &&
+      identity.emptySnapshotCount === 0 &&
+      identity.caretVerified === false &&
+      identity.caretMethod === 'not_required_exact_existing' &&
+      identity.promptInsertCount === 0;
+    const replaced =
+      identity?.composerPreparationMode === 'replaced' &&
+      typeof identity.clearMethod === 'string' && !!identity.clearMethod &&
+      identity.emptyVerified === true &&
+      identity.emptySnapshotCount === 2 &&
+      identity.caretVerified === true &&
+      typeof identity.caretMethod === 'string' && !!identity.caretMethod &&
+      identity.promptInsertCount === 1 &&
+      Number.isInteger(identity.deleteKeyCount) &&
+      identity.deleteKeyCount >= 0 && identity.deleteKeyCount <= 2;
     if (
       identity?.ok !== true ||
       identity.textModel !== REVIEW_PLAIN_TEXT_MODEL ||
       identity.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
       !['contenteditable', 'textarea', 'input'].includes(identity.composerKind) ||
-      typeof identity.clearMethod !== 'string' || !identity.clearMethod ||
-      identity.emptyVerified !== true ||
-      identity.emptySnapshotCount !== 2 ||
-      identity.selectionVerified !== true ||
-      !Number.isInteger(identity.deleteKeyCount) ||
-      identity.deleteKeyCount < 0 || identity.deleteKeyCount > 1 ||
-      identity.caretVerified !== true ||
-      typeof identity.caretMethod !== 'string' || !identity.caretMethod ||
-      identity.promptInsertCount !== 1 ||
+      (!retainedExact && !replaced) ||
       identity.sourceSha256 !== request.promptSha256 ||
       identity.canonicalPromptSha256 !== promptIdentity.canonicalSha256 ||
       identity.observedCanonicalSha256 !== promptIdentity.canonicalSha256

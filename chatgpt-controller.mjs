@@ -1033,6 +1033,53 @@ export class ChatGPTController {
     })()`);
   }
 
+  async #nativeClearReviewComposerOnce() {
+    const selector = JSON.stringify(this.selectors.promptTextarea);
+    const focused = await this.#eval(`(() => {
+      const reviewComposerNativeClearMarker = true;
+      const locateReviewComposer = ${locateReviewComposer.toString()};
+      const reviewComposerKind = ${reviewComposerKind.toString()};
+      const selected = locateReviewComposer(${selector});
+      const element = selected.element;
+      if (!element) return {
+        ok: false,
+        error: 'missing_prompt_textarea',
+        candidateCount: selected.candidateCount
+      };
+      element.focus();
+      const rect = element.getBoundingClientRect();
+      if (!(rect.width > 0 && rect.height > 0)) return {
+        ok: false,
+        error: 'review_composer_native_clear_target_unavailable',
+        candidateCount: selected.candidateCount
+      };
+      return {
+        ok: true,
+        composerKind: reviewComposerKind(element),
+        candidateCount: selected.candidateCount,
+        rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+      };
+    })()`);
+    if (focused?.ok !== true) return { ...(focused || {}), deleteKeyCount: 0 };
+    const rect = focused.rect;
+    await this.#clickAt(
+      Math.round(rect.x + Math.min(rect.w - 6, 18)),
+      Math.round(rect.y + Math.min(rect.h - 6, 18))
+    );
+    const isMac = process.platform === 'darwin';
+    await this.#sendKey('A', { modifiers: [isMac ? 'meta' : 'control'] });
+    await this.#sendKey('Backspace');
+    await sleep(75);
+    return {
+      ok: true,
+      composerKind: focused.composerKind,
+      candidateCount: focused.candidateCount,
+      clearMethod: 'native_select_all_backspace',
+      selectionVerified: false,
+      deleteKeyCount: 1
+    };
+  }
+
   #composerReplacementError(code, receipt, extra = {}) {
     const error = new Error(code);
     error.data = {
@@ -1113,15 +1160,59 @@ export class ChatGPTController {
 
   async #replacePrompt(prompt, { human = true, verifyExact = false } = {}) {
     await this.#emitProgress({ phase: 'typing_prompt' });
-    const clearAction = await this.#clearReviewComposerOnce();
-    if (clearAction?.ok !== true || clearAction.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL) {
-      throw this.#composerReplacementError('review_composer_clear_failed', clearAction, {
-        predicate: clearAction?.error || 'review_composer_clear_action_failed',
+    const existingIdentity = verifyExact
+      ? await this.inspectReviewComposerIdentity({ expectedPrompt: prompt })
+      : null;
+    const exactExisting =
+      existingIdentity?.ok === true &&
+      existingIdentity.textModel === REVIEW_PLAIN_TEXT_MODEL &&
+      existingIdentity.serializerOk === true &&
+      ['contenteditable', 'textarea', 'input'].includes(existingIdentity.composerKind) &&
+      /^[0-9a-f]{64}$/.test(String(existingIdentity.sourceSha256 || '')) &&
+      /^[0-9a-f]{64}$/.test(String(existingIdentity.canonicalPromptSha256 || '')) &&
+      existingIdentity.canonicalPromptSha256 === existingIdentity.observedCanonicalSha256;
+    if (exactExisting) {
+      return {
+        ...existingIdentity,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerPreparationMode: 'retained_exact',
+        composerKind: existingIdentity.composerKind,
+        clearMethod: 'not_required_exact_existing',
+        selectionVerified: false,
+        deleteKeyCount: 0,
+        initialSerializerOk: existingIdentity.serializerOk === true,
+        initialSerializedLength: existingIdentity.serializedLength,
         emptyVerified: false,
-        emptySnapshotCount: 0
-      });
+        emptySnapshotCount: 0,
+        caretVerified: false,
+        caretMethod: 'not_required_exact_existing',
+        promptInsertCount: 0
+      };
     }
-    const emptyReceipt = await this.#verifyReviewComposerEmpty();
+
+    let clearAction = await this.#clearReviewComposerOnce();
+    let nativeFallback = null;
+    const applyNativeFallback = async () => {
+      nativeFallback = await this.#nativeClearReviewComposerOnce();
+      if (nativeFallback?.ok !== true) {
+        throw this.#composerReplacementError('review_composer_clear_failed', nativeFallback, {
+          predicate: nativeFallback?.error || 'review_composer_native_clear_failed',
+          emptyVerified: false,
+          emptySnapshotCount: 0
+        });
+      }
+    };
+    if (clearAction?.ok !== true || clearAction.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL) {
+      await applyNativeFallback();
+    }
+    let emptyReceipt;
+    try {
+      emptyReceipt = await this.#verifyReviewComposerEmpty();
+    } catch (error) {
+      if (nativeFallback || error?.message !== 'review_composer_clear_failed') throw error;
+      await applyNativeFallback();
+      emptyReceipt = await this.#verifyReviewComposerEmpty();
+    }
     const caretReceipt = await this.#prepareReviewComposerInsertion();
     if (
       caretReceipt?.ok !== true ||
@@ -1140,14 +1231,20 @@ export class ChatGPTController {
       await this.page.insertText(prompt);
     }
     const promptInsertCount = human ? Array.from(String(prompt)).length : 1;
+    const initialDeleteKeyCount = Number(clearAction?.deleteKeyCount || 0);
     const replacementReceipt = {
       replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+      composerPreparationMode: 'replaced',
       composerKind: caretReceipt.composerKind,
-      clearMethod: clearAction.clearMethod,
-      selectionVerified: clearAction.selectionVerified === true,
-      deleteKeyCount: clearAction.deleteKeyCount,
-      initialSerializerOk: clearAction.initialSerializerOk,
-      initialSerializedLength: clearAction.initialSerializedLength,
+      clearMethod: nativeFallback
+        ? clearAction?.ok === true
+          ? `${clearAction.clearMethod}_then_native_select_all_backspace`
+          : 'native_select_all_backspace'
+        : clearAction.clearMethod,
+      selectionVerified: clearAction?.selectionVerified === true,
+      deleteKeyCount: initialDeleteKeyCount + Number(nativeFallback?.deleteKeyCount || 0),
+      initialSerializerOk: clearAction?.initialSerializerOk ?? existingIdentity?.serializerOk ?? null,
+      initialSerializedLength: clearAction?.initialSerializedLength ?? existingIdentity?.serializedLength ?? null,
       emptyVerified: emptyReceipt.emptyVerified,
       emptySnapshotCount: emptyReceipt.emptySnapshotCount,
       caretVerified: true,
@@ -1331,6 +1428,7 @@ export class ChatGPTController {
           canonicalPromptSha256 === observedCanonicalSha256;
         return {
           ok: exactIdentity,
+          composerKind: el.matches('textarea') ? 'textarea' : el.matches('input') ? 'input' : 'contenteditable',
           candidateCount: selected.candidateCount,
           selectedByPrimary: selected.selectedByPrimary,
           serializerOk: serialized.ok === true,
@@ -1730,10 +1828,10 @@ export class ChatGPTController {
         return canonicalizeGeminiModelEvidence(records, ${JSON.stringify(expected)});
       })()`);
     }
-    // On the current ChatGPT surface, High and Pro are values of its one
-    // visible reasoning-strength axis. They are not separate provider-model
-    // evidence. A fresh tab can reset Pro to High, so strict Pro work must
-    // normalize this exact visible control before any composer action.
+    // ChatGPT exposes provider-model identity and an optional High/Pro
+    // reasoning-strength axis as different controls. The exact caller value
+    // decides which surface is relevant; a full model label never creates an
+    // implicit requirement to inspect or change the reasoning-strength axis.
     const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
     const promptSelector = this.selectors.promptTextarea || '#prompt-textarea';
     return await this.#eval(`(() => {
@@ -1749,6 +1847,32 @@ export class ChatGPTController {
       const promptNode = document.querySelector(${JSON.stringify(promptSelector)});
       const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
       const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+      const expectsReasoningStrength = /^(?:high|pro)$/i.test(expected);
+      if (!expectsReasoningStrength) {
+        const exactModelControls = Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter(visible)
+          .filter((node) => !node.closest('[role="menu"], [role="listbox"]'))
+          .map((node) => {
+            const label = semanticLabel(node);
+            const testId = String(node.getAttribute('data-testid') || '');
+            const aria = String(node.getAttribute('aria-label') || '');
+            const route = testId === 'model-switcher-dropdown-button' || /model/i.test(aria)
+              ? 'semantic_model_switcher'
+              : composerRoot?.contains?.(node) && /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || ''))
+                ? 'composer_model_control'
+                : null;
+            return { label, route };
+          })
+          .filter((record) => record.route && modelLabelMatches(record.label, expected));
+        const matchedLabel = exactModelControls.length === 1 ? exactModelControls[0].label : null;
+        return {
+          matched: !!matchedLabel,
+          labels: exactModelControls.map((record) => record.label),
+          matchedLabel,
+          routeEvidence: exactModelControls.length === 1 ? exactModelControls[0].route : null,
+          scopedMatchCount: exactModelControls.length
+        };
+      }
       const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
       const routeFor = (node) => {
         if (composerRoot?.contains?.(node)) return 'composer_reasoning_control';
@@ -1785,6 +1909,7 @@ export class ChatGPTController {
     let isGemini = false;
     try { isGemini = new URL(await this.page.getUrl()).hostname === 'gemini.google.com'; } catch {}
     if (isGemini) return await this.#ensureGeminiExpectedModel(expected, timeoutMs);
+    const expectsReasoningStrength = /^(?:high|pro)$/i.test(expected);
     const reasoningModePicker = 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]';
     const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
     let state = null;
@@ -1792,7 +1917,17 @@ export class ChatGPTController {
     await this.#emitProgress({ phase: 'selecting_model' });
     while (Date.now() < deadline) {
       state = await this.#readExpectedModelState(expected);
-      if (state?.matched) return { ...state, selectionMethod: 'already_selected_visible_reasoning_mode' };
+      if (state?.matched) return {
+        ...state,
+        selectionMethod: expectsReasoningStrength
+          ? 'already_selected_visible_reasoning_mode'
+          : 'already_selected_visible_model'
+      };
+      if (!expectsReasoningStrength) {
+        const error = new Error('expected_model_unavailable');
+        error.data = { expectedModel: expected, availableModels: state?.labels || [] };
+        throw error;
+      }
       opened = await this.#eval(`(() => {
         const agentifyOpenModelPickerMarker = true;
         const visible = (node) => {
@@ -2408,12 +2543,13 @@ export class ChatGPTController {
       let clickTimeModelEvidence = null;
       if (location.hostname === 'chatgpt.com' && expectedModel) {
         const agentifyReasoningControlScopeMarker = true;
+        const expectsReasoningStrength = /^(?:high|pro)$/i.test(expectedModel);
         const promptNode = document.querySelector(${promptSel});
         const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
         const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
         const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
         const routeFor = (node) => {
-          if (composerRoot?.contains?.(node)) return 'composer_reasoning_control';
+          if (composerRoot?.contains?.(node)) return expectsReasoningStrength ? 'composer_reasoning_control' : 'composer_model_control';
           if (node.getAttribute('data-testid') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
           const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
           return controlledIds.some((id) => modeItems(document.getElementById(id)).map(semanticLabel).some((label) => /^(?:high|pro)$/i.test(label)))
@@ -3006,12 +3142,25 @@ export class ChatGPTController {
         modelEvidence: before.modelEvidence
       });
       const composerIdentity = await this.#replacePrompt(prompt, { human: false, verifyExact: true });
+      const retainedExact =
+        composerIdentity?.composerPreparationMode === 'retained_exact' &&
+        composerIdentity.clearMethod === 'not_required_exact_existing' &&
+        composerIdentity.selectionVerified === false &&
+        composerIdentity.deleteKeyCount === 0 &&
+        composerIdentity.emptyVerified === false &&
+        composerIdentity.emptySnapshotCount === 0 &&
+        composerIdentity.caretVerified === false &&
+        composerIdentity.caretMethod === 'not_required_exact_existing' &&
+        composerIdentity.promptInsertCount === 0;
+      const replaced =
+        composerIdentity?.composerPreparationMode === 'replaced' &&
+        composerIdentity.emptyVerified === true &&
+        composerIdentity.emptySnapshotCount === 2 &&
+        composerIdentity.caretVerified === true &&
+        composerIdentity.promptInsertCount === 1;
       if (
         composerIdentity?.replacementModel !== REVIEW_COMPOSER_REPLACEMENT_MODEL ||
-        composerIdentity.emptyVerified !== true ||
-        composerIdentity.emptySnapshotCount !== 2 ||
-        composerIdentity.caretVerified !== true ||
-        composerIdentity.promptInsertCount !== 1
+        (!retainedExact && !replaced)
       ) {
         throw this.#composerReplacementError('review_composer_replacement_receipt_invalid', composerIdentity, {
           predicate: 'review_composer_replacement_receipt_invalid'

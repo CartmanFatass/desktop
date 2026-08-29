@@ -11,7 +11,7 @@ function reasoningCandidate(overrides = {}) {
   };
 }
 
-function page({ label = 'Pro', url = 'https://chatgpt.com/' } = {}) {
+function page({ label = 'Pro', url = 'https://chatgpt.com/', kind = 'interactive', focused = false } = {}) {
   const calls = [];
   return {
     calls,
@@ -19,7 +19,7 @@ function page({ label = 'Pro', url = 'https://chatgpt.com/' } = {}) {
     async evaluate(js) {
       if (String(js).includes('const visible')) return {
         url,
-        controls: [{ role: 'button', label, kind: 'interactive', testId: 'mode-picker', selected: false, expanded: false, focused: false, bounds: { x: 10, y: 20, w: 40, h: 20 }, hitTested: true, forbidden: false }],
+        controls: [{ role: kind === 'editable' ? 'textbox' : 'button', label, kind, testId: 'mode-picker', selected: false, expanded: false, focused, bounds: { x: 10, y: 20, w: 40, h: 20 }, hitTested: true, forbidden: false }],
         composer: { present: false }, generation: { activeForbiddenControlLabels: [] }
       };
       return '';
@@ -53,6 +53,17 @@ test('operator control: URL drift rejects an observed target before native input
   const observed = await control.observe({ tabId: 'tab-1' });
   p.getUrl = async () => 'https://chatgpt.com/c/changed';
   await assert.rejects(control.act({ tabId: 'tab-1', url: observed.url, revision: observed.revision, targetId: observed.controls[0].targetId, action: 'click' }), /operator_url_changed/);
+  assert.equal(p.calls.length, 0);
+});
+
+test('operator control: Enter on a focused editable target cannot bypass the strict send actuator', async () => {
+  const p = page({ label: 'Message', kind: 'editable', focused: true });
+  const control = new NativeOperatorControl({ page: p });
+  const observed = await control.observe({ tabId: 'tab-1' });
+  await assert.rejects(
+    control.act({ tabId: 'tab-1', url: observed.url, revision: observed.revision, targetId: observed.controls[0].targetId, action: 'key', key: 'Enter' }),
+    /operator_send_capable_key_forbidden/
+  );
   assert.equal(p.calls.length, 0);
 });
 
@@ -100,14 +111,21 @@ test('operator control: duplicate visible High ancestors fail closed', () => {
   assert.equal(result.targets.length, 0);
 });
 
-test('operator control: Pro is discovered only after it is a visible actionable menu option', () => {
-  const beforeMenu = resolveVisibleReasoningTargets([reasoningCandidate({ text: 'Pro', label: 'Pro', popupRelation: false, menuScoped: false })]);
-  assert.equal(beforeMenu.diagnostics.Pro.accepted, false);
-  assert.deepEqual(beforeMenu.diagnostics.Pro.candidates, [{
+test('operator control: generic profile Pro popup is rejected and only an exact Pro menu option is accepted', () => {
+  const unrelated = resolveVisibleReasoningTargets([reasoningCandidate({ text: 'Pro', label: 'Pro', popupRelation: false, menuScoped: false })]);
+  assert.equal(unrelated.diagnostics.Pro.accepted, false);
+  assert.deepEqual(unrelated.diagnostics.Pro.candidates, [{
     source: 'rendered_text', ancestorKey: 'high-trigger', role: 'button', bounds: { x: 10, y: 10, w: 40, h: 20 },
     visible: true, inViewport: true, hitTested: true, actionable: true, ambiguous: false, forbidden: false,
     popupRelation: false, menuScoped: false, exclusionReasons: ['pro_not_menu_scoped']
   }]);
+  const accountPopup = resolveVisibleReasoningTargets([reasoningCandidate({
+    text: 'Pro', label: 'Open profile menu', popupRelation: true, menuScoped: false,
+    ancestorKey: 'account-profile-trigger'
+  })]);
+  assert.equal(accountPopup.diagnostics.Pro.accepted, false);
+  assert.equal(accountPopup.targets.length, 0);
+  assert.deepEqual(accountPopup.diagnostics.Pro.candidates[0].exclusionReasons, ['pro_not_menu_scoped']);
   const afterMenu = resolveVisibleReasoningTargets([reasoningCandidate({ text: 'Pro', label: 'Pro', ancestorKey: 'pro-option', popupRelation: false, menuScoped: true, source: 'accessible_label' })]);
   assert.equal(afterMenu.diagnostics.Pro.accepted, true);
   assert.deepEqual(afterMenu.diagnostics.Pro.candidates[0].exclusionReasons, []);

@@ -26,7 +26,7 @@ const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').dige
 
 async function fixture() {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, reviewPrompts: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
+  const calls = { review: 0, reviewPrompts: [], modelPreflights: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
   let failBeforeSubmittedReceipt = false;
   let failAfterSendBoundary = false;
   let postBoundaryFailure = null;
@@ -105,6 +105,7 @@ async function fixture() {
     async reviewQuery(args) {
       calls.review += 1;
       calls.reviewPrompts.push(args.prompt);
+      calls.modelPreflights.push(args.requireModelPreflight === true);
       const submittedUrl = args.firstBinding ? firstBindingSubmittedUrl : args.expectedUrl;
       const submittedId = args.firstBinding ? firstBindingSubmittedUrl.split('/').at(-1) : args.expectedConversationId;
       await args.onPrepared({
@@ -118,6 +119,7 @@ async function fixture() {
         ok: true,
         textModel: REVIEW_PLAIN_TEXT_MODEL,
         replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        composerPreparationMode: 'replaced',
         composerKind: 'contenteditable',
         clearMethod: 'already_empty',
         selectionVerified: true,
@@ -940,6 +942,7 @@ test('review transport: one send persists a complete receipt and duplicate retur
     scopedMatchCount: 1
   });
   assert.equal(first.modelEvidence, 'GPT-5.6 Pro');
+  assert.deepEqual(f.calls.modelPreflights, [true]);
   assert.equal('submissionIdentityMode' in first, false);
   assert.equal('composerPromptSha256' in first, false);
   assert.equal(f.calls.review, 1);

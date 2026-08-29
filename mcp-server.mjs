@@ -139,7 +139,7 @@ registerTool(
     inputSchema: {
       stableKey: z.string().describe('Persistent stable binding key.'),
       provider: z.enum(['chatgpt', 'gemini']).describe('Exact provider identity.'),
-      model: z.string().describe('Exact visible Pro model label expected in the conversation UI.'),
+      model: z.string().describe('Exact visible provider-model label expected in the conversation UI (for example, "GPT-5.6 Pro"); this does not imply a separate reasoning-mode requirement.'),
       conversationUrl: z.string().describe('Exact registered conversation URL, or the provider root for first binding.'),
       conversationId: z.string().describe('Exact conversation identity contained in conversationUrl, or __new__ for first binding.'),
       idempotencyKey: z.string().describe('Immutable operation idempotency key.'),

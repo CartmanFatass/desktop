@@ -68,7 +68,8 @@ function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty =
       }
       if (js.includes('reviewComposerEmptyMarker')) {
         emptyReads += 1;
-        if (failEmpty && emptyReads === 2) current = existingDraft || 'rehydrated';
+        if (failEmpty === true && emptyReads === 2) current = existingDraft || 'rehydrated';
+        if (failEmpty === 'persistent' && current === '') current = existingDraft || 'rehydrated';
         return {
           ok: current === '',
           replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
@@ -106,6 +107,7 @@ function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty =
           serializerMethod: 'contenteditable_structural',
           serializedLength: current.length,
           expectedLength: prompt.length,
+          composerKind: 'contenteditable',
           textModel: REVIEW_PLAIN_TEXT_MODEL,
           identityMode: 'canonical_exact',
           sourceSha256: reviewPlainTextIdentity(prompt).sourceSha256,
@@ -527,7 +529,7 @@ test('chatgpt-controller: composer mismatch diagnostics identify the first code-
   assert.equal(JSON.stringify(result).includes('synthetic'), false);
 });
 
-test('chatgpt-controller: strict persisted draft is cleared, verified empty twice, then inserted exactly once', async () => {
+test('chatgpt-controller: strict exact persisted draft is retained without clearing or reinsertion', async () => {
   const skeleton = '# Synthetic revision\n\n- item\n\n1. first\n  branch\n```text\nx=1\n```\n';
   const prompt = `${skeleton}${'x'.repeat(7024 - skeleton.length)}`;
   assert.equal(prompt.length, 7024);
@@ -576,24 +578,25 @@ test('chatgpt-controller: strict persisted draft is cleared, verified empty twic
     timeoutMs: 8_000,
     onComposerVerified: async (receipt) => { composerReceipt = receipt; }
   });
-  assert.equal(inserted, 1);
-  assert.equal(deleteKeys, 1);
+  assert.equal(inserted, 0);
+  assert.equal(deleteKeys, 0);
   assert.equal(clicked, 1);
   assert.equal(composer.current, prompt);
   assert.equal(composerReceipt.initialSerializedLength, prompt.length);
-  assert.equal(composerReceipt.clearMethod, 'verified_selection_backspace');
-  assert.equal(composerReceipt.selectionVerified, true);
-  assert.equal(composerReceipt.deleteKeyCount, 1);
-  assert.equal(composerReceipt.emptyVerified, true);
-  assert.equal(composerReceipt.emptySnapshotCount, 2);
-  assert.equal(composerReceipt.promptInsertCount, 1);
+  assert.equal(composerReceipt.composerPreparationMode, 'retained_exact');
+  assert.equal(composerReceipt.clearMethod, 'not_required_exact_existing');
+  assert.equal(composerReceipt.selectionVerified, false);
+  assert.equal(composerReceipt.deleteKeyCount, 0);
+  assert.equal(composerReceipt.emptyVerified, false);
+  assert.equal(composerReceipt.emptySnapshotCount, 0);
+  assert.equal(composerReceipt.promptInsertCount, 0);
   assert.equal(result.status, 'SENT_WAITING');
   assert.equal(result.userMessageId, 'draft-user');
 });
 
-test('chatgpt-controller: asynchronously rehydrated draft fails before prompt insertion or Send', async () => {
+test('chatgpt-controller: asynchronously rehydrated stale draft is cleared by one native fallback before one Send', async () => {
   const prompt = 'frozen prompt';
-  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt, failEmpty: true });
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: 'stale draft', failEmpty: true });
   let inserted = 0;
   let clicked = 0;
   const page = {
@@ -602,9 +605,54 @@ test('chatgpt-controller: asynchronously rehydrated draft fails before prompt in
       if (js.includes('const hasTurnstile')) return readyState();
       const composerResult = composer.evaluate(js);
       if (composerResult) return composerResult;
+      if (js.includes('reviewComposerNativeClearMarker')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 }, composerKind: 'contenteditable' };
       if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
       if (js.includes('reviewSnapshotMarker')) return {
-        messages: [{ order: 0, role: 'user', id: 'draft-rehydrate-history', text: 'history', textIdentityReadable: true }], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        messages: clicked ? [
+          { order: 0, role: 'user', id: 'draft-rehydrate-history', text: 'history', textIdentityReadable: true },
+          { order: 1, role: 'user', id: 'draft-rehydrate-user', text: prompt, textIdentityReadable: true },
+          { order: 2, role: 'assistant', id: 'draft-rehydrate-assistant', text: 'DONE' }
+        ] : [{ order: 0, role: 'user', id: 'draft-rehydrate-history', text: 'history', textIdentityReadable: true }],
+        modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: true
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText(text) { inserted += 1; composer.insert(text); },
+    async sendKey(key) { if (key === 'Backspace') composer.deleteSelection(); },
+    async moveMouse() {}, async mouseDown() {}, async mouseUp() {}
+  };
+  const controller = new ChatGPTController({
+    page,
+    selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
+  });
+  const result = await controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/c/draft-rehydrate',
+    expectedConversationId: 'draft-rehydrate',
+    expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000
+  });
+  assert.equal(result.status, 'SENT_WAITING');
+  assert.equal(inserted, 1);
+  assert.equal(clicked, 1);
+});
+
+test('chatgpt-controller: persistently rehydrated stale draft still fails before prompt insertion or Send', async () => {
+  const prompt = 'frozen prompt';
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: 'persistent stale draft', failEmpty: 'persistent' });
+  let inserted = 0;
+  let clicked = 0;
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/c/draft-persistent'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      const composerResult = composer.evaluate(js);
+      if (composerResult) return composerResult;
+      if (js.includes('reviewComposerNativeClearMarker')) return { ok: true, rect: { x: 10, y: 10, w: 200, h: 40 }, composerKind: 'contenteditable' };
+      if (js.includes('reviewSendOnceMarker')) { clicked += 1; return { ok: true, clickCount: 1 }; }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [{ order: 0, role: 'user', id: 'draft-persistent-history', text: 'history', textIdentityReadable: true }],
+        modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
         controlText: [], selectorStop: false, sendVisible: true
       };
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
@@ -617,28 +665,19 @@ test('chatgpt-controller: asynchronously rehydrated draft fails before prompt in
     page,
     selectors: { promptTextarea: '#prompt', sendButton: '#send', stopButton: '#stop' }
   });
-  await assert.rejects(
-    controller.reviewQuery({
-      prompt,
-      expectedUrl: 'https://chatgpt.com/c/draft-rehydrate',
-      expectedConversationId: 'draft-rehydrate',
-      expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000
-    }),
-    (error) => {
-      assert.equal(error.message, 'review_composer_clear_failed');
-      assert.equal(error.data.noClickProven, true);
-      assert.equal(error.data.promptInsertCount, 0);
-      assert.equal(error.data.serializedLength, prompt.length);
-      return true;
-    }
-  );
+  await assert.rejects(controller.reviewQuery({
+    prompt,
+    expectedUrl: 'https://chatgpt.com/c/draft-persistent',
+    expectedConversationId: 'draft-persistent',
+    expectedModel: 'GPT-5.6 Pro', timeoutMs: 8_000
+  }), /review_composer_clear_failed/);
   assert.equal(inserted, 0);
   assert.equal(clicked, 0);
 });
 
 test('chatgpt-controller: failed contenteditable caret binding fails before prompt insertion or Send', async () => {
   const prompt = 'frozen prompt';
-  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: prompt, failCaret: true });
+  const composer = strictComposerEvaluateFixture({ prompt, existingDraft: 'stale draft', failCaret: true });
   let inserted = 0;
   let clicked = 0;
   const page = {
@@ -2283,6 +2322,77 @@ test('chatgpt-controller: non-sending ChatGPT review preflight reads the selecte
     modelEvidenceCandidates: ['Pro'], modelEvidenceDiagnostics: [], preflightVerified: true,
     sendActionCount: 0, promptInsertCount: 0
   });
+});
+
+test('chatgpt-controller: full ChatGPT model identity does not require a separate reasoning-mode control', async () => {
+  const url = 'https://chatgpt.com/';
+  let reasoningPickerCalls = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return {
+        matched: true,
+        labels: ['GPT-5.6 Pro'],
+        matchedLabel: 'GPT-5.6 Pro',
+        routeEvidence: 'semantic_model_switcher',
+        scopedMatchCount: 1
+      };
+      if (/agentifyOpen(?:Unbound|Page)?ModelPickerMarker/.test(js) || js.includes('agentifyChooseModelMarker')) {
+        reasoningPickerCalls += 1;
+        throw new Error('full_model_must_not_open_reasoning_picker');
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'GPT-5.6 Pro', modelEvidenceCandidates: ['GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: false
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { throw new Error('preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(result.preflightVerified, true);
+  assert.equal(result.modelEvidence, 'GPT-5.6 Pro');
+  assert.equal(reasoningPickerCalls, 0);
+});
+
+test('chatgpt-controller: ambiguous full ChatGPT model identity remains unverified and non-sending', async () => {
+  const url = 'https://chatgpt.com/';
+  let reasoningPickerCalls = 0;
+  const page = {
+    async getUrl() { return url; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return {
+        matched: false,
+        labels: ['GPT-5.6 Pro', 'GPT-5.6 Pro'],
+        matchedLabel: null,
+        routeEvidence: null,
+        scopedMatchCount: 2
+      };
+      if (/agentifyOpen(?:Unbound|Page)?ModelPickerMarker/.test(js) || js.includes('agentifyChooseModelMarker')) {
+        reasoningPickerCalls += 1;
+        throw new Error('ambiguous_full_model_must_not_open_reasoning_picker');
+      }
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: null, modelEvidenceCandidates: ['GPT-5.6 Pro', 'GPT-5.6 Pro'],
+        controlText: [], selectorStop: false, sendVisible: false
+      };
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { throw new Error('ambiguous_preflight_must_not_insert_prompt'); },
+    async sendKey() { throw new Error('ambiguous_preflight_must_not_send_key'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: {} });
+  const result = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(result.preflightVerified, false);
+  assert.equal(result.modelEvidence, null);
+  assert.deepEqual(result.modelEvidenceCandidates, ['GPT-5.6 Pro', 'GPT-5.6 Pro']);
+  assert.equal(result.sendActionCount, 0);
+  assert.equal(result.promptInsertCount, 0);
+  assert.equal(reasoningPickerCalls, 0);
 });
 
 test('chatgpt-controller: strict review accepts structural exactness when browser text projections bracket the prompt', async () => {
