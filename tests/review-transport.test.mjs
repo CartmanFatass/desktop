@@ -964,6 +964,7 @@ test('review transport: one send persists a complete receipt and duplicate retur
 test('review transport: visible Pro is canonical send evidence for requested GPT-5.6 Pro', async () => {
   const f = await fixture();
   f.setVisibleModelLabel('Pro');
+  f.setVisibleModelRoute('composer_model_control');
   const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
   assert.equal(receipt.status, 'COMPLETE');
   assert.equal(receipt.model, 'GPT-5.6 Pro');
@@ -971,7 +972,7 @@ test('review transport: visible Pro is canonical send evidence for requested GPT
   assert.deepEqual(receipt.causalSendReceipt.modelSelection, {
     expectedModel: 'GPT-5.6 Pro',
     matchedLabel: 'Pro',
-    routeEvidence: 'semantic_model_switcher',
+    routeEvidence: 'composer_model_control',
     scopedMatchCount: 1
   });
 });

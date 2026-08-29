@@ -90,6 +90,42 @@ export function chatgptProductModelAlias(expectedModel) {
   return token === 'gpt56pro' || token === 'gpt56solpro';
 }
 
+const CHATGPT_MODE_ITEM_SELECTOR = '[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]';
+
+export function classifyChatgptModelControlRoute({
+  label = '',
+  testId = '',
+  ariaLabel = '',
+  ariaHasPopup = '',
+  ariaControls = '',
+  insideComposer = false,
+  controlledMenuLabels = [],
+  productModelRequest = false,
+  expectsReasoningStrength = false
+} = {}) {
+  const normalizedLabel = String(label || '').replace(/\s+/g, ' ').trim();
+  const semanticAttributes = `${String(testId || '')} ${String(ariaLabel || '')} ${String(ariaControls || '')}`;
+  const controlledReasoningMenu = Array.isArray(controlledMenuLabels)
+    && controlledMenuLabels.some((value) => /^(?:high|pro)$/i.test(String(value || '').replace(/\s+/g, ' ').trim()));
+  const explicitReasoningControl = /reasoning|thinking|effort/i.test(semanticAttributes);
+  if (explicitReasoningControl || controlledReasoningMenu) {
+    return insideComposer ? 'composer_reasoning_control' : 'controlled_reasoning_menu';
+  }
+  if (String(testId || '') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
+  if (/\bmodel\b/i.test(String(ariaLabel || ''))) return 'semantic_model_switcher';
+  if (!insideComposer) return null;
+
+  // Current ChatGPT exposes the selected GPT-5.6 Sol Pro product as one
+  // composer-adjacent button whose complete visible label is simply "Pro".
+  // The live control may have no model test id, aria label, or controlled menu.
+  // Uniqueness is enforced by the caller after unrelated page controls have
+  // been excluded; identifiable reasoning controls were rejected above.
+  if (productModelRequest && /^pro$/i.test(normalizedLabel)) return 'composer_model_control';
+  if (expectsReasoningStrength && /^(?:high|pro)$/i.test(normalizedLabel)) return 'composer_reasoning_control';
+  if (/^(?:menu|listbox)$/i.test(String(ariaHasPopup || ''))) return 'composer_model_control';
+  return null;
+}
+
 export function chatgptExpectedModelSpec(expectedModel) {
   const requestedModel = String(expectedModel || '').replace(/\s+/g, ' ').trim();
   if (chatgptProductModelAlias(requestedModel)) {
@@ -1876,9 +1912,12 @@ export class ChatGPTController {
       };
       const expected = ${JSON.stringify(visibleExpected)};
       const productModelRequest = ${JSON.stringify(productModelRequest)};
+      const classifyChatgptModelControlRoute = ${classifyChatgptModelControlRoute.toString()};
       const promptNode = document.querySelector(${JSON.stringify(promptSelector)});
       const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
       const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
+      const modeItemSelector = ${JSON.stringify(CHATGPT_MODE_ITEM_SELECTOR)};
+      const modeItems = (root) => Array.from(root?.querySelectorAll?.(modeItemSelector) || []);
       const expectsReasoningStrength = !productModelRequest && /^(?:high|pro)$/i.test(expected);
       if (!expectsReasoningStrength) {
         const exactModelControls = Array.from(document.querySelectorAll('button, [role="button"]'))
@@ -1888,14 +1927,24 @@ export class ChatGPTController {
             const label = semanticLabel(node);
             const testId = String(node.getAttribute('data-testid') || '');
             const aria = String(node.getAttribute('aria-label') || '');
-            const route = testId === 'model-switcher-dropdown-button' || /model/i.test(aria)
-              ? 'semantic_model_switcher'
-              : !productModelRequest && composerRoot?.contains?.(node) && /^(?:menu|listbox)$/i.test(String(node.getAttribute('aria-haspopup') || ''))
-                ? 'composer_model_control'
-                : null;
+            const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
+            const controlledMenuLabels = controlledIds.flatMap((id) => modeItems(document.getElementById(id)).map(semanticLabel));
+            const route = classifyChatgptModelControlRoute({
+              label,
+              testId,
+              ariaLabel: aria,
+              ariaHasPopup: node.getAttribute('aria-haspopup'),
+              ariaControls: node.getAttribute('aria-controls'),
+              insideComposer: !!composerRoot?.contains?.(node),
+              controlledMenuLabels,
+              productModelRequest,
+              expectsReasoningStrength
+            });
             return { label, route };
           })
-          .filter((record) => record.route && modelLabelMatches(record.label, expected));
+          .filter((record) => record.route
+            && (!productModelRequest || record.route === 'semantic_model_switcher' || record.route === 'composer_model_control')
+            && modelLabelMatches(record.label, expected));
         const matchedLabel = exactModelControls.length === 1 ? exactModelControls[0].label : null;
         return {
           matched: !!matchedLabel,
@@ -1905,7 +1954,6 @@ export class ChatGPTController {
           scopedMatchCount: exactModelControls.length
         };
       }
-      const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
       const routeFor = (node) => {
         if (composerRoot?.contains?.(node)) return 'composer_reasoning_control';
         if (node.getAttribute('data-testid') === 'model-switcher-dropdown-button') return 'semantic_model_switcher';
@@ -2597,6 +2645,7 @@ export class ChatGPTController {
       const expectedModel = ${expectedModelLabel};
       const expectedVisibleModel = ${expectedVisibleModelLabel};
       const productModelRequest = ${productModelRequest};
+      const classifyChatgptModelControlRoute = ${classifyChatgptModelControlRoute.toString()};
       let clickTimeModelEvidence = null;
       if (location.hostname === 'chatgpt.com' && expectedModel) {
         const agentifyReasoningControlScopeMarker = true;
@@ -2604,32 +2653,41 @@ export class ChatGPTController {
         const promptNode = document.querySelector(${promptSel});
         const composerRoot = promptNode?.closest?.('form') || promptNode?.parentElement?.parentElement?.parentElement || null;
         const semanticLabel = (node) => String(node.getAttribute('aria-label') || node.textContent || '').replace(/\s+/g, ' ').trim();
-        const modeItems = (root) => Array.from(root?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"], [role="option"], [data-testid*="model-option" i], [data-radix-collection-item]') || []);
+        const modeItemSelector = ${JSON.stringify(CHATGPT_MODE_ITEM_SELECTOR)};
+        const modeItems = (root) => Array.from(root?.querySelectorAll?.(modeItemSelector) || []);
         const routeFor = (node) => {
           const testId = String(node.getAttribute('data-testid') || '');
           const aria = String(node.getAttribute('aria-label') || '');
-          if (testId === 'model-switcher-dropdown-button' || /model/i.test(aria)) return 'semantic_model_switcher';
-          if (productModelRequest) return null;
-          if (composerRoot?.contains?.(node)) return expectsReasoningStrength ? 'composer_reasoning_control' : 'composer_model_control';
           const controlledIds = String(node.getAttribute('aria-controls') || '').split(/\s+/).filter(Boolean);
-          return controlledIds.some((id) => modeItems(document.getElementById(id)).map(semanticLabel).some((label) => /^(?:high|pro)$/i.test(label)))
-            ? 'controlled_reasoning_menu'
-            : null;
+          const controlledMenuLabels = controlledIds.flatMap((id) => modeItems(document.getElementById(id)).map(semanticLabel));
+          return classifyChatgptModelControlRoute({
+            label: semanticLabel(node),
+            testId,
+            ariaLabel: aria,
+            ariaHasPopup: node.getAttribute('aria-haspopup'),
+            ariaControls: node.getAttribute('aria-controls'),
+            insideComposer: !!composerRoot?.contains?.(node),
+            controlledMenuLabels,
+            productModelRequest,
+            expectsReasoningStrength
+          });
         };
-        const selectedReasoningControls = Array.from(document.querySelectorAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
+        const selectedModelControls = Array.from(document.querySelectorAll(productModelRequest ? 'button, [role="button"]' : 'button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
           .filter((node) => visible(node) && !node.closest('[role="menu"], [role="listbox"]'))
           .map((node) => ({ node, label: semanticLabel(node), route: routeFor(node) }))
-          .filter((record) => record.route && modelLabelMatches(record.label, expectedVisibleModel));
-        if (selectedReasoningControls.length !== 1) return {
+          .filter((record) => record.route
+            && (!productModelRequest || record.route === 'semantic_model_switcher' || record.route === 'composer_model_control')
+            && modelLabelMatches(record.label, expectedVisibleModel));
+        if (selectedModelControls.length !== 1) return {
           ok: false,
           error: 'review_model_mismatch_at_send',
           noClickProven: true,
-          selectedModelMatchCount: selectedReasoningControls.length
+          selectedModelMatchCount: selectedModelControls.length
         };
         clickTimeModelEvidence = {
           expectedModel,
-          matchedLabel: selectedReasoningControls[0].label,
-          routeEvidence: selectedReasoningControls[0].route,
+          matchedLabel: selectedModelControls[0].label,
+          routeEvidence: selectedModelControls[0].route,
           scopedMatchCount: 1
         };
       }

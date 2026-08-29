@@ -470,7 +470,7 @@ const CHATGPT_MODEL_ROUTES = new Set([
   'semantic_model_switcher',
   'controlled_reasoning_menu'
 ]);
-const CHATGPT_PRODUCT_MODEL_ROUTES = new Set(['semantic_model_switcher']);
+const CHATGPT_PRODUCT_MODEL_ROUTES = new Set(['semantic_model_switcher', 'composer_model_control']);
 
 function exactModelLabelMatches(actual, expected) {
   const normalize = (value) => String(value || '')

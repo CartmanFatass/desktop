@@ -8,6 +8,7 @@ import {
   canonicalizeReviewMessageNodes,
   canonicalizeGeminiReviewMessageNodes,
   canonicalizeGeminiModelEvidence,
+  classifyChatgptModelControlRoute,
   chatgptExpectedModelSpec,
   chatgptModelLabelMatches,
   classifyBlockedSignals,
@@ -1299,6 +1300,164 @@ test('chatgpt-controller: current ChatGPT Pro product names bind to the visible 
   assert.equal(chatgptModelLabelMatches('Jacob Frantz Pro, open profile menu', 'GPT-5.6 Pro'), false);
 });
 
+test('chatgpt-controller: live composer Pro shape is product evidence while profile and reasoning controls are not', () => {
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    insideComposer: true,
+    productModelRequest: true
+  }), 'composer_model_control');
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Jacob Frantz Pro, open profile menu',
+    testId: 'accounts-profile-button',
+    insideComposer: false,
+    productModelRequest: true
+  }), null);
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    testId: 'reasoning-mode-button',
+    insideComposer: true,
+    productModelRequest: true
+  }), 'composer_reasoning_control');
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    ariaControls: 'reasoning-menu',
+    insideComposer: true,
+    controlledMenuLabels: ['High', 'Pro'],
+    productModelRequest: true
+  }), 'composer_reasoning_control');
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    ariaLabel: 'Reasoning model',
+    insideComposer: true,
+    productModelRequest: true
+  }), 'composer_reasoning_control');
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    testId: 'model-switcher-dropdown-button',
+    ariaLabel: 'Reasoning effort',
+    insideComposer: true,
+    productModelRequest: true
+  }), 'composer_reasoning_control');
+  assert.equal(classifyChatgptModelControlRoute({
+    label: 'Pro',
+    testId: 'model-switcher-dropdown-button',
+    insideComposer: true,
+    controlledMenuLabels: ['High', 'Pro'],
+    productModelRequest: true
+  }), 'composer_reasoning_control');
+});
+
+test('chatgpt-controller: live metadata-free composer Pro passes the non-sending product preflight', async () => {
+  let promptInsertCount = 0;
+  let sendBoundaryCount = 0;
+  const composerRoot = { contains(node) { return node === composerPro; } };
+  const promptNode = {
+    closest(selector) { return selector === 'form' ? composerRoot : null; },
+    parentElement: null
+  };
+  const control = ({ label, aria = null, testId = null }) => ({
+    textContent: label,
+    getAttribute(name) {
+      if (name === 'aria-label') return aria;
+      if (name === 'data-testid') return testId;
+      return null;
+    },
+    getBoundingClientRect() { return { width: 68, height: 36, top: 659, bottom: 695, left: 730, right: 798 }; },
+    closest() { return null; }
+  });
+  const composerPro = control({ label: 'Pro' });
+  const accountPro = control({
+    label: 'Jacob Frantz Pro, open profile menu',
+    aria: 'Jacob Frantz Pro, open profile menu',
+    testId: 'accounts-profile-button'
+  });
+  const document = {
+    querySelector() { return promptNode; },
+    querySelectorAll() { return [composerPro, accountPro]; },
+    getElementById() { return null; }
+  };
+  const window = { getComputedStyle() { return { visibility: 'visible', display: 'block' }; } };
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return await Function('document', 'window', `return ${js}`)(document, window);
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'],
+        controlText: [], selectorStop: false, sendVisible: false
+      };
+      if (js.includes('reviewSendOnceMarker')) sendBoundaryCount += 1;
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { promptInsertCount += 1; },
+    async sendKey() { throw new Error('product_preflight_must_not_send'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt' } });
+  const result = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(result.preflightVerified, true);
+  assert.equal(result.modelEvidence, 'Pro');
+  assert.deepEqual(result.modelEvidenceCandidates, ['Pro']);
+  assert.equal(promptInsertCount, 0);
+  assert.equal(sendBoundaryCount, 0);
+});
+
+test('chatgpt-controller: Radix reasoning menu conflict fails during non-sending product preflight', async () => {
+  let promptInsertCount = 0;
+  let sendBoundaryCount = 0;
+  const menuItem = (label) => ({
+    textContent: label,
+    getAttribute() { return null; }
+  });
+  const reasoningMenu = {
+    querySelectorAll(selector) {
+      assert.match(selector, /data-radix-collection-item/);
+      return [menuItem('High'), menuItem('Pro')];
+    }
+  };
+  const composerRoot = { contains(node) { return node === composerPro; } };
+  const promptNode = {
+    closest(selector) { return selector === 'form' ? composerRoot : null; },
+    parentElement: null
+  };
+  const composerPro = {
+    textContent: 'Pro',
+    getAttribute(name) {
+      if (name === 'aria-controls') return 'reasoning-menu';
+      return null;
+    },
+    getBoundingClientRect() { return { width: 68, height: 36, top: 659, bottom: 695, left: 730, right: 798 }; },
+    closest() { return null; }
+  };
+  const document = {
+    querySelector() { return promptNode; },
+    querySelectorAll() { return [composerPro]; },
+    getElementById(id) { return id === 'reasoning-menu' ? reasoningMenu : null; }
+  };
+  const window = { getComputedStyle() { return { visibility: 'visible', display: 'block' }; } };
+  const page = {
+    async getUrl() { return 'https://chatgpt.com/'; },
+    async evaluate(js) {
+      if (js.includes('const hasTurnstile')) return readyState();
+      if (js.includes('agentifyModelStateMarker')) return await Function('document', 'window', `return ${js}`)(document, window);
+      if (js.includes('reviewSnapshotMarker')) return {
+        messages: [], modelEvidence: 'Pro', modelEvidenceCandidates: ['Pro'],
+        controlText: [], selectorStop: false, sendVisible: false
+      };
+      if (js.includes('reviewSendOnceMarker')) sendBoundaryCount += 1;
+      throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
+    },
+    async insertText() { promptInsertCount += 1; },
+    async sendKey() { throw new Error('product_preflight_must_not_send'); }
+  };
+  const controller = new ChatGPTController({ page, selectors: { promptTextarea: '#prompt' } });
+  const result = await controller.reviewPreflight({ expectedModel: 'GPT-5.6 Pro', timeoutMs: 5_000 });
+  assert.equal(result.preflightVerified, false);
+  assert.equal(result.modelEvidence, null);
+  assert.deepEqual(result.modelEvidenceCandidates, []);
+  assert.equal(promptInsertCount, 0);
+  assert.equal(sendBoundaryCount, 0);
+});
+
 test('chatgpt-controller: full Pro product ignores a separate reasoning Pro control', async () => {
   let productLabel = 'Thinking';
   let promptInsertCount = 0;
@@ -1323,7 +1482,7 @@ test('chatgpt-controller: full Pro product ignores a separate reasoning Pro cont
     label: () => productLabel,
     testId: 'model-switcher-dropdown-button'
   });
-  const reasoningPro = control({ label: 'Pro' });
+  const reasoningPro = control({ label: 'Pro', testId: 'reasoning-mode-button' });
   const document = {
     querySelector() { return promptNode; },
     querySelectorAll() { return [productModel, reasoningPro]; },
