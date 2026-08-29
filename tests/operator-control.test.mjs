@@ -67,6 +67,17 @@ test('operator control: Enter on a focused editable target cannot bypass the str
   assert.equal(p.calls.length, 0);
 });
 
+test('operator control: an unbound provider-root composer cannot be mutated outside strict first binding', async () => {
+  const p = page({ label: 'Message', kind: 'editable', focused: true });
+  const control = new NativeOperatorControl({ page: p });
+  const observed = await control.observe({ tabId: 'tab-1' });
+  await assert.rejects(
+    control.act({ tabId: 'tab-1', url: observed.url, revision: observed.revision, targetId: observed.controls[0].targetId, action: 'key', key: 'Backspace' }),
+    /operator_unbound_root_composer_mutation_forbidden/
+  );
+  assert.equal(p.calls.length, 0);
+});
+
 test('operator control: wait distinguishes delayed visible success from evidence-bearing timeout', async () => {
   let calls = 0;
   const delayed = {

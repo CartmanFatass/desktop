@@ -490,6 +490,134 @@ test('http-api: strict typed-failure cleanup retains the tab scope until close c
   assert.equal(completed.data.receipt.tabLifecycle.status, 'CLOSED');
 });
 
+test('http-api: first-binding strict reviews serialize the shared provider-root writer across tabs', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-root-writer-'));
+  const entered = [];
+  let markFirstEntered;
+  let markSecondEntered;
+  let markConcreteEntered;
+  let releaseFirst;
+  let releaseSecond;
+  let releaseConcrete;
+  let markSecondQueued;
+  let markDuplicateQueued;
+  const firstEntered = new Promise((resolve) => { markFirstEntered = resolve; });
+  const secondEntered = new Promise((resolve) => { markSecondEntered = resolve; });
+  const concreteEntered = new Promise((resolve) => { markConcreteEntered = resolve; });
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const concreteGate = new Promise((resolve) => { releaseConcrete = resolve; });
+  const secondQueued = new Promise((resolve) => { markSecondQueued = resolve; });
+  const duplicateQueued = new Promise((resolve) => { markDuplicateQueued = resolve; });
+  const awaitRuntimeFact = async (promise, label) => {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 2_000);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const controller = (name, enteredSignal, gate) => ({
+    runExclusive: async (fn) => await fn(),
+    async reviewQuery() {
+      entered.push(name);
+      enteredSignal();
+      await gate;
+      const error = new Error('review_composer_clear_failed');
+      error.data = { noClickProven: true };
+      throw error;
+    }
+  });
+  const controllers = new Map([
+    ['root-tab-a', controller('a', markFirstEntered, firstGate)],
+    ['root-tab-b', controller('b', markSecondEntered, secondGate)],
+    ['concrete-tab', controller('concrete', markConcreteEntered, concreteGate)]
+  ]);
+  const tabs = {
+    async ensureTab({ key }) {
+      if (key === 'root-a') return 'root-tab-a';
+      if (key === 'root-b') return 'root-tab-b';
+      return 'concrete-tab';
+    },
+    getControllerById(tabId) { return controllers.get(tabId); },
+    async closeTab() {},
+    listTabs: () => [
+      { id: 'root-tab-a', key: 'root-a', vendorId: 'chatgpt' },
+      { id: 'root-tab-b', key: 'root-b', vendorId: 'chatgpt' },
+      { id: 'concrete-tab', key: 'concrete', vendorId: 'chatgpt' }
+    ]
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default-tab',
+    serverId: 'sid-root-writer',
+    stateDir,
+    getStatus: async () => ({ ok: true }),
+    getSettings: async () => ({ maxInflightQueries: 3, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0 }),
+    onRuntimeChanged(snapshot) {
+      const waiting = snapshot.activeQueries.filter((item) => item.phase === 'waiting_unbound_root_writer').length;
+      if (snapshot.activeQueries.length >= 2 && waiting >= 1) markSecondQueued(snapshot);
+      if (snapshot.activeQueries.length >= 3 && waiting >= 2) markDuplicateQueued(snapshot);
+    }
+  });
+  t.after(() => { releaseFirst?.(); releaseSecond?.(); releaseConcrete?.(); server.close(); });
+  const port = server.address().port;
+  const makeBody = (suffix, { firstBinding = true } = {}) => {
+    const prompt = `root writer ${suffix}`;
+    return {
+      stableKey: `root-${suffix}`,
+      provider: 'chatgpt',
+      model: 'GPT-5.6 Pro',
+      conversationUrl: firstBinding ? 'https://chatgpt.com/' : 'https://chatgpt.com/c/concrete',
+      conversationId: firstBinding ? '__new__' : 'concrete',
+      idempotencyKey: `root-op-${suffix}`,
+      prompt,
+      promptSha256: reviewPlainTextIdentity(prompt).sourceSha256,
+      responsePath: path.join(stateDir, `root-${suffix}-response.md`),
+      timeoutMs: 60_000,
+      firstBinding
+    };
+  };
+
+  const firstRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('a') });
+  await firstEntered;
+  const concreteRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('concrete', { firstBinding: false }) });
+  await concreteEntered;
+  releaseConcrete();
+  const concreteResult = await concreteRequest;
+  const secondRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('b') });
+  await awaitRuntimeFact(secondQueued, 'the second root writer to queue');
+  const duplicateRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('b') });
+  const runtime = await awaitRuntimeFact(duplicateQueued, 'the duplicate root writer to queue');
+  const enteredBeforeRelease = [...entered];
+  const phasesBeforeRelease = runtime.activeQueries.map((item) => item.phase);
+  releaseFirst();
+  releaseSecond();
+  const [firstResult, secondResult, duplicateResult] = await Promise.all([firstRequest, secondRequest, duplicateRequest]);
+
+  assert.equal(runtime.activeQueries.length, 3);
+  assert.deepEqual(enteredBeforeRelease, ['a', 'concrete']);
+  assert.equal(phasesBeforeRelease.filter((phase) => phase === 'waiting_unbound_root_writer').length, 2);
+  assert.deepEqual(entered, ['a', 'concrete', 'b']);
+  assert.equal(concreteResult.res.status, 200);
+  assert.equal(concreteResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(firstResult.res.status, 200);
+  assert.equal(secondResult.res.status, 200);
+  assert.equal(duplicateResult.res.status, 200);
+  assert.equal(firstResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(secondResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  assert.equal(duplicateResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
+  const operations = (await readReviewTransportState(stateDir)).operations;
+  assert.equal(Object.keys(operations).filter((key) => key === 'root-op-b').length, 1);
+});
+
 async function req({ port, token, method, pth, body, headers = {} }) {
   const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
     method,

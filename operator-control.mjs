@@ -20,6 +20,18 @@ function boundedText(value, limit = 160) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function isUnboundProviderRoot(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const host = url.hostname.toLowerCase();
+    const pathname = url.pathname.replace(/\/+$/, '') || '/';
+    return (host === 'chatgpt.com' && pathname === '/') ||
+      (host === 'gemini.google.com' && (pathname === '/' || pathname === '/app'));
+  } catch {
+    return false;
+  }
+}
+
 function targetId(url, item) {
   return `target:${digest(JSON.stringify({ url, role: item.role, label: item.label, kind: item.kind, testId: item.testId, bounds: item.bounds, reasoningText: item.reasoningText || '' }))}`;
 }
@@ -172,12 +184,18 @@ export class NativeOperatorControl {
     const target = current.controls.filter((item) => item.targetId === wantedTargetId);
     if (target.length !== 1 || !target[0].actionable || FORBIDDEN.test(`${target[0].label} ${target[0].testId}`)) fail('operator_target_unavailable');
     const kind = String(action || '').trim().toLowerCase();
+    const keyValue = String(key || '');
+    const editableMutation = target[0].kind === 'editable' && (
+      kind === 'text' || kind === 'paste' ||
+      (kind === 'key' && ['Backspace', 'Delete', ' ', 'a'].includes(keyValue))
+    );
+    if (editableMutation && isUnboundProviderRoot(currentUrl)) fail('operator_unbound_root_composer_mutation_forbidden');
     if (kind === 'click') {
       const b = target[0].bounds; await this.page.moveMouse(b.x + b.w / 2, b.y + b.h / 2); await this.page.mouseDown(b.x + b.w / 2, b.y + b.h / 2, { button: 'left', clickCount: 1 }); await this.page.mouseUp(b.x + b.w / 2, b.y + b.h / 2, { button: 'left', clickCount: 1 });
     } else if (kind === 'key') {
-      if (!target[0].focused || !KEY_ALLOWLIST.has(String(key || ''))) fail('operator_key_target_not_focused');
-      if (target[0].kind === 'editable' && String(key) === 'Enter') fail('operator_send_capable_key_forbidden');
-      await this.page.sendKey(String(key), { modifiers: Array.isArray(modifiers) ? modifiers : [] });
+      if (!target[0].focused || !KEY_ALLOWLIST.has(keyValue)) fail('operator_key_target_not_focused');
+      if (target[0].kind === 'editable' && keyValue === 'Enter') fail('operator_send_capable_key_forbidden');
+      await this.page.sendKey(keyValue, { modifiers: Array.isArray(modifiers) ? modifiers : [] });
     } else if (kind === 'text' || kind === 'paste') {
       if (target[0].kind !== 'editable' || !textPath || !textSha256 || !path.isAbsolute(String(textPath))) fail('operator_text_preparation_invalid');
       const bytes = await fs.readFile(path.resolve(String(textPath))); const actualSha = digest(bytes);

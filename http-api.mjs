@@ -547,6 +547,7 @@ export function startHttpApi({
   const activeQueries = new Map(); // tabId -> runtime status
   const activeReviewQueries = new Map(); // runtime key -> strict-review status
   const activeReviewAdmissions = new Map(); // idempotency key -> exact fresh-operation fingerprint
+  const unboundRootWriters = new Map(); // provider/profile root -> ephemeral first-binding writer queue
   const activeQueryRuns = new Map(); // tabId -> in-process query promise
   const activeScopes = new Map(); // request scope -> runtime status
   const lastOutcomes = new Map(); // tabId -> last finished outcome
@@ -740,6 +741,37 @@ export function startHttpApi({
     try {
       onRuntimeChanged?.(runtimeSnapshot());
     } catch {}
+  };
+
+  const acquireUnboundRootWriter = async ({ provider, reviewRun }) => {
+    // One Agentify desktop instance owns one local browser profile per provider.
+    // Root-composer state may be shared by otherwise distinct tabs until the
+    // provider creates a concrete conversation, so first binding needs one
+    // short in-memory writer queue. This is not durable workflow state.
+    const providerToken = normalizeVendorToken(provider) || 'unknown';
+    const scope = `unbound-root:${providerToken}`;
+    let releaseSignal;
+    const entry = {
+      released: new Promise((resolve) => { releaseSignal = resolve; })
+    };
+    const previous = unboundRootWriters.get(scope) || null;
+    unboundRootWriters.set(scope, entry);
+    if (previous) {
+      reviewRun.phase = 'waiting_unbound_root_writer';
+      reviewRun.updatedAt = Date.now();
+      emitRuntimeChanged();
+      await previous.released;
+    }
+    reviewRun.phase = 'strict_transport';
+    reviewRun.updatedAt = Date.now();
+    emitRuntimeChanged();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseSignal();
+      if (unboundRootWriters.get(scope) === entry) unboundRootWriters.delete(scope);
+    };
   };
 
   const setActiveQuery = (tabId, item) => {
@@ -1185,7 +1217,11 @@ export function startHttpApi({
         };
         activeReviewQueries.set(runtimeKey, reviewRun);
         emitRuntimeChanged();
+        let releaseUnboundRootWriter = null;
         try {
+          if (body.firstBinding === true && body.verifyExisting !== true) {
+            releaseUnboundRootWriter = await acquireUnboundRootWriter({ provider: body.provider, reviewRun });
+          }
           if (!joinsExactActiveOperation) {
             reserveReviewScope(reviewRun.stableKey ? `key:${reviewRun.stableKey}` : null);
             reserveReviewScope(reviewRun.tabId ? `tab:${reviewRun.tabId}` : null);
@@ -1268,6 +1304,7 @@ export function startHttpApi({
           }
           throw error;
         } finally {
+          releaseUnboundRootWriter?.();
           for (const scope of reviewScopes) clearScope(scope, reviewRun.id);
           activeReviewQueries.delete(runtimeKey);
           if (reserveSendCapacity) {
