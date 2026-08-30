@@ -3175,10 +3175,10 @@ export class ChatGPTController {
     return lastSnapshot;
   }
 
-  async #readChatgptCombinedProControl() {
+  async #openChatgptTargetMenu() {
     const promptSelector = this.selectors.promptTextarea || '#prompt-textarea';
-    return await this.#eval(`(() => {
-      const agentifyChatgptCombinedProControlStateMarker = true;
+    const target = await this.#eval(`(() => {
+      const agentifyOpenChatgptTargetMenuMarker = true;
       const normalize = (value) => String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim();
       const visible = (node) => {
         const rect = node?.getBoundingClientRect?.();
@@ -3186,10 +3186,13 @@ export class ChatGPTController {
         return !!rect && rect.width > 0 && rect.height > 0 &&
           style?.display !== 'none' && style?.visibility !== 'hidden';
       };
+      const openMenus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter(visible)
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+      if (openMenus.length === 1) return { ok: true, alreadyOpen: true, menuCount: 1 };
+      if (openMenus.length > 1) return { ok: false, triggerCount: 0, menuCount: openMenus.length };
       const prompt = document.querySelector(${JSON.stringify(promptSelector)});
-      if (!prompt || !visible(prompt)) {
-        return { matched: false, providerVisibleLabel: null, scopedMatchCount: 0, error: 'prompt_unavailable' };
-      }
+      if (!prompt || !visible(prompt)) return { ok: false, triggerCount: 0, menuCount: 0 };
       const promptRect = prompt.getBoundingClientRect();
       const composer =
         prompt.closest('form') ||
@@ -3199,20 +3202,94 @@ export class ChatGPTController {
       const inComposerNeighborhood = (node) => {
         if (composer?.contains?.(node)) return true;
         const rect = node.getBoundingClientRect();
-        const verticalOverlap = rect.bottom >= promptRect.top - 48 && rect.top <= promptRect.bottom + 48;
-        return verticalOverlap && rect.left >= promptRect.left - 48 && rect.right <= promptRect.right + 192;
+        return rect.bottom >= promptRect.top - 48 && rect.top <= promptRect.bottom + 48 &&
+          rect.left >= promptRect.left - 48 && rect.right <= promptRect.right + 192;
       };
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"]'))
+      const triggers = Array.from(document.querySelectorAll('button[aria-haspopup="menu"], [role="button"][aria-haspopup="menu"]'))
         .filter(visible)
         .filter((node) => !node.closest('[role="menu"], [role="listbox"]'))
         .filter(inComposerNeighborhood)
-        .filter((node) => normalize(node.getAttribute('aria-label') || node.textContent) === 'Pro');
+        .filter((node) => /^(?:High|Pro)$/i.test(normalize(node.getAttribute('aria-label') || node.textContent)));
+      if (triggers.length !== 1) return { ok: false, triggerCount: triggers.length, menuCount: 0 };
+      const rect = triggers[0].getBoundingClientRect();
+      return { ok: true, alreadyOpen: false, triggerCount: 1, menuCount: 0, rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height } };
+    })()`);
+    if (!target?.ok) {
+      const error = new Error(
+        target?.triggerCount > 1 || target?.menuCount > 1
+          ? 'chatgpt_target_menu_ambiguous'
+          : 'chatgpt_target_menu_unavailable'
+      );
+      error.data = { triggerCount: target?.triggerCount || 0, menuCount: target?.menuCount || 0 };
+      throw error;
+    }
+    if (!target.alreadyOpen) {
+      await this.#clickAt(target.rect.x + target.rect.w / 2, target.rect.y + target.rect.h / 2);
+      await sleep(150);
+    }
+    const opened = await this.#eval(`(() => {
+      const agentifyVerifyChatgptTargetMenuOpenMarker = true;
+      const visible = (node) => {
+        const rect = node?.getBoundingClientRect?.();
+        const style = node ? window.getComputedStyle(node) : null;
+        return !!rect && rect.width > 0 && rect.height > 0 &&
+          style?.display !== 'none' && style?.visibility !== 'hidden';
+      };
+      const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter(visible)
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+      return { opened: menus.length === 1, menuCount: menus.length };
+    })()`);
+    if (!opened?.opened) throw new Error('chatgpt_target_menu_open_unconfirmed');
+    return { ...target, ...opened };
+  }
+
+  async #closeChatgptTargetMenu() {
+    await this.#sendKey('Escape');
+    await sleep(100);
+    const result = await this.#eval(`(() => {
+      const agentifyCloseChatgptTargetMenuMarker = true;
+      const visible = (node) => {
+        const rect = node?.getBoundingClientRect?.();
+        const style = node ? window.getComputedStyle(node) : null;
+        return !!rect && rect.width > 0 && rect.height > 0 &&
+          style?.display !== 'none' && style?.visibility !== 'hidden';
+      };
+      const count = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter(visible)
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'))
+        .length;
+      return { closed: count === 0, visibleTargetMenuCount: count };
+    })()`);
+    if (!result?.closed) throw new Error('chatgpt_target_menu_close_unconfirmed');
+    return result;
+  }
+
+  async #readChatgptProductModelState(productModel) {
+    const requested = String(productModel || '').trim();
+    if (!requested) throw new Error('missing_product_model');
+    return await this.#eval(`(() => {
+      const agentifyChatgptProductModelStateMarker = true;
+      const requested = ${JSON.stringify(requested)};
+      const normalize = (value) => String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim();
+      const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+      const records = menus.flatMap((menu) => Array.from(menu.querySelectorAll(
+        '[data-testid="composer-model-picker-slider-advanced-view"] [role="menuitemradio"]'
+      )).map((node) => ({
+        label: normalize(node.getAttribute('aria-label') || node.textContent),
+        selected: node.getAttribute('aria-checked') === 'true' || node.getAttribute('data-state') === 'checked'
+      }))).filter((record) => record.label === requested);
+      const selected = records.filter((record) => record.selected);
       return {
-        matched: candidates.length === 1,
-        providerVisibleLabel: candidates.length === 1 ? 'Pro' : null,
-        selectionView: 'chatgpt_combined_pro_control',
-        role: 'button',
-        scopedMatchCount: candidates.length
+        matched: menus.length === 1 && records.length === 1 && selected.length === 1,
+        requestedProductModel: requested,
+        matchedLabel: selected.length === 1 ? selected[0].label : null,
+        selectionView: 'chatgpt_target_menu_product_list',
+        role: 'menuitemradio',
+        menuCount: menus.length,
+        scopedMatchCount: records.length,
+        selectedMatchCount: selected.length
       };
     })()`);
   }
@@ -3220,51 +3297,122 @@ export class ChatGPTController {
   async #ensureChatgptProductModel(productModel) {
     const requested = String(productModel || '').trim();
     if (!requested) throw new Error('missing_product_model');
-    if (requested !== 'GPT-5.6 Sol') throw new Error('unsupported_chatgpt_product_model');
-    const state = await this.#readChatgptCombinedProControl();
-    if (!state?.matched) {
-      const error = new Error(
-        state?.scopedMatchCount > 1
-          ? 'chatgpt_combined_pro_control_ambiguous'
-          : 'chatgpt_combined_pro_control_unavailable'
-      );
-      error.data = { requestedProductModel: requested, scopedMatchCount: state?.scopedMatchCount || 0 };
+    await this.#openChatgptTargetMenu();
+    try {
+      const state = await this.#readChatgptProductModelState(requested);
+      if (!state?.matched) {
+        const error = new Error('chatgpt_product_model_unavailable_or_unselected');
+        error.data = {
+          requestedProductModel: requested,
+          menuCount: state?.menuCount || 0,
+          scopedMatchCount: state?.scopedMatchCount || 0,
+          selectedMatchCount: state?.selectedMatchCount || 0
+        };
+        throw error;
+      }
+      const closure = await this.#closeChatgptTargetMenu();
+      return { ...state, ...closure, selectionMethod: 'selected_product_menuitemradio_observed' };
+    } catch (error) {
+      await this.#closeChatgptTargetMenu().catch(() => {});
       throw error;
     }
-    return {
-      ...state,
-      requestedProductModel: requested,
-      matchedLabel: requested,
-      bindingBasis: 'provider_visible_combined_pro_control',
-      selectionMethod: 'already_selected_combined_pro_control',
-      closed: true
-    };
   }
 
-  async #ensureChatgptReasoningEffort(reasoningEffort) {
+  async #readChatgptReasoningEffortState(reasoningEffort) {
     const requested = String(reasoningEffort || '').trim();
     if (!requested) throw new Error('missing_reasoning_effort');
-    if (requested !== 'Pro') throw new Error('unsupported_chatgpt_reasoning_effort');
-    const state = await this.#readChatgptCombinedProControl();
-    if (!state?.matched) {
-      const error = new Error(
-        state?.scopedMatchCount > 1
-          ? 'chatgpt_combined_pro_control_ambiguous'
-          : 'chatgpt_combined_pro_control_unavailable'
-      );
-      error.data = { requestedReasoningEffort: requested, scopedMatchCount: state?.scopedMatchCount || 0 };
+    return await this.#eval(`(() => {
+      const agentifyChatgptReasoningSliderStateMarker = true;
+      const requested = ${JSON.stringify(requested)};
+      const normalize = (value) => String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim();
+      const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+      const roots = menus.flatMap((menu) => Array.from(menu.querySelectorAll('[data-model-reasoning-effort-slider]')));
+      const sliders = roots.flatMap((root) => Array.from(root.querySelectorAll('[role="slider"]')));
+      const slider = sliders.length === 1 ? sliders[0] : null;
+      const min = Number(slider?.getAttribute('aria-valuemin'));
+      const max = Number(slider?.getAttribute('aria-valuemax'));
+      const value = Number(slider?.getAttribute('aria-valuenow'));
+      const owner = roots.length === 1 ? roots[0].closest('[role="menuitem"][aria-label="Power"]') : null;
+      const described = String(owner?.getAttribute('aria-describedby') || '')
+        .split(/\\s+/)
+        .filter(Boolean)
+        .map((id) => normalize(document.getElementById(id)?.textContent))
+        .filter(Boolean);
+      const renderedLabel = normalize(described[0] || '').replace(/,.*/, '');
+      return {
+        matched: menus.length === 1 && roots.length === 1 && sliders.length === 1 && !!owner &&
+          Number.isFinite(min) && Number.isFinite(max) && Number.isFinite(value) &&
+          max - min === 4 && value === max && renderedLabel === requested,
+        requestedReasoningEffort: requested,
+        matchedLabel: renderedLabel === requested ? renderedLabel : null,
+        selectionView: 'chatgpt_target_menu_reasoning_slider',
+        role: 'slider',
+        actionOwner: owner ? 'Power' : null,
+        menuCount: menus.length,
+        scopedMatchCount: roots.length,
+        sliderCount: sliders.length,
+        ownerCount: owner ? 1 : 0,
+        min,
+        max,
+        value,
+        targetValue: max
+      };
+    })()`);
+  }
+
+  async #focusChatgptReasoningEffortOwner() {
+    const result = await this.#eval(`(() => {
+      const agentifyFocusChatgptReasoningEffortOwnerMarker = true;
+      const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+      const owners = menus.flatMap((menu) => Array.from(menu.querySelectorAll(
+        '[role="menuitem"][aria-label="Power"]'
+      )));
+      if (owners.length !== 1) return { focused: false, ownerCount: owners.length };
+      owners[0].focus();
+      return { focused: document.activeElement === owners[0], ownerCount: 1 };
+    })()`);
+    if (!result?.focused) throw new Error('reasoning_effort_power_owner_unavailable');
+    return result;
+  }
+
+  async #ensureChatgptReasoningEffort(reasoningEffort, timeoutMs = 20_000) {
+    const requested = String(reasoningEffort || '').trim();
+    if (!requested) throw new Error('missing_reasoning_effort');
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    await this.#openChatgptTargetMenu();
+    try {
+      let state = await this.#readChatgptReasoningEffortState(requested);
+      if (state?.matched) {
+        const closure = await this.#closeChatgptTargetMenu();
+        return { ...state, ...closure, selectionMethod: 'already_selected_exact_reasoning_effort', stepCount: 0 };
+      }
+      await this.#focusChatgptReasoningEffortOwner();
+      let stepCount = 0;
+      while (Date.now() < deadline && stepCount < 5) {
+        if (!Number.isFinite(state?.min) || !Number.isFinite(state?.max) || !Number.isFinite(state?.value)) {
+          throw new Error('reasoning_effort_slider_unavailable');
+        }
+        if (state.max - state.min !== 4) throw new Error('reasoning_effort_slider_position_count_invalid');
+        if (state.value < state.max) await this.#sendKey('ArrowRight');
+        else if (state.value > state.max) await this.#sendKey('ArrowLeft');
+        else throw new Error('reasoning_effort_label_mismatch');
+        stepCount += 1;
+        await sleep(100);
+        state = await this.#readChatgptReasoningEffortState(requested);
+        if (state?.matched) {
+          const closure = await this.#closeChatgptTargetMenu();
+          return { ...state, ...closure, selectionMethod: 'bounded_slider_arrow_steps', stepCount };
+        }
+      }
+      const error = new Error('reasoning_effort_switch_unconfirmed');
+      error.data = { requestedReasoningEffort: requested, stepCount, value: state?.value };
+      throw error;
+    } catch (error) {
+      await this.#closeChatgptTargetMenu().catch(() => {});
       throw error;
     }
-    return {
-      ...state,
-      requestedReasoningEffort: requested,
-      matchedLabel: requested,
-      actionOwner: 'Pro',
-      bindingBasis: 'provider_visible_combined_pro_control',
-      selectionMethod: 'already_selected_combined_pro_control',
-      stepCount: 0,
-      closed: true
-    };
   }
   async reviewQuery({
     prompt,

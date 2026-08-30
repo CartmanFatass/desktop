@@ -976,39 +976,90 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
   assert.equal(modelLabelMatches('High', 'Pro'), false);
 });
 
-function combinedProControlFixture(scopedMatchCount = 1) {
-  let sendActions = 0;
+function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', triggerCount = 1 } = {}) {
+  let menuOpen = false;
+  let value = initialValue;
   let pointerActivations = 0;
-  let keyActivations = 0;
+  let arrowRightCount = 0;
+  let sendActions = 0;
   const page = {
     async getUrl() { return 'https://chatgpt.com/'; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
-      if (js.includes('agentifyChatgptCombinedProControlStateMarker')) {
+      if (js.includes('agentifyOpenChatgptTargetMenuMarker')) {
+        if (menuOpen) return { ok: true, alreadyOpen: true, menuCount: 1 };
+        if (triggerCount !== 1) return { ok: false, triggerCount, menuCount: 0 };
+        return { ok: true, alreadyOpen: false, triggerCount: 1, menuCount: 0, rect: { x: 10, y: 10, w: 20, h: 20 } };
+      }
+      if (js.includes('agentifyVerifyChatgptTargetMenuOpenMarker')) {
+        return { opened: menuOpen, menuCount: menuOpen ? 1 : 0 };
+      }
+      if (js.includes('agentifyCloseChatgptTargetMenuMarker')) {
+        return { closed: !menuOpen, visibleTargetMenuCount: menuOpen ? 1 : 0 };
+      }
+      if (js.includes('agentifyChatgptProductModelStateMarker')) {
         return {
-          matched: scopedMatchCount === 1,
-          providerVisibleLabel: scopedMatchCount === 1 ? 'Pro' : null,
-          selectionView: 'chatgpt_combined_pro_control',
-          role: 'button',
-          scopedMatchCount
+          matched: menuOpen && productModel === 'GPT-5.6 Sol',
+          requestedProductModel: 'GPT-5.6 Sol',
+          matchedLabel: menuOpen && productModel === 'GPT-5.6 Sol' ? productModel : null,
+          selectionView: 'chatgpt_target_menu_product_list',
+          role: 'menuitemradio',
+          menuCount: menuOpen ? 1 : 0,
+          scopedMatchCount: menuOpen && productModel === 'GPT-5.6 Sol' ? 1 : 0,
+          selectedMatchCount: menuOpen && productModel === 'GPT-5.6 Sol' ? 1 : 0
         };
+      }
+      if (js.includes('agentifyChatgptReasoningSliderStateMarker')) {
+        return {
+          matched: menuOpen && value === 4,
+          requestedReasoningEffort: 'Pro',
+          matchedLabel: menuOpen && value === 4 ? 'Pro' : null,
+          selectionView: 'chatgpt_target_menu_reasoning_slider',
+          role: 'slider',
+          actionOwner: menuOpen ? 'Power' : null,
+          menuCount: menuOpen ? 1 : 0,
+          scopedMatchCount: menuOpen ? 1 : 0,
+          sliderCount: menuOpen ? 1 : 0,
+          ownerCount: menuOpen ? 1 : 0,
+          min: 0,
+          max: 4,
+          value,
+          targetValue: 4
+        };
+      }
+      if (js.includes('agentifyFocusChatgptReasoningEffortOwnerMarker')) {
+        return { focused: menuOpen, ownerCount: menuOpen ? 1 : 0 };
       }
       if (js.includes('reviewSendOnceMarker')) sendActions += 1;
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
-    async moveMouse() { pointerActivations += 1; },
-    async mouseDown() { pointerActivations += 1; },
-    async mouseUp() { pointerActivations += 1; },
-    async sendKey() { keyActivations += 1; }
+    async moveMouse() {},
+    async mouseDown() {},
+    async mouseUp() {
+      pointerActivations += 1;
+      menuOpen = true;
+    },
+    async sendKey(key) {
+      if (key === 'Escape') {
+        menuOpen = false;
+        return;
+      }
+      if (key === 'ArrowRight') {
+        arrowRightCount += 1;
+        value += 1;
+        return;
+      }
+      throw new Error(`forbidden_target_key:${key}`);
+    }
   };
   return {
     page,
-    state: () => ({ sendActions, pointerActivations, keyActivations })
+    state: () => ({ menuOpen, value, pointerActivations, arrowRightCount, sendActions })
   };
 }
 
-test('chatgpt-controller: one visible composer Pro control binds product and effort without UI mutation', async () => {
-  const fixture = combinedProControlFixture();
+test('chatgpt-controller: one target menu proves selected product and Pro effort without Send', async () => {
+  const fixture = targetMenuFixture();
   const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
   const result = await controller.reviewPreflight({
     productModel: 'GPT-5.6 Sol',
@@ -1017,35 +1068,51 @@ test('chatgpt-controller: one visible composer Pro control binds product and eff
   });
 
   assert.equal(result.productModelEvidence.matchedLabel, 'GPT-5.6 Sol');
-  assert.equal(result.productModelEvidence.providerVisibleLabel, 'Pro');
-  assert.equal(result.productModelEvidence.selectionView, 'chatgpt_combined_pro_control');
+  assert.equal(result.productModelEvidence.selectionView, 'chatgpt_target_menu_product_list');
   assert.equal(result.reasoningEffortEvidence.matchedLabel, 'Pro');
-  assert.equal(result.reasoningEffortEvidence.providerVisibleLabel, 'Pro');
+  assert.equal(result.reasoningEffortEvidence.selectionView, 'chatgpt_target_menu_reasoning_slider');
   assert.equal(result.reasoningEffortEvidence.stepCount, 0);
   assert.deepEqual(fixture.state(), {
-    sendActions: 0,
-    pointerActivations: 0,
-    keyActivations: 0
+    menuOpen: false,
+    value: 4,
+    pointerActivations: 2,
+    arrowRightCount: 0,
+    sendActions: 0
   });
 });
 
-test('chatgpt-controller: ambiguous composer Pro controls fail before UI mutation', async () => {
-  const fixture = combinedProControlFixture(2);
+test('chatgpt-controller: one target menu advances High to Pro before closing', async () => {
+  const fixture = targetMenuFixture({ initialValue: 2 });
   const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  const result = await controller.reviewPreflight({
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    timeoutMs: 5_000
+  });
 
+  assert.equal(result.reasoningEffortEvidence.stepCount, 2);
+  assert.deepEqual(fixture.state(), {
+    menuOpen: false,
+    value: 4,
+    pointerActivations: 2,
+    arrowRightCount: 2,
+    sendActions: 0
+  });
+});
+
+test('chatgpt-controller: ambiguous target-menu triggers fail before activation', async () => {
+  const fixture = targetMenuFixture({ triggerCount: 2 });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
   await assert.rejects(
     controller.reviewPreflight({
       productModel: 'GPT-5.6 Sol',
       reasoningEffort: 'Pro',
       timeoutMs: 5_000
     }),
-    /chatgpt_combined_pro_control_ambiguous/
+    /chatgpt_target_menu_ambiguous/
   );
-  assert.deepEqual(fixture.state(), {
-    sendActions: 0,
-    pointerActivations: 0,
-    keyActivations: 0
-  });
+  assert.equal(fixture.state().pointerActivations, 0);
+  assert.equal(fixture.state().sendActions, 0);
 });
 
 test('chatgpt-controller: ChatGPT profile snapshot reports aggregate cookie presence and root binding without composer input', async () => {
