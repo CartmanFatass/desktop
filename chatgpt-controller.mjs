@@ -3191,7 +3191,7 @@ export class ChatGPTController {
         .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
       if (openMenus.length === 1) return { ok: true, alreadyOpen: true, menuCount: 1 };
       if (openMenus.length > 1) return { ok: false, triggerCount: 0, menuCount: openMenus.length };
-      const prompt = document.querySelector(${JSON.stringify(promptSelector)});
+      const prompt = Array.from(document.querySelectorAll(${JSON.stringify(promptSelector)})).find(visible);
       if (!prompt || !visible(prompt)) return { ok: false, triggerCount: 0, menuCount: 0 };
       const promptRect = prompt.getBoundingClientRect();
       const composer =
