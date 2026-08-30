@@ -3309,28 +3309,21 @@ export class ChatGPTController {
     })()`);
   }
 
-  async #ensureChatgptProductModel(productModel) {
+  async #verifyChatgptProductModelInOpenMenu(productModel) {
     const requested = String(productModel || '').trim();
     if (!requested) throw new Error('missing_product_model');
-    await this.#openChatgptTargetMenu();
-    try {
-      const state = await this.#readChatgptProductModelState(requested);
-      if (!state?.matched) {
-        const error = new Error('chatgpt_product_model_unavailable_or_unselected');
-        error.data = {
-          requestedProductModel: requested,
-          menuCount: state?.menuCount || 0,
-          scopedMatchCount: state?.scopedMatchCount || 0,
-          selectedMatchCount: state?.selectedMatchCount || 0
-        };
-        throw error;
-      }
-      const closure = await this.#closeChatgptTargetMenu();
-      return { ...state, ...closure, selectionMethod: 'selected_product_menuitemradio_observed' };
-    } catch (error) {
-      await this.#closeChatgptTargetMenu().catch(() => {});
+    const state = await this.#readChatgptProductModelState(requested);
+    if (!state?.matched) {
+      const error = new Error('chatgpt_product_model_unavailable_or_unselected');
+      error.data = {
+        requestedProductModel: requested,
+        menuCount: state?.menuCount || 0,
+        scopedMatchCount: state?.scopedMatchCount || 0,
+        selectedMatchCount: state?.selectedMatchCount || 0
+      };
       throw error;
     }
+    return { ...state, selectionMethod: 'selected_product_menuitemradio_observed' };
   }
 
   async #readChatgptReasoningEffortState(reasoningEffort) {
@@ -3392,42 +3385,87 @@ export class ChatGPTController {
     return result;
   }
 
+  async #verifyChatgptReasoningEffortInOpenMenu(reasoningEffort, deadline) {
+    const requested = String(reasoningEffort || '').trim();
+    if (!requested) throw new Error('missing_reasoning_effort');
+    let state = await this.#readChatgptReasoningEffortState(requested);
+    if (state?.matched) {
+      return { ...state, selectionMethod: 'already_selected_exact_reasoning_effort', stepCount: 0 };
+    }
+    await this.#focusChatgptReasoningEffortOwner();
+    let stepCount = 0;
+    while (Date.now() < deadline && stepCount < 5) {
+      if (!Number.isFinite(state?.min) || !Number.isFinite(state?.max) || !Number.isFinite(state?.value)) {
+        throw new Error('reasoning_effort_slider_unavailable');
+      }
+      if (state.max - state.min !== 4) throw new Error('reasoning_effort_slider_position_count_invalid');
+      if (state.value < state.max) await this.#sendKey('ArrowRight');
+      else if (state.value > state.max) await this.#sendKey('ArrowLeft');
+      else throw new Error('reasoning_effort_label_mismatch');
+      stepCount += 1;
+      await sleep(100);
+      state = await this.#readChatgptReasoningEffortState(requested);
+      if (state?.matched) {
+        return { ...state, selectionMethod: 'bounded_slider_arrow_steps', stepCount };
+      }
+    }
+    const error = new Error('reasoning_effort_switch_unconfirmed');
+    error.data = { requestedReasoningEffort: requested, stepCount, value: state?.value };
+    throw error;
+  }
+
   async #ensureChatgptReasoningEffort(reasoningEffort, timeoutMs = 20_000) {
     const requested = String(reasoningEffort || '').trim();
     if (!requested) throw new Error('missing_reasoning_effort');
     const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
-    await this.#openChatgptTargetMenu();
+    let evidence;
+    let failure = null;
     try {
-      let state = await this.#readChatgptReasoningEffortState(requested);
-      if (state?.matched) {
-        const closure = await this.#closeChatgptTargetMenu();
-        return { ...state, ...closure, selectionMethod: 'already_selected_exact_reasoning_effort', stepCount: 0 };
-      }
-      await this.#focusChatgptReasoningEffortOwner();
-      let stepCount = 0;
-      while (Date.now() < deadline && stepCount < 5) {
-        if (!Number.isFinite(state?.min) || !Number.isFinite(state?.max) || !Number.isFinite(state?.value)) {
-          throw new Error('reasoning_effort_slider_unavailable');
-        }
-        if (state.max - state.min !== 4) throw new Error('reasoning_effort_slider_position_count_invalid');
-        if (state.value < state.max) await this.#sendKey('ArrowRight');
-        else if (state.value > state.max) await this.#sendKey('ArrowLeft');
-        else throw new Error('reasoning_effort_label_mismatch');
-        stepCount += 1;
-        await sleep(100);
-        state = await this.#readChatgptReasoningEffortState(requested);
-        if (state?.matched) {
-          const closure = await this.#closeChatgptTargetMenu();
-          return { ...state, ...closure, selectionMethod: 'bounded_slider_arrow_steps', stepCount };
-        }
-      }
-      const error = new Error('reasoning_effort_switch_unconfirmed');
-      error.data = { requestedReasoningEffort: requested, stepCount, value: state?.value };
-      throw error;
+      await this.#openChatgptTargetMenu();
+      evidence = await this.#verifyChatgptReasoningEffortInOpenMenu(requested, deadline);
     } catch (error) {
-      await this.#closeChatgptTargetMenu().catch(() => {});
-      throw error;
+      failure = error;
     }
+    let closure;
+    try {
+      closure = await this.#closeChatgptTargetMenu();
+    } catch (error) {
+      if (!failure) failure = error;
+    }
+    if (failure) throw failure;
+    return { ...evidence, ...closure };
+  }
+
+  async #ensureChatgptStrictAxes(productModel, reasoningEffort, timeoutMs = 20_000) {
+    const requestedProductModel = String(productModel || '').trim();
+    if (!requestedProductModel) throw new Error('missing_product_model');
+    const requestedReasoningEffort = String(reasoningEffort || '').trim();
+    if (!requestedReasoningEffort) throw new Error('missing_reasoning_effort');
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+    let productModelEvidence;
+    let reasoningEffortEvidence;
+    let failure = null;
+    try {
+      await this.#openChatgptTargetMenu();
+      productModelEvidence = await this.#verifyChatgptProductModelInOpenMenu(requestedProductModel);
+      reasoningEffortEvidence = await this.#verifyChatgptReasoningEffortInOpenMenu(
+        requestedReasoningEffort,
+        deadline
+      );
+    } catch (error) {
+      failure = error;
+    }
+    let closure;
+    try {
+      closure = await this.#closeChatgptTargetMenu();
+    } catch (error) {
+      if (!failure) failure = error;
+    }
+    if (failure) throw failure;
+    return {
+      productModelEvidence: { ...productModelEvidence, ...closure },
+      reasoningEffortEvidence: { ...reasoningEffortEvidence, ...closure }
+    };
   }
   async reviewQuery({
     prompt,
@@ -3459,8 +3497,11 @@ export class ChatGPTController {
       let reasoningEffortEvidence = null;
       if (provider === 'chatgpt.com') {
         if (typeof reasoningEffort !== 'string' || !reasoningEffort.trim()) throw new Error('missing_reasoning_effort');
-        productModelEvidence = await this.#ensureChatgptProductModel(productModel, Math.min(Math.max(1, deadline - Date.now()), 60_000));
-        reasoningEffortEvidence = await this.#ensureChatgptReasoningEffort(reasoningEffort, Math.min(Math.max(1, deadline - Date.now()), 60_000));
+        ({ productModelEvidence, reasoningEffortEvidence } = await this.#ensureChatgptStrictAxes(
+          productModel,
+          reasoningEffort,
+          Math.min(Math.max(1, deadline - Date.now()), 60_000)
+        ));
       } else if (provider === 'gemini.google.com') {
         if (reasoningEffort !== null) throw new Error('reasoning_effort_must_be_null');
         const selected = productModel === '__selected__'
@@ -3519,8 +3560,11 @@ export class ChatGPTController {
         throw error;
       }
       if (provider === 'chatgpt.com') {
-        productModelEvidence = await this.#ensureChatgptProductModel(productModel, Math.min(Math.max(1, deadline - Date.now()), 60_000));
-        reasoningEffortEvidence = await this.#ensureChatgptReasoningEffort(reasoningEffort, Math.min(Math.max(1, deadline - Date.now()), 60_000));
+        ({ productModelEvidence, reasoningEffortEvidence } = await this.#ensureChatgptStrictAxes(
+          productModel,
+          reasoningEffort,
+          Math.min(Math.max(1, deadline - Date.now()), 60_000)
+        ));
         if (!productModelEvidence?.matched || !reasoningEffortEvidence?.matched) {
           const error = new Error('review_target_mismatch_at_send');
           error.data = { noClickProven: true };
@@ -3699,8 +3743,11 @@ export class ChatGPTController {
     if (provider === 'chatgpt.com') {
       const requestedReasoningEffort = String(reasoningEffort || '').trim();
       if (!requestedReasoningEffort) throw new Error('missing_reasoning_effort');
-      productModelEvidence = await this.#ensureChatgptProductModel(requestedProductModel, Math.max(1, deadline - Date.now()));
-      reasoningEffortEvidence = await this.#ensureChatgptReasoningEffort(requestedReasoningEffort, Math.max(1, deadline - Date.now()));
+      ({ productModelEvidence, reasoningEffortEvidence } = await this.#ensureChatgptStrictAxes(
+        requestedProductModel,
+        requestedReasoningEffort,
+        Math.max(1, deadline - Date.now())
+      ));
     } else if (provider === 'gemini.google.com') {
       if (reasoningEffort !== null) throw new Error('reasoning_effort_must_be_null');
       const verified = await this.#ensureExpectedModel(requestedProductModel, Math.max(1, deadline - Date.now()));

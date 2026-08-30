@@ -979,6 +979,7 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
 function targetMenuFixture({
   initialValue = 4,
   productModel = 'GPT-5.6 Sol',
+  reasoningLabel = 'Pro',
   triggerCount = 1,
   menuOpenAfterChecks = 0,
   openedMenuCount = 1
@@ -989,6 +990,7 @@ function targetMenuFixture({
   let pointerActivations = 0;
   let arrowRightCount = 0;
   let sendActions = 0;
+  let closeActions = 0;
   const verificationChecks = [];
   const page = {
     async getUrl() { return 'https://chatgpt.com/'; },
@@ -1028,9 +1030,9 @@ function targetMenuFixture({
       }
       if (js.includes('agentifyChatgptReasoningSliderStateMarker')) {
         return {
-          matched: menuOpen && value === 4,
+          matched: menuOpen && value === 4 && reasoningLabel === 'Pro',
           requestedReasoningEffort: 'Pro',
-          matchedLabel: menuOpen && value === 4 ? 'Pro' : null,
+          matchedLabel: menuOpen && reasoningLabel === 'Pro' ? reasoningLabel : null,
           selectionView: 'chatgpt_target_menu_reasoning_slider',
           role: 'slider',
           actionOwner: menuOpen ? 'Power' : null,
@@ -1060,6 +1062,7 @@ function targetMenuFixture({
     },
     async sendKey(key) {
       if (key === 'Escape') {
+        closeActions += 1;
         menuOpen = false;
         menuPending = false;
         return;
@@ -1075,6 +1078,7 @@ function targetMenuFixture({
   return {
     page,
     state: () => ({ menuOpen, value, pointerActivations, arrowRightCount, sendActions }),
+    closureCount: () => closeActions,
     verificationChecks: () => [...verificationChecks]
   };
 }
@@ -1096,10 +1100,13 @@ test('chatgpt-controller: one target menu proves selected product and Pro effort
   assert.deepEqual(fixture.state(), {
     menuOpen: false,
     value: 4,
-    pointerActivations: 2,
+    pointerActivations: 1,
     arrowRightCount: 0,
     sendActions: 0
   });
+  assert.equal(result.productModelEvidence.closed, true);
+  assert.equal(result.reasoningEffortEvidence.closed, true);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: one target menu advances High to Pro before closing', async () => {
@@ -1115,10 +1122,56 @@ test('chatgpt-controller: one target menu advances High to Pro before closing', 
   assert.deepEqual(fixture.state(), {
     menuOpen: false,
     value: 4,
-    pointerActivations: 2,
+    pointerActivations: 1,
     arrowRightCount: 2,
     sendActions: 0
   });
+  assert.equal(fixture.closureCount(), 1);
+});
+
+test('chatgpt-controller: product mismatch closes the shared target menu without Send', async () => {
+  const fixture = targetMenuFixture({ productModel: 'GPT-5.6 Other' });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  await assert.rejects(
+    controller.reviewPreflight({
+      productModel: 'GPT-5.6 Sol',
+      reasoningEffort: 'Pro',
+      timeoutMs: 5_000
+    }),
+    (error) => {
+      assert.equal(error.message, 'chatgpt_product_model_unavailable_or_unselected');
+      assert.deepEqual(error.data, {
+        requestedProductModel: 'GPT-5.6 Sol',
+        menuCount: 1,
+        scopedMatchCount: 0,
+        selectedMatchCount: 0
+      });
+      return true;
+    }
+  );
+
+  assert.equal(fixture.state().menuOpen, false);
+  assert.equal(fixture.state().pointerActivations, 1);
+  assert.equal(fixture.closureCount(), 1);
+  assert.equal(fixture.state().sendActions, 0);
+});
+
+test('chatgpt-controller: effort failure closes the shared target menu without Send', async () => {
+  const fixture = targetMenuFixture({ reasoningLabel: 'High' });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  await assert.rejects(
+    controller.reviewPreflight({
+      productModel: 'GPT-5.6 Sol',
+      reasoningEffort: 'Pro',
+      timeoutMs: 5_000
+    }),
+    /reasoning_effort_label_mismatch/
+  );
+
+  assert.equal(fixture.state().menuOpen, false);
+  assert.equal(fixture.state().pointerActivations, 1);
+  assert.equal(fixture.closureCount(), 1);
+  assert.equal(fixture.state().sendActions, 0);
 });
 
 test('chatgpt-controller: delayed target-menu render is accepted after the unique activation', async () => {
@@ -1132,8 +1185,10 @@ test('chatgpt-controller: delayed target-menu render is accepted after the uniqu
 
   assert.equal(result.productModelEvidence.matchedLabel, 'GPT-5.6 Sol');
   assert.equal(result.reasoningEffortEvidence.matchedLabel, 'Pro');
-  assert.deepEqual(fixture.verificationChecks(), [2, 2]);
+  assert.deepEqual(fixture.verificationChecks(), [2]);
   assert.equal(fixture.state().sendActions, 0);
+  assert.equal(fixture.state().pointerActivations, 1);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: target-menu observation polling never repeats the native activation', async () => {
@@ -1145,9 +1200,10 @@ test('chatgpt-controller: target-menu observation polling never repeats the nati
     timeoutMs: 5_000
   });
 
-  assert.deepEqual(fixture.verificationChecks(), [4, 4]);
-  assert.equal(fixture.state().pointerActivations, 2);
+  assert.deepEqual(fixture.verificationChecks(), [4]);
+  assert.equal(fixture.state().pointerActivations, 1);
   assert.equal(fixture.state().sendActions, 0);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: persistent target-menu absence times out before Send without a second click', async () => {
@@ -1165,6 +1221,7 @@ test('chatgpt-controller: persistent target-menu absence times out before Send w
   assert.ok(fixture.verificationChecks()[0] > 1);
   assert.equal(fixture.state().pointerActivations, 1);
   assert.equal(fixture.state().sendActions, 0);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: multiple target menus appearing after activation remain ambiguous', async () => {
@@ -1186,6 +1243,7 @@ test('chatgpt-controller: multiple target menus appearing after activation remai
   assert.deepEqual(fixture.verificationChecks(), [2]);
   assert.equal(fixture.state().pointerActivations, 1);
   assert.equal(fixture.state().sendActions, 0);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: ambiguous target-menu triggers fail before activation', async () => {
@@ -1201,6 +1259,7 @@ test('chatgpt-controller: ambiguous target-menu triggers fail before activation'
   );
   assert.equal(fixture.state().pointerActivations, 0);
   assert.equal(fixture.state().sendActions, 0);
+  assert.equal(fixture.closureCount(), 1);
 });
 
 test('chatgpt-controller: ChatGPT profile snapshot reports aggregate cookie presence and root binding without composer input', async () => {
