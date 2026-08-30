@@ -32,6 +32,11 @@ function tabMatchesVendor(tab, { vendorId = null, url = null } = {}) {
   if (currentUrl && requestedUrl) return currentUrl.startsWith(requestedUrl) || requestedUrl.startsWith(currentUrl);
   return false;
 }
+function missingBrowserTargetCloseError(error) {
+  const message = String(error?.message || error || '');
+  return /No target with given id found|target (?:is )?(?:closed|missing|not found)|session closed/i.test(message) ||
+    error?.constructor?.name === 'ErrorEvent';
+}
 
 function browserProvenance(browserBackend) {
   const raw = browserBackend?.getState?.();
@@ -61,6 +66,7 @@ export class TabManager {
     this.tabs = new Map(); // tabId -> { id, key, name, vendorId, vendorName, url, session, presenter, controller, createdAt, lastUsedAt }
     this.keyToId = new Map();
     this.forcedFocusTabs = new Set();
+    this.releasedTabIds = new Set();
     this.mutex = new Mutex();
     this.quitting = false;
   }
@@ -70,80 +76,88 @@ export class TabManager {
     this.browserBackend?.setQuitting?.(this.quitting);
   }
 
-  async createTab({ key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
-    return await this.mutex.run(async () => {
-      if (key && this.keyToId.has(key)) return this.keyToId.get(key);
-      if (this.tabs.size >= this.maxTabs) throw new Error('max_tabs_reached');
+  async #createTabUnlocked({ key = null, name = null, url = 'https://chatgpt.com/', show = false, protectedTab = false, vendorId = null, vendorName = null } = {}) {
+    if (key && this.keyToId.has(key)) return this.keyToId.get(key);
+    if (this.tabs.size >= this.maxTabs) throw new Error('max_tabs_reached');
 
-      const id = crypto.randomUUID();
-      let finalized = false;
-      const finalizeClose = () => {
-        if (finalized) return;
-        finalized = true;
-        this.tabs.delete(id);
-        if (key) this.keyToId.delete(key);
-        this.forcedFocusTabs.delete(id);
-        this.onChanged?.();
-      };
-
-      const session = await this.browserBackend.createSession({
-        tabId: id,
-        url,
-        show,
-        protectedTab,
-        vendorId,
-        vendorName,
-        onClosed: finalizeClose
-      });
-      let controller = null;
-      try {
-        controller = await this.createController({ tabId: id, page: session.page, session });
-      } catch (error) {
-        try {
-          await session?.close?.();
-        } catch {}
-        finalizeClose();
-        throw error;
-      }
-
-      const tab = {
-        id,
-        key,
-        name: name || key || `tab-${id.slice(0, 8)}`,
-        vendorId: vendorId || null,
-        vendorName: vendorName || null,
-        url: String(url || ''),
-        session,
-        presenter: session.presenter,
-        controller,
-        protectedTab: !!protectedTab,
-        createdAt: Date.now(),
-        lastUsedAt: Date.now()
-      };
-
-      this.tabs.set(id, tab);
-      if (key) this.keyToId.set(key, id);
+    const id = crypto.randomUUID();
+    let finalized = false;
+    const finalizeClose = () => {
+      if (finalized) return;
+      finalized = true;
+      this.tabs.delete(id);
+      if (key) this.keyToId.delete(key);
+      this.releasedTabIds.add(id);
+      if (this.releasedTabIds.size > 512) this.releasedTabIds.delete(this.releasedTabIds.values().next().value);
+      this.forcedFocusTabs.delete(id);
       this.onChanged?.();
-      return id;
+    };
+
+    const session = await this.browserBackend.createSession({
+      tabId: id,
+      url,
+      show,
+      protectedTab,
+      vendorId,
+      vendorName,
+      onClosed: finalizeClose
     });
+    let controller = null;
+    try {
+      controller = await this.createController({ tabId: id, page: session.page, session });
+    } catch (error) {
+      try {
+        await session?.close?.();
+      } catch {}
+      finalizeClose();
+      throw error;
+    }
+
+    const tab = {
+      id,
+      key,
+      name: name || key || `tab-${id.slice(0, 8)}`,
+      vendorId: vendorId || null,
+      vendorName: vendorName || null,
+      url: String(url || ''),
+      session,
+      presenter: session.presenter,
+      controller,
+      protectedTab: !!protectedTab,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now()
+    };
+
+    this.tabs.set(id, tab);
+    if (key) this.keyToId.set(key, id);
+    this.onChanged?.();
+    return id;
+  }
+
+  async createTab(options = {}) {
+    return await this.mutex.run(async () => await this.#createTabUnlocked(options));
   }
 
   async ensureTab({ key, name, url, vendorId, vendorName, show, exactUrl = false } = {}) {
     if (!key) throw new Error('missing_key');
-    const existing = this.keyToId.get(key);
-    if (existing) {
-      const tab = this.tabs.get(existing);
-      if (!tab || tab.session?.isClosed?.()) {
-        this.keyToId.delete(key);
-        if (tab) this.tabs.delete(existing);
-        this.onChanged?.();
-        return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
+    return await this.mutex.run(async () => {
+      const existing = this.keyToId.get(key);
+      if (existing) {
+        const tab = this.tabs.get(existing);
+        if (!tab || tab.session?.isClosed?.()) {
+          this.keyToId.delete(key);
+          this.releasedTabIds.add(existing);
+          if (this.releasedTabIds.size > 512) this.releasedTabIds.delete(this.releasedTabIds.values().next().value);
+          if (tab) this.tabs.delete(existing);
+          this.onChanged?.();
+          return await this.#createTabUnlocked({ key, name, show: !!show, url, vendorId, vendorName });
+        }
+        if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('key_vendor_mismatch');
+        if (exactUrl && String(tab.url || '') !== String(url || '')) throw new Error('key_url_mismatch');
+        return existing;
       }
-      if (!tabMatchesVendor(tab, { vendorId, url })) throw new Error('key_vendor_mismatch');
-      if (exactUrl && String(tab.url || '') !== String(url || '')) throw new Error('key_url_mismatch');
-      return existing;
-    }
-    return await this.createTab({ key, name, show: !!show, url, vendorId, vendorName });
+      return await this.#createTabUnlocked({ key, name, show: !!show, url, vendorId, vendorName });
+    });
   }
 
   async refreshControllers({ createController, validateController = null } = {}) {
@@ -256,16 +270,25 @@ export class TabManager {
   async closeTab(id) {
     return await this.mutex.run(async () => {
       const tab = this.tabs.get(id);
-      if (!tab) throw new Error('tab_not_found');
-      // Keep the registry entry until the browser backend has confirmed the
-      // close.  A failed CDP close must remain observable and retryable rather
-      // than being reported as a successful cleanup after its tab was dropped.
-      await tab.session?.close?.();
-      if (tab.key) this.keyToId.delete(tab.key);
+      if (!tab) {
+        if (this.releasedTabIds.has(id)) return { status: 'ALREADY_RELEASED', tabId: id };
+        throw new Error('tab_not_found');
+      }
+      if (tab.protectedTab) throw new Error('default_tab_protected');
+      let status = 'CLOSED';
+      try {
+        await tab.session?.close?.();
+      } catch (error) {
+        if (!missingBrowserTargetCloseError(error)) throw error;
+        status = 'ALREADY_RELEASED';
+      }
+      if (tab.key && this.keyToId.get(tab.key) === id) this.keyToId.delete(tab.key);
       this.tabs.delete(id);
       this.forcedFocusTabs.delete(id);
       this.onChanged?.();
-      return true;
+      this.releasedTabIds.add(id);
+      if (this.releasedTabIds.size > 512) this.releasedTabIds.delete(this.releasedTabIds.values().next().value);
+      return { status, tabId: id };
     });
   }
 

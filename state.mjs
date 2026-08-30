@@ -35,69 +35,144 @@ export function reviewTransportPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, 'review-transport.json');
 }
 
-const REVIEW_TRANSPORT_SCHEMA_VERSION = 2;
-const LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION = 1;
-const LEGACY_SEND_ACTION_MIGRATION_ID = 'review_transport_v1_to_v2_complete_send_action_count';
-const LEGACY_SEND_ACTION_MIGRATION_BASIS = 'validated_complete_send_and_completion_evidence';
+const REVIEW_TRANSPORT_SCHEMA_VERSION = 3;
+
+const REVIEW_PHASES = new Set([
+  'VALIDATE',
+  'PREPARE_UI',
+  'ARMED',
+  'VERIFY_COMMITMENT',
+  'WAIT_RESPONSE',
+  'READ_RESPONSE',
+  'PUBLISH_ARCHIVE',
+  'TERMINAL'
+]);
+const REVIEW_COMMITMENTS = new Set(['ZERO_PROVEN', 'UNRESOLVED', 'ONE_EXACT', 'VIOLATION']);
+const REVIEW_RECOVERABILITY = new Set([
+  'PRECOMMIT_REPAIR',
+  'OBSERVE_ONLY',
+  'POSTCOMMIT_RECOVERY',
+  'HUMAN_INTERLOCK',
+  'NONE'
+]);
+const REVIEW_OBSERVABILITY = new Set([
+  'UNOBSERVED',
+  'FRESH_COMPLETE',
+  'FRESH_PARTIAL',
+  'STALE',
+  'LOST',
+  'CONTRADICTORY'
+]);
+const REVIEW_MESSAGE_CAPABILITIES = new Set(['AVAILABLE', 'RESERVED', 'SEALED']);
+const REVIEW_FAILURE_LOCI = new Set([
+  'NONE',
+  'SPEC',
+  'AUTH',
+  'TAB_OWNERSHIP',
+  'PRECOMMIT_UI',
+  'COMMIT_BOUNDARY',
+  'TURN_CONFIRMATION',
+  'RESPONSE',
+  'ARCHIVE'
+]);
+const UPPER_CODE = /^[A-Z][A-Z0-9_]*$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+const LEGACY_TRANSPORT_FIELDS = [
+  'model',
+  'expectedModel',
+  'expectedMode',
+  'modelEvidence',
+  'status',
+  'terminalState',
+  'sendCount',
+  'sendActionCount',
+  'newUserMessageCount'
+];
 
 export function defaultReviewTransportState() {
   return { schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION, bindings: {}, operations: {} };
 }
 
-function validateMigrationHistory(value, nonEmptyString) {
-  if (value.migrationHistory === undefined) return;
-  if (!Array.isArray(value.migrationHistory) || value.migrationHistory.length !== 1) {
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function rejectLegacyFields(value) {
+  if (LEGACY_TRANSPORT_FIELDS.some((field) => Object.hasOwn(value, field))) {
     throw new Error('review_transport_state_invalid');
-  }
-  const migration = value.migrationHistory[0];
-  if (
-    !migration ||
-    typeof migration !== 'object' ||
-    Array.isArray(migration) ||
-    migration.migrationId !== LEGACY_SEND_ACTION_MIGRATION_ID ||
-    migration.fromSchemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION ||
-    migration.toSchemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
-    !Array.isArray(migration.inferredFields)
-  ) {
-    throw new Error('review_transport_state_invalid');
-  }
-  const seen = new Set();
-  for (const inference of migration.inferredFields) {
-    const operation = value.operations?.[inference?.idempotencyKey];
-    if (
-      !inference ||
-      typeof inference !== 'object' ||
-      Array.isArray(inference) ||
-      !nonEmptyString(inference.idempotencyKey) ||
-      !nonEmptyString(inference.operationId) ||
-      inference.field !== 'sendActionCount' ||
-      inference.value !== 1 ||
-      inference.basis !== LEGACY_SEND_ACTION_MIGRATION_BASIS ||
-      seen.has(inference.idempotencyKey) ||
-      !operation ||
-      operation.operationId !== inference.operationId ||
-      operation.status !== 'COMPLETE' ||
-      operation.sendActionCount !== 1
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
-    seen.add(inference.idempotencyKey);
   }
 }
 
-function validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount = false } = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review_transport_state_invalid');
-  const expectedSchemaVersion = allowLegacyCompleteMissingSendActionCount
-    ? LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION
-    : REVIEW_TRANSPORT_SCHEMA_VERSION;
-  if (value.schemaVersion !== expectedSchemaVersion) throw new Error('review_transport_state_invalid');
+function validateTargetAxes(value) {
+  if (!nonEmptyString(value.productModel)) throw new Error('review_transport_state_invalid');
+  if (value.provider === 'chatgpt') {
+    if (value.productModel !== 'GPT-5.6 Sol' || value.reasoningEffort !== 'Pro') {
+      throw new Error('review_transport_state_invalid');
+    }
+  } else if (value.provider === 'gemini') {
+    if (value.reasoningEffort !== null) throw new Error('review_transport_state_invalid');
+  } else {
+    throw new Error('review_transport_state_invalid');
+  }
+}
+
+function validateEvidence(value, { required = false } = {}) {
+  const product = value.productModelEvidence;
+  const reasoning = value.reasoningEffortEvidence;
+  if (product !== undefined && product !== null && (typeof product !== 'object' || Array.isArray(product))) {
+    throw new Error('review_transport_state_invalid');
+  }
+  if (required && (
+    !product ||
+    product.requestedProductModel !== value.productModel ||
+    product.matchedLabel !== value.productModel ||
+    product.scopedMatchCount !== 1
+  )) throw new Error('review_transport_state_invalid');
+  if (value.provider === 'chatgpt') {
+    if (reasoning !== undefined && reasoning !== null && (typeof reasoning !== 'object' || Array.isArray(reasoning))) {
+      throw new Error('review_transport_state_invalid');
+    }
+    if (required && (
+      !reasoning ||
+      reasoning.requestedReasoningEffort !== value.reasoningEffort ||
+      reasoning.matchedLabel !== value.reasoningEffort ||
+      reasoning.scopedMatchCount !== 1 ||
+      reasoning.role !== 'slider' ||
+      reasoning.actionOwner !== 'Power' ||
+      !Number.isFinite(reasoning.min) ||
+      !Number.isFinite(reasoning.max) ||
+      reasoning.max - reasoning.min !== 4 ||
+      reasoning.value !== reasoning.max
+    )) throw new Error('review_transport_state_invalid');
+  } else if (reasoning !== undefined && reasoning !== null) {
+    throw new Error('review_transport_state_invalid');
+  }
+}
+
+function validateFailure(failure) {
+  if (
+    !failure ||
+    typeof failure !== 'object' ||
+    Array.isArray(failure) ||
+    !REVIEW_FAILURE_LOCI.has(failure.locus) ||
+    !UPPER_CODE.test(String(failure.code || '')) ||
+    ((failure.locus === 'NONE') !== (failure.code === 'NONE'))
+  ) {
+    throw new Error('review_transport_state_invalid');
+  }
+}
+
+function validateReviewTransportState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    throw new Error('review_transport_state_invalid');
+  }
   if (!value.bindings || typeof value.bindings !== 'object' || Array.isArray(value.bindings)) {
     throw new Error('review_transport_state_invalid');
   }
   if (!value.operations || typeof value.operations !== 'object' || Array.isArray(value.operations)) {
     throw new Error('review_transport_state_invalid');
   }
-  const nonEmptyString = (entry) => typeof entry === 'string' && entry.length > 0;
+
   for (const [key, binding] of Object.entries(value.bindings)) {
     if (
       !nonEmptyString(key) ||
@@ -105,270 +180,106 @@ function validateReviewTransportState(value, { allowLegacyCompleteMissingSendAct
       typeof binding !== 'object' ||
       Array.isArray(binding) ||
       binding.stableKey !== key ||
-      !nonEmptyString(binding.provider) ||
-      !nonEmptyString(binding.model) ||
       !nonEmptyString(binding.conversationUrl) ||
       !nonEmptyString(binding.conversationId) ||
       !Number.isFinite(binding.createdAt) ||
       !Number.isFinite(binding.updatedAt)
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
+    ) throw new Error('review_transport_state_invalid');
+    rejectLegacyFields(binding);
+    validateTargetAxes(binding);
     if (binding.geminiBootstrap !== undefined) {
       const bootstrap = binding.geminiBootstrap;
       if (
-        binding.provider !== 'gemini' || !bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap) ||
-        bootstrap.nonScientific !== true || !nonEmptyString(bootstrap.bootstrapOperationId) ||
-        !nonEmptyString(bootstrap.bootstrapModel) || typeof bootstrap.continuationConsumed !== 'boolean' ||
-        (bootstrap.continuationConsumed && (!nonEmptyString(bootstrap.continuationOperationId) || !nonEmptyString(bootstrap.continuationModel))) ||
-        (!bootstrap.continuationConsumed && (bootstrap.continuationOperationId !== undefined || bootstrap.continuationModel !== undefined))
+        binding.provider !== 'gemini' ||
+        !bootstrap ||
+        typeof bootstrap !== 'object' ||
+        Array.isArray(bootstrap) ||
+        bootstrap.nonScientific !== true ||
+        !nonEmptyString(bootstrap.bootstrapOperationId) ||
+        !nonEmptyString(bootstrap.bootstrapProductModel) ||
+        typeof bootstrap.continuationConsumed !== 'boolean'
       ) throw new Error('review_transport_state_invalid');
     }
   }
-  const statuses = new Set(['SEND_INTENT', 'PREPARED', 'SUBMITTED', 'OBSERVING', 'BLOCKED', 'COMPLETE']);
+
   for (const [key, operation] of Object.entries(value.operations)) {
     if (
       !nonEmptyString(key) ||
       !operation ||
       typeof operation !== 'object' ||
       Array.isArray(operation) ||
+      operation.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
       operation.idempotencyKey !== key ||
       !nonEmptyString(operation.operationId) ||
       !nonEmptyString(operation.requestFingerprint) ||
       !nonEmptyString(operation.stableKey) ||
-      !nonEmptyString(operation.provider) ||
-      !nonEmptyString(operation.model) ||
       !nonEmptyString(operation.conversationUrl) ||
       !nonEmptyString(operation.conversationId) ||
-      !/^[0-9a-f]{64}$/.test(String(operation.promptSha256 || '')) ||
-      !statuses.has(operation.status) ||
-      !Number.isInteger(operation.sendCount) ||
-      operation.sendCount < 0 ||
-      operation.sendCount > 1 ||
+      !path.isAbsolute(String(operation.responsePath || '')) ||
+      !SHA256.test(String(operation.promptSha256 || '')) ||
+      !REVIEW_PHASES.has(operation.phase) ||
+      !REVIEW_COMMITMENTS.has(operation.commitment) ||
+      !REVIEW_RECOVERABILITY.has(operation.recoverability) ||
+      !REVIEW_OBSERVABILITY.has(operation.observability) ||
+      !REVIEW_MESSAGE_CAPABILITIES.has(operation.messageCapability) ||
+      ![0, 1].includes(operation.providerUserMessageCount) ||
+      ![0, 1].includes(operation.sendActivationCount) ||
+      !Number.isInteger(operation.attemptCount) ||
+      operation.attemptCount < 1 ||
       !Number.isFinite(operation.createdAt) ||
       !Number.isFinite(operation.updatedAt)
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.baselineMessageIds !== undefined) {
-      if (
-        !Array.isArray(operation.baselineMessageIds) ||
-        operation.baselineMessageIds.some((id) => !nonEmptyString(id)) ||
-        new Set(operation.baselineMessageIds).size !== operation.baselineMessageIds.length
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    const geminiBootstrap = operation.geminiBootstrap === true;
-    const geminiBootstrapContinuation = operation.geminiBootstrapContinuation === true;
-    const bootstrapNonScientific = operation.bootstrapNonScientific === true;
-    if (
-      (operation.geminiBootstrap !== undefined && typeof operation.geminiBootstrap !== 'boolean') ||
-      (operation.geminiBootstrapContinuation !== undefined && typeof operation.geminiBootstrapContinuation !== 'boolean') ||
-      (operation.bootstrapNonScientific !== undefined && typeof operation.bootstrapNonScientific !== 'boolean') ||
-      (geminiBootstrap && (operation.provider !== 'gemini' || operation.firstBinding !== true || !bootstrapNonScientific)) ||
-      (geminiBootstrapContinuation && operation.provider !== 'gemini') ||
-      (geminiBootstrap && geminiBootstrapContinuation)
     ) throw new Error('review_transport_state_invalid');
-    if (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) {
+    rejectLegacyFields(operation);
+    validateTargetAxes(operation);
+    validateEvidence(operation, { required: operation.commitment === 'ONE_EXACT' });
+    validateFailure(operation.failure);
+
+    if (
+      operation.messageCapability === 'AVAILABLE' &&
+      !(operation.phase === 'PREPARE_UI' && operation.commitment === 'ZERO_PROVEN' && operation.recoverability === 'PRECOMMIT_REPAIR')
+    ) throw new Error('review_transport_state_invalid');
+    if (operation.messageCapability === 'RESERVED' && operation.phase !== 'ARMED') {
       throw new Error('review_transport_state_invalid');
     }
-    if (operation.responsePath !== undefined && (!path.isAbsolute(operation.responsePath) || !nonEmptyString(operation.responsePath))) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.sendBoundaryEnteredAt !== undefined && !Number.isFinite(operation.sendBoundaryEnteredAt)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    const hasObservedUserTurn = operation.observedUserMessageId !== undefined;
-    if (hasObservedUserTurn) {
-      const observedCommitmentClasses = new Set([
-        'turn_exact',
-        'turn_unreadable',
-        'turn_content_mismatch',
-        'turn_causal_exact_rendered_unreadable',
-        'turn_causal_exact_rendered_mismatch'
-      ]);
+    if (operation.commitment === 'UNRESOLVED' && (
+      operation.phase !== 'VERIFY_COMMITMENT' ||
+      operation.recoverability !== 'OBSERVE_ONLY' ||
+      operation.messageCapability !== 'SEALED'
+    )) throw new Error('review_transport_state_invalid');
+    if (operation.commitment === 'ONE_EXACT' && (
+      operation.providerUserMessageCount !== 1 ||
+      operation.messageCapability !== 'SEALED' ||
+      !nonEmptyString(operation.userMessageId) ||
+      !['agentify_review_causal_submission_v1', 'agentify_review_observed_exact_turn_v3'].includes(operation.turnConfirmationMode) ||
+      (operation.sendActivationCount === 0 && operation.turnConfirmationMode !== 'agentify_review_observed_exact_turn_v3')
+    )) throw new Error('review_transport_state_invalid');
+    if (operation.commitment === 'ZERO_PROVEN' && (
+      operation.providerUserMessageCount !== 0 ||
+      operation.sendActivationCount !== 0 ||
+      operation.userMessageId !== undefined
+    )) throw new Error('review_transport_state_invalid');
+
+    if (operation.phase === 'TERMINAL' && operation.failure.locus === 'NONE') {
+      const archive = operation.archive;
       if (
-        !nonEmptyString(operation.observedUserMessageId) ||
-        !Number.isFinite(operation.observedUserMessageAt) ||
-        !nonEmptyString(operation.observedConversationUrl) ||
-        !nonEmptyString(operation.observedConversationId) ||
-        !observedCommitmentClasses.has(operation.observedCommitmentClass) ||
-        !operation.observedTurnEvidence ||
-        typeof operation.observedTurnEvidence !== 'object' ||
-        Array.isArray(operation.observedTurnEvidence) ||
-        operation.observedTurnEvidence.commitmentClass !== operation.observedCommitmentClass ||
-        operation.observedTurnEvidence.newUserMessageCount !== 1 ||
-        operation.sendActionCount !== 1 ||
-        operation.newUserMessageCount !== 1 ||
-        (operation.observedCommitmentClass.startsWith('turn_causal_exact_') && !operation.causalSendReceipt) ||
-        (operation.userMessageId !== undefined && operation.userMessageId !== operation.observedUserMessageId)
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    } else if (
-      operation.observedUserMessageAt !== undefined ||
-      operation.observedConversationUrl !== undefined ||
-      operation.observedConversationId !== undefined ||
-      operation.observedCommitmentClass !== undefined ||
-      operation.observedTurnEvidence !== undefined
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.causalSendReceipt !== undefined) {
-      const receipt = operation.causalSendReceipt;
-      if (
-        !receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
-        receipt.ok !== true || receipt.persisted !== true ||
-        receipt.identityModel !== 'agentify_review_causal_submission_v1' ||
-        receipt.operationId !== operation.operationId ||
-        receipt.sendActionCount !== 1 || receipt.clickCount !== 1 ||
-        receipt.sourceSha256 !== operation.promptSha256 ||
-        !/^[0-9a-f]{64}$/.test(String(receipt.canonicalPromptSha256 || '')) ||
-        !/^[0-9a-f]{64}$/.test(String(receipt.baselineMessageIdsSha256 || '')) ||
-        operation.sendActionCount !== 1
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.submissionIdentity !== undefined) {
-      const identity = operation.submissionIdentity;
-      if (
-        !identity || typeof identity !== 'object' || Array.isArray(identity) ||
-        identity.identityModel !== 'agentify_review_causal_submission_v1' ||
-        identity.sourceSha256 !== operation.promptSha256 ||
-        !/^[0-9a-f]{64}$/.test(String(identity.canonicalPromptSha256 || '')) ||
-        !/^[0-9a-f]{64}$/.test(String(identity.baselineMessageIdsSha256 || '')) ||
-        identity.sendActionCount !== 1 || identity.clickCount !== 1 ||
-        identity.userMessageId !== operation.userMessageId ||
-        identity.conversationUrl !== operation.conversationUrl ||
-        identity.conversationId !== operation.conversationId ||
-        operation.sendCount !== 1 || operation.sendActionCount !== 1 ||
-        !operation.causalSendReceipt
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.renderedDisplay !== undefined) {
-      const display = operation.renderedDisplay;
-      if (
-        !display || typeof display !== 'object' || Array.isArray(display) ||
-        !new Set(['exact', 'lossy_mismatch', 'unreadable']).has(display.fidelity) ||
-        !operation.submissionIdentity
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'PREPARED' && (!operation.baselineMessageIds || operation.sendCount !== 0 || operation.userMessageId)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'SUBMITTED' && (operation.sendCount !== 1 || !operation.userMessageId)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'COMPLETE') {
-      const responseText = operation.responseText;
-      const legacyResponseSha256 = typeof responseText === 'string'
-        ? crypto.createHash('sha256').update(responseText, 'utf8').digest('hex')
-        : null;
-      const archivedResponse = path.isAbsolute(String(operation.responsePath || '')) &&
-        Number.isInteger(operation.responseBytes) && operation.responseBytes > 0 &&
-        /^[0-9a-f]{64}$/.test(String(operation.responseSha256 || ''));
-      const responseArchiveProjection = operation.responseArchiveProjection || 'exact';
-      const snapshotHashes = Array.isArray(operation.snapshots)
-        ? operation.snapshots.map((snapshot) => snapshot?.textSha256)
-        : [];
-      const responseProjectionValid = responseArchiveProjection === 'exact'
-        ? snapshotHashes.every((hash) => hash === operation.responseSha256) &&
-          (operation.renderedResponseBytes === undefined || operation.renderedResponseBytes === operation.responseBytes)
-        : responseArchiveProjection === 'terminal_lf_v1' &&
-          Number.isInteger(operation.renderedResponseBytes) &&
-          operation.responseBytes === operation.renderedResponseBytes + 1 &&
-          snapshotHashes.length === 2 &&
-          /^[0-9a-f]{64}$/.test(String(snapshotHashes[0] || '')) &&
-          snapshotHashes[0] === snapshotHashes[1] &&
-          snapshotHashes[0] !== operation.responseSha256;
-      const legacyInlineResponse = nonEmptyString(responseText) && operation.responseSha256 === legacyResponseSha256;
-      const snapshots = operation.snapshots;
-      const controls = operation.controls;
-      const validSendActionCount = operation.sendActionCount === 1 || (
-        allowLegacyCompleteMissingSendActionCount && operation.sendActionCount === undefined
-      );
-      if (
-        operation.sendCount !== 1 ||
-        !validSendActionCount ||
-        !operation.userMessageId ||
-        !operation.assistantMessageId ||
-        operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
-        (!archivedResponse && !legacyInlineResponse) ||
-        !Array.isArray(snapshots) ||
-        snapshots.length !== 2 ||
-        snapshots.some((snapshot) =>
-          !snapshot ||
-          snapshot.assistantMessageId !== operation.assistantMessageId ||
-          !responseProjectionValid ||
-          !Number.isFinite(snapshot.observedAt)
-        ) ||
-        snapshots[1].observedAt - snapshots[0].observedAt < 3_000 ||
-        !controls ||
-        typeof controls !== 'object' ||
-        controls.stop !== false ||
-        controls.continue !== false ||
-        controls.retry !== false ||
-        typeof controls.answerNow !== 'boolean' ||
-        !Array.isArray(operation.clickedControls) ||
-        operation.clickedControls.length !== 0 ||
-        !nonEmptyString(operation.modelEvidence) ||
-        (archivedResponse && operation.renderedDisplay?.fidelity !== 'exact') ||
-        !Number.isFinite(operation.completedAt)
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
+        operation.commitment !== 'ONE_EXACT' ||
+        operation.recoverability !== 'NONE' ||
+        operation.observability !== 'FRESH_COMPLETE' ||
+        !nonEmptyString(operation.assistantMessageId) ||
+        !archive ||
+        typeof archive !== 'object' ||
+        Array.isArray(archive) ||
+        !path.isAbsolute(String(archive.path || '')) ||
+        archive.path !== operation.responsePath ||
+        !SHA256.test(String(archive.sha256 || '')) ||
+        !Number.isInteger(archive.sizeBytes) ||
+        archive.sizeBytes <= 0 ||
+        archive.projection !== 'exact' ||
+        !Number.isFinite(archive.verifiedAt)
+      ) throw new Error('review_transport_state_invalid');
     }
   }
-  if (!allowLegacyCompleteMissingSendActionCount) validateMigrationHistory(value, nonEmptyString);
   return value;
-}
-
-function migrateLegacyReviewTransportState(value) {
-  validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount: true });
-  const inferredFields = [];
-  const operations = {};
-  for (const [idempotencyKey, operation] of Object.entries(value.operations)) {
-    const migratedOperation = { ...operation };
-    if (operation.status === 'COMPLETE' && operation.sendActionCount === undefined) {
-      migratedOperation.sendActionCount = 1;
-      inferredFields.push({
-        idempotencyKey,
-        operationId: operation.operationId,
-        field: 'sendActionCount',
-        value: 1,
-        basis: LEGACY_SEND_ACTION_MIGRATION_BASIS
-      });
-    }
-    operations[idempotencyKey] = migratedOperation;
-  }
-  inferredFields.sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey));
-  return validateReviewTransportState({
-    ...value,
-    schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
-    operations,
-    migrationHistory: [{
-      migrationId: LEGACY_SEND_ACTION_MIGRATION_ID,
-      fromSchemaVersion: LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION,
-      toSchemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
-      inferredFields
-    }]
-  });
-}
-
-function normalizeReviewTransportState(value, { migrateLegacy = false } = {}) {
-  if (migrateLegacy && value?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
-    return migrateLegacyReviewTransportState(value);
-  }
-  return validateReviewTransportState(value);
 }
 
 export function defaultSettings() {
@@ -476,31 +387,24 @@ export async function readReviewTransportStateReadOnly(stateDir = defaultStateDi
   try {
     const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
     const parsed = JSON.parse(raw);
-    return normalizeReviewTransportState(parsed, { migrateLegacy: true });
+    if (parsed?.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
+      throw new Error('review_transport_state_version_unsupported');
+    }
+    return validateReviewTransportState(parsed);
   } catch (error) {
     if (error?.code === 'ENOENT') return defaultReviewTransportState();
-    if (String(error?.message || '') === 'review_transport_state_invalid') throw error;
+    if (['review_transport_state_invalid', 'review_transport_state_version_unsupported'].includes(String(error?.message || ''))) throw error;
     throw new Error('review_transport_state_invalid', { cause: error });
   }
 }
 
 export async function readReviewTransportState(stateDir = defaultStateDir()) {
-  const normalized = await readReviewTransportStateReadOnly(stateDir);
-  try {
-    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed.schemaVersion !== normalized.schemaVersion) {
-      await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
-    }
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-  return normalized;
+  return await readReviewTransportStateReadOnly(stateDir);
 }
 
 export async function writeReviewTransportState(state, stateDir = defaultStateDir()) {
   await ensureStateDir(stateDir);
-  const normalized = normalizeReviewTransportState(state);
+  const normalized = validateReviewTransportState(state);
   await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   return normalized;
 }

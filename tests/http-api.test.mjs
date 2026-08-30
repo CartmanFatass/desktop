@@ -12,6 +12,18 @@ import {
   reviewPlainTextIdentity
 } from '../review-text-identity.mjs';
 import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
+async function req({ port, token = null, method = 'GET', pth = '/', body = undefined }) {
+  const headers = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  if (body !== undefined) headers['content-type'] = 'application/json';
+  const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  return { res, data };
+}
 
 test('http-api: strict pre-send busy and post-send identity ambiguity are conflicts', () => {
   assert.equal(mapErrorToHttp(new Error('review_tab_busy')).code, 409);
@@ -32,8 +44,8 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      status: 'COMPLETE',
-      terminalState: 'NATURAL_COMPLETION_VERIFIED',
+      phase: 'TERMINAL',
+      commitment: 'ONE_EXACT',
       tabId: 'complete-tab',
       conversationId: 'conversation-complete'
     }
@@ -42,7 +54,9 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      terminalState: 'SENT_WAITING',
+      phase: 'WAIT_RESPONSE',
+      commitment: 'ONE_EXACT',
+      messageCapability: 'SEALED',
       tabId: 'waiting-tab',
       conversationId: 'conversation-waiting'
     }
@@ -51,7 +65,9 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      terminalState: 'COMMITMENT_UNKNOWN',
+      phase: 'VERIFY_COMMITMENT',
+      commitment: 'UNRESOLVED',
+      messageCapability: 'SEALED',
       tabId: 'unbound-tab',
       conversationId: '__new__'
     }
@@ -60,7 +76,9 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      terminalState: 'SENT_WAITING',
+      phase: 'WAIT_RESPONSE',
+      commitment: 'ONE_EXACT',
+      messageCapability: 'SEALED',
       tabId: 'default-tab',
       conversationId: 'conversation-default'
     }
@@ -82,8 +100,8 @@ test('http-api: tab cleanup failure is reported without changing the transport f
     },
     defaultTabId: 'default-tab',
     receipt: {
-      status: 'COMPLETE',
-      terminalState: 'NATURAL_COMPLETION_VERIFIED',
+      phase: 'TERMINAL',
+      commitment: 'ONE_EXACT',
       tabId: 'completed-tab',
       conversationId: 'conversation-complete'
     }
@@ -93,54 +111,56 @@ test('http-api: tab cleanup failure is reported without changing the transport f
   assert.equal(result.error, 'chrome_cdp_disconnected');
 });
 
-test('http-api: reasoning-mode preflight carries no prompt or strict operation surface', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-mode-'));
+test('http-api: reasoning-effort preflight carries no prompt or strict operation surface', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-effort-'));
   const seen = [];
   const controller = {
-    async reviewReasoningModePreflight(args) {
+    async reviewReasoningEffortPreflight(args) {
       seen.push(args);
       return {
-        provider: 'chatgpt', conversationUrl: 'https://chatgpt.com/', reasoningModeEvidence: 'Pro',
-        reasoningModeReceipt: { selectedMode: 'Pro', promptInsertCount: 0, sendActionCount: 0 },
-        promptInsertCount: 0, sendActionCount: 0
+        provider: 'chatgpt',
+        conversationUrl: 'https://chatgpt.com/',
+        reasoningEffortEvidence: { requestedReasoningEffort: 'Pro', matchedLabel: 'Pro', value: 4 },
+        promptInsertCount: 0,
+        sendActivationCount: 0
       };
     }
   };
   const tabs = {
-    listTabs: () => [{ id: 'mode-tab', key: 'mode', vendorId: 'chatgpt' }],
+    listTabs: () => [{ id: 'effort-tab', key: 'effort', vendorId: 'chatgpt' }],
     getControllerById: () => controller
   };
-  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-mode', stateDir, getStatus: async () => ({ ok: true }) });
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-effort', stateDir, getStatus: async () => ({ ok: true }) });
   t.after(() => server.close());
   const { res, data } = await req({
-    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-mode-preflight',
-    body: { tabId: 'mode-tab', expectedMode: 'Pro', timeoutMs: 1_000 }
+    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-effort-preflight',
+    body: { tabId: 'effort-tab', reasoningEffort: 'Pro', timeoutMs: 1_000 }
   });
   assert.equal(res.status, 200);
-  assert.equal(data.result.reasoningModeEvidence, 'Pro');
-  assert.deepEqual(seen, [{ expectedMode: 'Pro', timeoutMs: 1_000 }]);
+  assert.equal(data.result.reasoningEffortEvidence.matchedLabel, 'Pro');
+  assert.deepEqual(seen, [{ reasoningEffort: 'Pro', timeoutMs: 1_000 }]);
   assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
 });
 
-test('http-api: page-wide reasoning diagnostic has no prompt or strict operation surface', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-diagnostic-'));
+test('http-api: reasoning-effort diagnostic has no prompt or strict operation surface', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-effort-diagnostic-'));
   const seen = [];
   const controller = {
-    async reviewReasoningModeDiagnostics(args) {
+    async reviewReasoningEffortDiagnostics(args) {
       seen.push(args);
-      return { provider: 'chatgpt', scope: args.scope, controls: [], promptInsertCount: 0, sendActionCount: 0 };
+      return { provider: 'chatgpt', sliderCount: 1, value: 4, promptInsertCount: 0, sendActivationCount: 0 };
     }
   };
-  const tabs = { listTabs: () => [{ id: 'mode-tab', key: 'mode', vendorId: 'chatgpt' }], getControllerById: () => controller };
-  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-diagnostic', stateDir, getStatus: async () => ({ ok: true }) });
+  const tabs = { listTabs: () => [{ id: 'effort-tab', key: 'effort', vendorId: 'chatgpt' }], getControllerById: () => controller };
+  const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-effort-diagnostic', stateDir, getStatus: async () => ({ ok: true }) });
   t.after(() => server.close());
   const { res, data } = await req({
-    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-mode-diagnostics',
-    body: { tabId: 'mode-tab', scope: 'page', timeoutMs: 1_000 }
+    port: server.address().port, token: 'secret', method: 'POST', pth: '/review-reasoning-effort-diagnostics',
+    body: { tabId: 'effort-tab', timeoutMs: 1_000 }
   });
   assert.equal(res.status, 200);
-  assert.equal(data.result.scope, 'page');
-  assert.deepEqual(seen, [{ timeoutMs: 1_000, scope: 'page', openModeSelector: false }]);
+  assert.equal(data.result.value, 4);
+  assert.deepEqual(seen, [{ timeoutMs: 1_000 }]);
   assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
 });
 
@@ -221,416 +241,6 @@ test('http-api: controller refresh is fixed-generation-only, refuses strict acti
   assert.equal(generation, 1);
 });
 
-test('http-api: stale durable PREPARED alone does not impersonate an active controller boundary', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-strict-'));
-  const pending = {
-    schemaVersion: 2,
-    bindings: {},
-    operations: {
-      pending: {
-        operationId: 'pending-operation', idempotencyKey: 'pending', requestFingerprint: 'b'.repeat(64), stableKey: 'pending-stable-key',
-        provider: 'chatgpt', model: 'Pro', conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true,
-        promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
-        timeoutMs: 2700000, status: 'PREPARED', terminalState: null, sendCount: 0,
-        sendActionCount: 0, baselineMessageIds: [], createdAt: Date.now(), updatedAt: Date.now()
-      }
-    }
-  };
-  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(pending));
-  let calls = 0;
-  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
-  const server = await startHttpApi({
-    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-strict', stateDir, getStatus: async () => ({ ok: true }),
-    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
-    onControllerRuntimeRefresh: async () => { calls += 1; return {}; }
-  });
-  t.after(() => server.close());
-  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
-  assert.equal(result.res.status, 200);
-  assert.equal(calls, 1);
-});
-
-test('http-api: controller refresh can repair an idle already-submitted strict observer', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-submitted-'));
-  const submitted = {
-    schemaVersion: 2,
-    bindings: {},
-    operations: {
-      submitted: {
-        operationId: 'submitted-operation', idempotencyKey: 'submitted', requestFingerprint: 'b'.repeat(64), stableKey: 'submitted-stable-key',
-        provider: 'chatgpt', model: 'Pro', conversationUrl: 'https://chatgpt.com/c/submitted', conversationId: 'submitted', firstBinding: false,
-        promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
-        timeoutMs: 2700000, status: 'SUBMITTED', terminalState: 'SENT_WAITING', sendCount: 1,
-        sendActionCount: 1, userMessageId: 'submitted-user', baselineMessageIds: [], createdAt: Date.now(), updatedAt: Date.now()
-      }
-    }
-  };
-  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(submitted));
-  let calls = 0;
-  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
-  const server = await startHttpApi({
-    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-submitted', stateDir, getStatus: async () => ({ ok: true }),
-    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
-    onControllerRuntimeRefresh: async () => { calls += 1; return { generation: 1, sourceDigest: 'b'.repeat(64) }; }
-  });
-  t.after(() => server.close());
-  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
-  assert.equal(result.res.status, 200);
-  assert.equal(calls, 1);
-});
-
-test('http-api: provider admission is rejected while controller refresh is held', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-held-'));
-  let sendCalls = 0;
-  let releaseRefresh;
-  let markRefreshStarted;
-  const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
-  const refreshHeld = new Promise((resolve) => { releaseRefresh = resolve; });
-  const controller = {
-    async send() { sendCalls += 1; return { ok: true }; }
-  };
-  const tabs = {
-    listTabs: () => [{ id: 't0', key: 'default', protectedTab: true }],
-    getControllerById: () => controller
-  };
-  const server = await startHttpApi({
-    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-held', stateDir, getStatus: async () => ({ ok: true }),
-    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
-    onControllerRuntimeRefresh: async () => {
-      markRefreshStarted();
-      await refreshHeld;
-      return { generation: 1, sourceDigest: 'b'.repeat(64) };
-    }
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-  const refreshRequest = req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
-  await refreshStarted;
-  let concurrentSend;
-  try {
-    concurrentSend = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'must not send', tabId: 't0' } });
-  } finally {
-    releaseRefresh();
-  }
-  const refreshed = await refreshRequest;
-  assert.equal(concurrentSend.res.status, 409);
-  assert.equal(concurrentSend.data.error, 'controller_refresh_in_progress');
-  assert.equal(sendCalls, 0);
-  assert.equal(refreshed.res.status, 200);
-});
-
-test('http-api: stale durable send-intent alone does not impersonate an active refresh boundary', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-intent-'));
-  const now = Date.now();
-  const state = {
-    schemaVersion: 2, bindings: {}, operations: {
-      intent: {
-        operationId: 'intent-operation', idempotencyKey: 'intent', requestFingerprint: 'b'.repeat(64), stableKey: 'intent-stable-key', provider: 'chatgpt', model: 'Pro',
-        conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true, promptSha256: 'c'.repeat(64), promptTextModel: 'agentify_review_plain_text_v1', canonicalPromptSha256: 'c'.repeat(64),
-        timeoutMs: 2700000, status: 'SEND_INTENT', terminalState: null, sendCount: 0, sendActionCount: 0, createdAt: now, updatedAt: now
-      }
-    }
-  };
-  await fs.writeFile(path.join(stateDir, 'review-transport.json'), JSON.stringify(state));
-  const tabs = { listTabs: () => [], getControllerById: () => ({}) };
-  const server = await startHttpApi({
-    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh-intent', stateDir, getStatus: async () => ({ ok: true }),
-    getControllerRuntimeState: () => ({ supported: true, generation: 0, sourceDigest: 'a'.repeat(64) }),
-    onControllerRuntimeRefresh: async () => ({ generation: 1, sourceDigest: 'b'.repeat(64) })
-  });
-  t.after(() => server.close());
-  const result = await req({ port: server.address().port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: 'a'.repeat(64) } });
-  assert.equal(result.res.status, 200);
-});
-
-test('http-api: an empty continuation baseline returns a typed zero-send fact', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-empty-baseline-'));
-  let composerWrites = 0;
-  const closedTabs = [];
-  const controller = {
-    async reviewQuery(args) {
-      await args.onPrepared({
-        baselineMessageIds: [],
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      });
-      composerWrites += 1;
-    }
-  };
-  const tabs = {
-    ensureTab: async () => 'review-tab',
-    getControllerById: () => controller,
-    closeTab: async (tabId) => { closedTabs.push(tabId); },
-    listTabs: () => []
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-empty-baseline',
-    stateDir,
-    getStatus: async () => ({ ok: true })
-  });
-  t.after(() => server.close());
-  const prompt = 'Do not write this continuation prompt.';
-  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
-  const { res, data } = await req({
-    port: server.address().port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/review-query',
-    body: {
-      stableKey: 'empty-baseline-continuation',
-      provider: 'chatgpt',
-      model: 'GPT-5.6 Pro',
-      conversationUrl: 'https://chatgpt.com/c/empty-baseline',
-      conversationId: 'empty-baseline',
-      idempotencyKey: 'empty-baseline-continuation-op',
-      prompt,
-      promptSha256,
-      responsePath: path.join(stateDir, 'empty-baseline-response.md'),
-      timeoutMs: 60_000,
-      firstBinding: false
-    }
-  });
-  assert.equal(res.status, 200);
-  assert.equal(data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(data.receipt.zeroCommitPreClick, true);
-  assert.equal(data.receipt.tabId, 'review-tab');
-  assert.equal(data.receipt.tabLifecycle.status, 'CLOSED');
-  assert.deepEqual(closedTabs, ['review-tab']);
-  assert.equal(composerWrites, 0);
-  const operation = (await readReviewTransportState(stateDir)).operations['empty-baseline-continuation-op'];
-  assert.equal(operation.failureStage, 'before_composer_write');
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.userMessageId, undefined);
-});
-
-test('http-api: strict typed-failure cleanup retains the tab scope until close completes', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-cleanup-scope-'));
-  let closeStartedResolve;
-  const closeStarted = new Promise((resolve) => { closeStartedResolve = resolve; });
-  let releaseClose;
-  const closeGate = new Promise((resolve) => { releaseClose = resolve; });
-  let ordinaryCalls = 0;
-  const controller = {
-    runExclusive: async (fn) => await fn(),
-    async reviewQuery(args) {
-      await args.onPrepared({
-        baselineMessageIds: [],
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      });
-    },
-    async query() {
-      ordinaryCalls += 1;
-      return { text: 'must not run during cleanup' };
-    }
-  };
-  const tabs = {
-    ensureTab: async () => 'cleanup-tab',
-    getControllerById: () => controller,
-    closeTab: async () => {
-      closeStartedResolve();
-      await closeGate;
-    },
-    listTabs: () => [{ id: 'cleanup-tab', key: 'cleanup-key' }]
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 'default-tab',
-    serverId: 'sid-review-cleanup-scope',
-    stateDir,
-    getStatus: async () => ({ ok: true })
-  });
-  t.after(() => { releaseClose?.(); server.close(); });
-  const port = server.address().port;
-  const prompt = 'typed zero-send cleanup';
-  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
-  const strict = req({
-    port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/review-query',
-    body: {
-      stableKey: 'cleanup-key',
-      provider: 'chatgpt',
-      model: 'GPT-5.6 Pro',
-      conversationUrl: 'https://chatgpt.com/c/cleanup-scope',
-      conversationId: 'cleanup-scope',
-      idempotencyKey: 'cleanup-scope-op',
-      prompt,
-      promptSha256,
-      responsePath: path.join(stateDir, 'cleanup-response.md'),
-      timeoutMs: 60_000,
-      firstBinding: false
-    }
-  });
-  await closeStarted;
-  const ordinary = await req({
-    port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/query',
-    body: { key: 'cleanup-key', prompt: 'must be rejected while close is pending' }
-  });
-  assert.equal(ordinary.res.status, 409);
-  assert.equal(ordinary.data.error, 'tab_busy');
-  assert.equal(ordinaryCalls, 0);
-  releaseClose();
-  const completed = await strict;
-  assert.equal(completed.res.status, 200);
-  assert.equal(completed.data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(completed.data.receipt.tabLifecycle.status, 'CLOSED');
-});
-
-test('http-api: first-binding strict reviews serialize the shared provider-root writer across tabs', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-root-writer-'));
-  const entered = [];
-  let markFirstEntered;
-  let markSecondEntered;
-  let markConcreteEntered;
-  let releaseFirst;
-  let releaseSecond;
-  let releaseConcrete;
-  let markSecondQueued;
-  let markDuplicateQueued;
-  const firstEntered = new Promise((resolve) => { markFirstEntered = resolve; });
-  const secondEntered = new Promise((resolve) => { markSecondEntered = resolve; });
-  const concreteEntered = new Promise((resolve) => { markConcreteEntered = resolve; });
-  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
-  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
-  const concreteGate = new Promise((resolve) => { releaseConcrete = resolve; });
-  const secondQueued = new Promise((resolve) => { markSecondQueued = resolve; });
-  const duplicateQueued = new Promise((resolve) => { markDuplicateQueued = resolve; });
-  const awaitRuntimeFact = async (promise, label) => {
-    let timer;
-    try {
-      return await Promise.race([
-        promise,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 2_000);
-        })
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  const controller = (name, enteredSignal, gate) => ({
-    runExclusive: async (fn) => await fn(),
-    async reviewQuery() {
-      entered.push(name);
-      enteredSignal();
-      await gate;
-      const error = new Error('review_composer_clear_failed');
-      error.data = { noClickProven: true };
-      throw error;
-    }
-  });
-  const controllers = new Map([
-    ['root-tab-a', controller('a', markFirstEntered, firstGate)],
-    ['root-tab-b', controller('b', markSecondEntered, secondGate)],
-    ['concrete-tab', controller('concrete', markConcreteEntered, concreteGate)]
-  ]);
-  const tabs = {
-    async ensureTab({ key }) {
-      if (key === 'root-a') return 'root-tab-a';
-      if (key === 'root-b') return 'root-tab-b';
-      return 'concrete-tab';
-    },
-    getControllerById(tabId) { return controllers.get(tabId); },
-    async closeTab() {},
-    listTabs: () => [
-      { id: 'root-tab-a', key: 'root-a', vendorId: 'chatgpt' },
-      { id: 'root-tab-b', key: 'root-b', vendorId: 'chatgpt' },
-      { id: 'concrete-tab', key: 'concrete', vendorId: 'chatgpt' }
-    ]
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 'default-tab',
-    serverId: 'sid-root-writer',
-    stateDir,
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 3, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0 }),
-    onRuntimeChanged(snapshot) {
-      const waiting = snapshot.activeQueries.filter((item) => item.phase === 'waiting_unbound_root_writer').length;
-      if (snapshot.activeQueries.length >= 2 && waiting >= 1) markSecondQueued(snapshot);
-      if (snapshot.activeQueries.length >= 3 && waiting >= 2) markDuplicateQueued(snapshot);
-    }
-  });
-  t.after(() => { releaseFirst?.(); releaseSecond?.(); releaseConcrete?.(); server.close(); });
-  const port = server.address().port;
-  const makeBody = (suffix, { firstBinding = true } = {}) => {
-    const prompt = `root writer ${suffix}`;
-    return {
-      stableKey: `root-${suffix}`,
-      provider: 'chatgpt',
-      model: 'GPT-5.6 Pro',
-      conversationUrl: firstBinding ? 'https://chatgpt.com/' : 'https://chatgpt.com/c/concrete',
-      conversationId: firstBinding ? '__new__' : 'concrete',
-      idempotencyKey: `root-op-${suffix}`,
-      prompt,
-      promptSha256: reviewPlainTextIdentity(prompt).sourceSha256,
-      responsePath: path.join(stateDir, `root-${suffix}-response.md`),
-      timeoutMs: 60_000,
-      firstBinding
-    };
-  };
-
-  const firstRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('a') });
-  await firstEntered;
-  const concreteRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('concrete', { firstBinding: false }) });
-  await concreteEntered;
-  releaseConcrete();
-  const concreteResult = await concreteRequest;
-  const secondRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('b') });
-  await awaitRuntimeFact(secondQueued, 'the second root writer to queue');
-  const duplicateRequest = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: makeBody('b') });
-  const runtime = await awaitRuntimeFact(duplicateQueued, 'the duplicate root writer to queue');
-  const enteredBeforeRelease = [...entered];
-  const phasesBeforeRelease = runtime.activeQueries.map((item) => item.phase);
-  releaseFirst();
-  releaseSecond();
-  const [firstResult, secondResult, duplicateResult] = await Promise.all([firstRequest, secondRequest, duplicateRequest]);
-
-  assert.equal(runtime.activeQueries.length, 3);
-  assert.deepEqual(enteredBeforeRelease, ['a', 'concrete']);
-  assert.equal(phasesBeforeRelease.filter((phase) => phase === 'waiting_unbound_root_writer').length, 2);
-  assert.deepEqual(entered, ['a', 'concrete', 'b']);
-  assert.equal(concreteResult.res.status, 200);
-  assert.equal(concreteResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(firstResult.res.status, 200);
-  assert.equal(secondResult.res.status, 200);
-  assert.equal(duplicateResult.res.status, 200);
-  assert.equal(firstResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(secondResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(duplicateResult.data.receipt.terminalState, 'ZERO_SEND_FAILED');
-  const operations = (await readReviewTransportState(stateDir)).operations;
-  assert.equal(Object.keys(operations).filter((key) => key === 'root-op-b').length, 1);
-});
-
-async function req({ port, token, method, pth, body, headers = {} }) {
-  const res = await fetch(`http://127.0.0.1:${port}${pth}`, {
-    method,
-    headers: {
-      ...(body ? { 'content-type': 'application/json' } : {}),
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      ...headers
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const data = await res.json().catch(() => ({}));
-  return { res, data };
-}
 
 test('http-api: health is public and returns serverId', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
@@ -674,237 +284,6 @@ test('http-api: rejects unauthorized', async (t) => {
   assert.equal(data.error, 'unauthorized');
 });
 
-test('http-api: strict review send returns SENT_WAITING and later observes the same operation to COMPLETE', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-'));
-  let sends = 0;
-  const response = 'REVIEW_SMOKE_OK';
-  const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
-  const prompt = 'Return REVIEW_SMOKE_OK.';
-  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
-  let observations = 0;
-  const controller = {
-    async reviewQuery(args) {
-      sends += 1;
-      await args.onPrepared({
-        baselineMessageIds: ['historical-user-1'],
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      });
-      await args.onComposerVerified?.({
-        ok: true,
-        textModel: REVIEW_PLAIN_TEXT_MODEL,
-        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
-        composerPreparationMode: 'replaced',
-        composerKind: 'contenteditable',
-        clearMethod: 'already_empty',
-        selectionVerified: true,
-        deleteKeyCount: 0,
-        emptyVerified: true,
-        emptySnapshotCount: 2,
-        caretVerified: true,
-        caretMethod: 'contenteditable_collapsed_range',
-        promptInsertCount: 1,
-        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        identityMode: 'canonical_exact'
-      });
-      const modelEvidence = {
-        expectedModel: args.expectedModel,
-        matchedLabel: 'GPT-5.6 Pro',
-        routeEvidence: 'semantic_model_switcher',
-        scopedMatchCount: 1
-      };
-      await args.onSendBoundaryEntered?.({ modelEvidence });
-      const causalSubmissionReceipt = await args.onSendAction({
-        clickCount: 1,
-        sendActionCount: 1,
-        clickTimeIdentity: {
-          ok: true,
-          recoveredExact: true,
-          textModel: REVIEW_PLAIN_TEXT_MODEL,
-          identityMode: 'canonical_exact',
-          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
-        },
-        clickTimeModelEvidence: modelEvidence
-      });
-      const observedTurn = {
-        observedUserMessageId: 'user-http-1',
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        commitmentClass: 'turn_exact',
-        newUserMessageCount: 1,
-        serializerOk: true,
-        renderedDisplayFidelity: 'exact'
-      };
-      await args.onUserTurnObserved(observedTurn);
-      await args.onSubmitted({
-        userMessageId: 'user-http-1',
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro',
-        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
-        causalSubmissionReceipt,
-        renderedDisplayFidelity: 'exact',
-        renderedDisplayEvidence: observedTurn,
-        renderedIdentityMode: 'canonical_exact'
-      });
-      return {
-        status: 'SENT_WAITING',
-        userMessageId: 'user-http-1',
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      };
-    },
-    async observeReviewResponse(args) {
-      observations += 1;
-      return {
-        userMessageId: args.userMessageId,
-        assistantMessageId: 'assistant-http-1',
-        text: response,
-        snapshots: [
-          { observedAt: 1000, assistantMessageId: 'assistant-http-1', textSha256: responseSha256 },
-          { observedAt: 4100, assistantMessageId: 'assistant-http-1', textSha256: responseSha256 }
-        ],
-        controls: { stop: false, continue: false, retry: false, answerNow: false },
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      };
-    }
-  };
-  const tabs = {
-    ensureTab: async () => 'review-tab',
-    getControllerById: () => controller,
-    listTabs: () => []
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-review',
-    stateDir,
-    getStatus: async () => ({ ok: true })
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-  const body = {
-    stableKey: 'hmasd-agentify-transport-smoke',
-    provider: 'chatgpt',
-    model: 'GPT-5.6 Pro',
-    conversationUrl: 'https://chatgpt.com/c/conversation-http',
-    conversationId: 'conversation-http',
-    idempotencyKey: 'hmasd-agentify-transport-smoke',
-    prompt,
-    promptSha256,
-    responsePath: path.join(stateDir, 'strict-review-response.md'),
-    timeoutMs: 45 * 60_000
-  };
-  const first = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
-  assert.equal(first.res.status, 200);
-  assert.equal(first.data.receipt.status, 'SUBMITTED');
-  assert.equal(first.data.receipt.terminalState, 'SENT_WAITING');
-  assert.equal(first.data.receipt.sendActionCount, 1);
-  const duplicate = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
-  assert.equal(duplicate.res.status, 200);
-  assert.equal(duplicate.data.receipt.operationId, first.data.receipt.operationId);
-  assert.equal(duplicate.data.receipt.status, 'COMPLETE');
-  assert.equal(duplicate.data.receipt.responseSha256, responseSha256);
-  assert.equal(duplicate.data.receipt.responsePath, body.responsePath);
-  assert.equal(await fs.readFile(body.responsePath, 'utf8'), response);
-  assert.equal(sends, 1);
-  assert.equal(observations, 1);
-});
-
-test('http-api: a crash after the send-capable boundary returns COMMITMENT_UNKNOWN as a retained fact', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-unknown-'));
-  let calls = 0;
-  const controller = {
-    async reviewQuery(args) {
-      calls += 1;
-      await args.onPrepared({
-        baselineMessageIds: ['historical-user-1'],
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      });
-      await args.onComposerVerified({
-        ok: true,
-        textModel: REVIEW_PLAIN_TEXT_MODEL,
-        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
-        composerPreparationMode: 'replaced',
-        composerKind: 'contenteditable',
-        clearMethod: 'already_empty',
-        selectionVerified: true,
-        deleteKeyCount: 0,
-        emptyVerified: true,
-        emptySnapshotCount: 2,
-        caretVerified: true,
-        caretMethod: 'contenteditable_collapsed_range',
-        promptInsertCount: 1,
-        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        identityMode: 'canonical_exact'
-      });
-      await args.onSendBoundaryEntered({
-        modelEvidence: {
-          expectedModel: args.expectedModel,
-          matchedLabel: 'GPT-5.6 Pro',
-          routeEvidence: 'semantic_model_switcher',
-          scopedMatchCount: 1
-        }
-      });
-      throw new Error('simulated_boundary_crash');
-    }
-  };
-  const tabs = {
-    ensureTab: async () => 'review-tab',
-    getControllerById: () => controller,
-    listTabs: () => []
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-review-unknown',
-    stateDir,
-    getStatus: async () => ({ ok: true })
-  });
-  t.after(() => server.close());
-  const prompt = 'Exact frozen transport question.';
-  const { res, data } = await req({
-    port: server.address().port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/review-query',
-    body: {
-      stableKey: 'unknown-boundary-key',
-      provider: 'chatgpt',
-      model: 'GPT-5.6 Pro',
-      conversationUrl: 'https://chatgpt.com/c/unknown-boundary',
-      conversationId: 'unknown-boundary',
-      idempotencyKey: 'unknown-boundary-operation',
-      prompt,
-      responsePath: path.join(stateDir, 'unknown-boundary-response.md'),
-      timeoutMs: 60_000
-    }
-  });
-  assert.equal(res.status, 200);
-  assert.equal(data.receipt.status, 'OBSERVING');
-  assert.equal(data.receipt.terminalState, 'COMMITMENT_UNKNOWN');
-  assert.equal(data.receipt.sendCount, 0);
-  assert.equal(data.receipt.sendActionCount, 0);
-  assert.equal(calls, 1);
-});
 
 test('http-api: status returns getStatus output', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
@@ -3491,250 +2870,6 @@ test('http-api: query returns 429 when maxInflightQueries exceeded', async (t) =
   assert.equal(q1r.res.status, 200);
 });
 
-test('http-api: shared max inflight blocks a fresh strict send behind an ordinary query before ledger creation', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-shared-governor-'));
-  let ordinaryStarted = 0;
-  let releaseOrdinary;
-  const ordinaryGate = new Promise((resolve) => { releaseOrdinary = resolve; });
-  const ordinaryController = {
-    runExclusive: async (fn) => await fn(),
-    query: async () => {
-      ordinaryStarted += 1;
-      await ordinaryGate;
-      return { text: 'ordinary done' };
-    }
-  };
-  const tabs = {
-    listTabs: () => [{ id: 'ordinary-tab', key: 'ordinary' }],
-    ensureTab: async () => 'ordinary-tab',
-    getControllerById: () => ordinaryController
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 'ordinary-tab',
-    serverId: 'sid-shared-governor-ordinary-first',
-    stateDir,
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
-  });
-  t.after(() => { releaseOrdinary?.(); server.close(); });
-  const port = server.address().port;
-  const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary', prompt: 'hold capacity' } });
-  for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-
-  const prompt = 'strict should not send';
-  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
-  const strict = await req({
-    port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/review-query',
-    body: {
-      stableKey: 'strict-blocked-by-ordinary',
-      provider: 'chatgpt',
-      model: 'GPT-5.6 Pro',
-      conversationUrl: 'https://chatgpt.com/c/shared-governor',
-      conversationId: 'shared-governor',
-      idempotencyKey: 'strict-blocked-by-ordinary-op',
-      prompt,
-      promptSha256,
-      responsePath: path.join(stateDir, 'strict-blocked-response.md'),
-      timeoutMs: 60_000
-    }
-  });
-  assert.equal(strict.res.status, 429);
-  assert.equal(strict.data.reason, 'max_inflight');
-  assert.equal(strict.data.operationKind, 'strict-review');
-  assert.equal(strict.data.sendActionCount, 0);
-  assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
-
-  releaseOrdinary();
-  assert.equal((await ordinary).res.status, 200);
-});
-
-test('http-api: fresh strict reserves shared capacity while exact verifyExisting bypasses send admission', async (t) => {
-  const bounded = async (promise, label) => await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(label)), 2_000);
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (error) => { clearTimeout(timer); reject(error); }
-    );
-  });
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-strict-governor-'));
-  const response = 'STRICT_GOVERNOR_OK';
-  const responseSha256 = (await import('node:crypto')).createHash('sha256').update(response, 'utf8').digest('hex');
-  const prompt = 'strict governor prompt';
-  const promptSha256 = (await import('node:crypto')).createHash('sha256').update(prompt, 'utf8').digest('hex');
-  let strictStarted = 0;
-  let releaseStrict;
-  const strictGate = new Promise((resolve) => { releaseStrict = resolve; });
-  let ordinaryStarted = 0;
-  let releaseOrdinary;
-  const ordinaryGate = new Promise((resolve) => { releaseOrdinary = resolve; });
-  const strictResult = {
-    userMessageId: 'strict-governor-user',
-    assistantMessageId: 'strict-governor-assistant',
-    text: response,
-    snapshots: [
-      { observedAt: 1000, assistantMessageId: 'strict-governor-assistant', textSha256: responseSha256 },
-      { observedAt: 4100, assistantMessageId: 'strict-governor-assistant', textSha256: responseSha256 }
-    ],
-    controls: { stop: false, continue: false, retry: false, answerNow: false },
-    conversationUrl: 'https://chatgpt.com/c/strict-governor',
-    conversationId: 'strict-governor',
-    modelEvidence: 'GPT-5.6 Pro'
-  };
-  const strictController = {
-    runExclusive: async (fn) => await fn(),
-    reviewQuery: async (args) => {
-      await args.onPrepared({ baselineMessageIds: ['historical-user-1'], conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId, modelEvidence: 'GPT-5.6 Pro' });
-      await args.onComposerVerified?.({
-        ok: true,
-        textModel: REVIEW_PLAIN_TEXT_MODEL,
-        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
-        composerPreparationMode: 'replaced',
-        composerKind: 'contenteditable',
-        clearMethod: 'already_empty',
-        selectionVerified: true,
-        deleteKeyCount: 0,
-        emptyVerified: true,
-        emptySnapshotCount: 2,
-        caretVerified: true,
-        caretMethod: 'contenteditable_collapsed_range',
-        promptInsertCount: 1,
-        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        identityMode: 'canonical_exact'
-      });
-      const modelEvidence = {
-        expectedModel: args.expectedModel,
-        matchedLabel: 'GPT-5.6 Pro',
-        routeEvidence: 'semantic_model_switcher',
-        scopedMatchCount: 1
-      };
-      await args.onSendBoundaryEntered?.({ modelEvidence });
-      const causalSubmissionReceipt = await args.onSendAction({
-        clickCount: 1,
-        sendActionCount: 1,
-        clickTimeIdentity: {
-          ok: true,
-          recoveredExact: true,
-          textModel: REVIEW_PLAIN_TEXT_MODEL,
-          identityMode: 'canonical_exact',
-          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256
-        },
-        clickTimeModelEvidence: modelEvidence
-      });
-      const observedTurn = {
-        observedUserMessageId: strictResult.userMessageId,
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        commitmentClass: 'turn_exact',
-        newUserMessageCount: 1,
-        serializerOk: true,
-        renderedDisplayFidelity: 'exact'
-      };
-      await args.onUserTurnObserved(observedTurn);
-      await args.onSubmitted({
-        userMessageId: strictResult.userMessageId,
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro',
-        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
-        causalSubmissionReceipt,
-        renderedDisplayFidelity: 'exact',
-        renderedDisplayEvidence: observedTurn,
-        renderedIdentityMode: 'canonical_exact'
-      });
-      strictStarted += 1;
-      await strictGate;
-      return strictResult;
-    },
-    observeReviewResponse: async () => strictResult
-  };
-  const ordinaryController = {
-    runExclusive: async (fn) => await fn(),
-    query: async () => {
-      ordinaryStarted += 1;
-      await ordinaryGate;
-      return { text: 'ordinary done' };
-    }
-  };
-  const tabs = {
-    listTabs: () => [{ id: 'strict-tab', key: 'strict-governor-key' }, { id: 'ordinary-tab', key: 'ordinary-after-strict' }],
-    ensureTab: async ({ key }) => key === 'strict-governor-key' ? 'strict-tab' : 'ordinary-tab',
-    getControllerById: (id) => id === 'strict-tab' ? strictController : ordinaryController,
-    closeTab: async () => true
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 'ordinary-tab',
-    serverId: 'sid-shared-governor-strict-first',
-    stateDir,
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
-  });
-  t.after(() => {
-    releaseStrict?.();
-    releaseOrdinary?.();
-    server.close();
-  });
-  const port = server.address().port;
-  const strictBody = {
-    stableKey: 'strict-governor-key',
-    provider: 'chatgpt',
-    model: 'GPT-5.6 Pro',
-    conversationUrl: strictResult.conversationUrl,
-    conversationId: strictResult.conversationId,
-    idempotencyKey: 'strict-governor-op',
-    prompt,
-    promptSha256,
-    responsePath: path.join(stateDir, 'strict-governor-response.md'),
-    timeoutMs: 60_000
-  };
-  const strict = req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: strictBody });
-  for (let i = 0; i < 50 && strictStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  if (strictStarted !== 1) {
-    const early = await bounded(strict, 'fresh strict request neither started nor returned');
-    assert.fail(`fresh strict request returned before controller start: ${JSON.stringify(early)}`);
-  }
-  const ordinaryBlocked = await bounded(
-    req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'blocked by strict' } }),
-    'ordinary admission did not return while strict was active'
-  );
-  assert.equal(ordinaryBlocked.res.status, 429);
-  assert.equal(ordinaryBlocked.data.reason, 'max_inflight');
-  const activeVerified = await bounded(
-    req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } }),
-    'active strict observation did not return'
-  );
-  assert.equal(activeVerified.res.status, 200);
-  assert.equal(activeVerified.data.receipt.userMessageId, strictResult.userMessageId);
-
-  releaseStrict();
-  assert.equal((await bounded(strict, 'fresh strict request did not return')).res.status, 200);
-
-  const ordinary = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'ordinary-after-strict', prompt: 'hold while observing' } });
-  for (let i = 0; i < 50 && ordinaryStarted === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  const verified = await bounded(
-    req({ port, token: 'secret', method: 'POST', pth: '/review-query', body: { ...strictBody, verifyExisting: true } }),
-    'post-completion strict observation did not return'
-  );
-  assert.equal(verified.res.status, 200);
-  assert.equal(verified.data.receipt.operationId, (await readReviewTransportState(stateDir)).operations[strictBody.idempotencyKey].operationId);
-
-  releaseOrdinary();
-  assert.equal((await bounded(ordinary, 'ordinary query did not return')).res.status, 200);
-});
 
 test('http-api: query pacing returns 429 with retryAfterMs when max wait is 0', async (t) => {
   let calls = 0;

@@ -27,10 +27,12 @@ test('mcp-server registers agentify_* tools only', async () => {
   assert.ok(src.includes("path: '/review-query'"), 'expected strict review-query endpoint forwarding');
   assert.ok(src.includes("'agentify_review_preflight'"), 'expected native non-sending strict preflight tool');
   assert.ok(src.includes("path: '/review-preflight'"), 'expected native review-preflight endpoint forwarding');
-  assert.ok(src.includes("'agentify_review_reasoning_mode_preflight'"), 'expected native no-send ChatGPT reasoning-mode preflight tool');
-  assert.ok(src.includes("path: '/review-reasoning-mode-preflight'"), 'expected native reasoning-mode endpoint forwarding');
-  assert.ok(src.includes("'agentify_review_reasoning_mode_diagnostics'"), 'expected native read-only ChatGPT reasoning-mode diagnostic tool');
-  assert.ok(src.includes("path: '/review-reasoning-mode-diagnostics'"), 'expected native reasoning-mode diagnostic endpoint forwarding');
+  assert.ok(src.includes("'agentify_review_reasoning_effort_preflight'"), 'expected native no-send ChatGPT reasoning-effort preflight tool');
+  assert.ok(src.includes("path: '/review-reasoning-effort-preflight'"), 'expected native reasoning-effort endpoint forwarding');
+  assert.ok(src.includes("'agentify_review_reasoning_effort_diagnostics'"), 'expected native read-only ChatGPT reasoning-effort diagnostic tool');
+  assert.ok(src.includes("path: '/review-reasoning-effort-diagnostics'"), 'expected native reasoning-effort diagnostic endpoint forwarding');
+  assert.equal(src.includes("'agentify_review_reasoning_mode_preflight'"), false);
+  assert.equal(src.includes("path: '/review-reasoning-mode-preflight'"), false);
   assert.ok(src.includes("'agentify_review_chatgpt_profile_snapshot'"), 'expected native aggregate-only ChatGPT profile snapshot tool');
   assert.ok(src.includes("path: '/review-chatgpt-profile-snapshot'"), 'expected native profile snapshot endpoint forwarding');
   assert.ok(src.includes("'agentify_operator_observe'"), 'expected closed-loop native operator observation tool');
@@ -43,7 +45,7 @@ test('mcp-server registers agentify_* tools only', async () => {
   assert.equal(src.includes("'agentify_review_cancel_prepared'"), false, 'redundant zero-send retirement tool must stay absent');
   assert.ok(src.includes("'agentify_review_observe'"), 'expected native ledger-only strict observation tool');
   assert.ok(src.includes("path: '/review-observe'"), 'expected native review-observe endpoint forwarding');
-  for (const field of ['stableKey', 'provider', 'model', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'responsePath', 'verifyExisting', 'firstBinding', 'existingTabId']) {
+  for (const field of ['stableKey', 'provider', 'productModel', 'reasoningEffort', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'responsePath', 'verifyExisting', 'firstBinding', 'existingTabId']) {
     assert.ok(src.includes(`${field}:`), `expected ${field} review field`);
   }
   assert.ok(src.includes('promptSha256: z.string().optional()'), 'expected caller prompt hash to be optional and tool-local');

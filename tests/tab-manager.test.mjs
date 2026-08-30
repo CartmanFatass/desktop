@@ -88,6 +88,38 @@ test('tab-manager: failed close retains the tab for observable cleanup recovery'
   assert.equal(manager.listTabs().length, 1);
   assert.equal(manager.listTabs()[0].id, tabId);
 });
+test('tab-manager: stale browser target close releases the exact non-protected logical row', async () => {
+  class ErrorEvent extends Error {}
+  const browserBackend = {
+    async createSession() {
+      return {
+        page: {},
+        presenter: {},
+        isClosed: () => false,
+        close: async () => { throw new ErrorEvent('opaque browser target event'); }
+      };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({ key: 'stale-target', url: 'https://chatgpt.com/c/stale' });
+
+  assert.deepEqual(await manager.closeTab(tabId), { status: 'ALREADY_RELEASED', tabId });
+  assert.deepEqual(manager.listTabs(), []);
+  assert.deepEqual(await manager.closeTab(tabId), { status: 'ALREADY_RELEASED', tabId });
+});
+
+test('tab-manager: protected tab close remains refused', async () => {
+  const browserBackend = {
+    async createSession() {
+      return { page: {}, presenter: {}, isClosed: () => false, close: async () => {} };
+    }
+  };
+  const manager = new TabManager({ browserBackend, createController: async () => ({}) });
+  const tabId = await manager.createTab({ key: 'default', protectedTab: true, url: 'https://chatgpt.com/' });
+
+  await assert.rejects(manager.closeTab(tabId), /default_tab_protected/);
+  assert.equal(manager.listTabs().length, 1);
+});
 
 test('tab-manager: exact stable binding rejects another conversation URL for the same key', async () => {
   const browserBackend = {

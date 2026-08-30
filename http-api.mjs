@@ -93,6 +93,7 @@ export function mapErrorToHttp(error) {
     [
       'review_binding_mismatch',
       'review_idempotency_conflict',
+      'review_operation_in_progress',
       'review_conversation_identity_mismatch',
       'review_model_identity_mismatch',
       'review_identity_unreadable',
@@ -139,18 +140,6 @@ function positiveIntOr(value, fallback, max = Number.POSITIVE_INFINITY) {
   return Math.max(1, Math.min(max, Math.floor(n)));
 }
 
-const STRICT_REVIEW_TERMINAL_TAB_STATES = new Set([
-  'NATURAL_COMPLETION_VERIFIED',
-  'ZERO_SEND_FAILED',
-  'SENT_INPUT_MISMATCH',
-  'SENT_MODEL_MISMATCH'
-]);
-
-const STRICT_REVIEW_RECOVERABLE_TAB_STATES = new Set([
-  'COMMITMENT_UNKNOWN',
-  'SENT_WAITING',
-  'SENT_UNREADABLE'
-]);
 
 function concreteReviewConversationId(receipt) {
   const value = String(
@@ -167,12 +156,14 @@ export async function releaseStrictReviewTab({ tabs, defaultTabId, receipt } = {
     return { status: 'RETAINED_PROTECTED', tabId };
   }
 
-  const transportState = String(receipt?.terminalState || receipt?.status || '').trim();
-  const terminal = receipt?.status === 'COMPLETE' ||
-    STRICT_REVIEW_TERMINAL_TAB_STATES.has(transportState);
-  const recoverable = STRICT_REVIEW_RECOVERABLE_TAB_STATES.has(transportState);
+  const terminal = receipt?.phase === 'TERMINAL';
+  const repairable = receipt?.phase === 'PREPARE_UI' &&
+    receipt?.commitment === 'ZERO_PROVEN' &&
+    receipt?.recoverability === 'PRECOMMIT_REPAIR' &&
+    receipt?.messageCapability === 'AVAILABLE';
+  const observeOnly = receipt?.messageCapability === 'SEALED';
   const conversationId = concreteReviewConversationId(receipt);
-  if (!terminal && !(recoverable && conversationId)) {
+  if (!terminal && !repairable && !(observeOnly && conversationId)) {
     return {
       status: 'RETAINED_RECOVERY_HANDLE',
       tabId,
@@ -181,8 +172,12 @@ export async function releaseStrictReviewTab({ tabs, defaultTabId, receipt } = {
   }
 
   try {
-    await tabs.closeTab(tabId);
-    return { status: 'CLOSED', tabId, conversationId: conversationId || null };
+    const closeReceipt = await tabs.closeTab(tabId);
+    return {
+      status: closeReceipt?.status || 'CLOSED',
+      tabId,
+      conversationId: conversationId || null
+    };
   } catch (error) {
     const message = String(error?.message || error);
     if (message === 'tab_not_found' || message === 'tab_closed') {
@@ -979,8 +974,8 @@ export function startHttpApi({
         const tabId = (body.tabId ? String(body.tabId).trim() : '') || null;
         if (!tabId) return sendJson(res, 400, { error: 'missing_tabId' });
         if (tabId === defaultTabId) throw new Error('default_tab_protected');
-        await tabs.closeTab(tabId);
-        return sendJson(res, 200, { ok: true });
+        const closeReceipt = await tabs.closeTab(tabId);
+        return sendJson(res, 200, { ok: true, receipt: closeReceipt });
       }
 
       if (url.pathname === '/shutdown' && req.method === 'POST') {
@@ -1027,41 +1022,43 @@ export function startHttpApi({
 
       if (url.pathname === '/review-preflight' && req.method === 'POST') {
         const body = await parseBody(req);
-        const expectedModel = String(body.expectedModel || body.model || '').trim();
-        if (!expectedModel) throw new Error('missing_expected_model');
+        const productModel = String(body.productModel || '').trim();
+        if (!productModel) throw new Error('missing_product_model');
+        if (!Object.hasOwn(body, 'reasoningEffort')) throw new Error('missing_reasoning_effort');
+        const reasoningEffort = body.reasoningEffort;
+        if (reasoningEffort !== null && (productModel !== 'GPT-5.6 Sol' || reasoningEffort !== 'Pro')) {
+          throw new Error('review_invalid_request');
+        }
         const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
         const controller = tabs.getControllerById(tabId);
         if (typeof controller?.reviewPreflight !== 'function') throw new Error('review_preflight_unavailable');
-        const result = await runExclusive(controller, async () => controller.reviewPreflight({ expectedModel, timeoutMs }));
+        const result = await runExclusive(controller, async () => controller.reviewPreflight({ productModel, reasoningEffort, timeoutMs }));
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 
       // This path has no prompt or review-operation fields. It can only
-      // normalize the visible ChatGPT High/Pro reasoning mode pre-send.
-      if (url.pathname === '/review-reasoning-mode-preflight' && req.method === 'POST') {
+      // normalize the visible ChatGPT reasoning effort pre-send.
+      if (url.pathname === '/review-reasoning-effort-preflight' && req.method === 'POST') {
         const body = await parseBody(req);
-        const expectedMode = String(body.expectedMode || body.expectedModel || body.model || '').trim();
-        if (!expectedMode) throw new Error('missing_expected_reasoning_mode');
+        const reasoningEffort = String(body.reasoningEffort || '').trim();
+        if (!reasoningEffort) throw new Error('missing_reasoning_effort');
+        if (reasoningEffort !== 'Pro') throw new Error('review_invalid_request');
         const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
         const controller = tabs.getControllerById(tabId);
-        if (typeof controller?.reviewReasoningModePreflight !== 'function') throw new Error('review_reasoning_mode_preflight_unavailable');
-        const result = await runExclusive(controller, async () => controller.reviewReasoningModePreflight({ expectedMode, timeoutMs }));
+        if (typeof controller?.reviewReasoningEffortPreflight !== 'function') throw new Error('review_reasoning_effort_preflight_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewReasoningEffortPreflight({ reasoningEffort, timeoutMs }));
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 
-      if (url.pathname === '/review-reasoning-mode-diagnostics' && req.method === 'POST') {
+      if (url.pathname === '/review-reasoning-effort-diagnostics' && req.method === 'POST') {
         const body = await parseBody(req);
         const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
-        const scope = String(body.scope || 'composer').trim().toLowerCase();
-        if (!['composer', 'page'].includes(scope)) throw new Error('review_reasoning_mode_diagnostic_scope_invalid');
-        const openModeSelector = body.openModeSelector === true;
-        if (openModeSelector && scope !== 'page') throw new Error('review_reasoning_mode_diagnostic_open_requires_page_scope');
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
         const controller = tabs.getControllerById(tabId);
-        if (typeof controller?.reviewReasoningModeDiagnostics !== 'function') throw new Error('review_reasoning_mode_diagnostics_unavailable');
-        const result = await runExclusive(controller, async () => controller.reviewReasoningModeDiagnostics({ timeoutMs, scope, openModeSelector }));
+        if (typeof controller?.reviewReasoningEffortDiagnostics !== 'function') throw new Error('review_reasoning_effort_diagnostics_unavailable');
+        const result = await runExclusive(controller, async () => controller.reviewReasoningEffortDiagnostics({ timeoutMs }));
         return sendJson(res, 200, { ok: true, tabId, result });
       }
 
@@ -1157,8 +1154,9 @@ export function startHttpApi({
         if (activeAdmission && activeAdmission.requestFingerprint !== admission.requestFingerprint) {
           throw new Error('review_idempotency_conflict');
         }
-        const joinsExactActiveOperation = !!activeAdmission;
-        const reserveSendCapacity = admission.requiresSendCapacity && !joinsExactActiveOperation;
+        if (activeAdmission) throw new Error('review_operation_in_progress');
+        const joinsExactActiveOperation = false;
+        const reserveSendCapacity = admission.requiresSendCapacity;
         if (reserveSendCapacity) {
           assertInflightCapacity({ governor, operationKind: 'strict-review' });
           inflight.queries += 1;
@@ -1240,13 +1238,13 @@ export function startHttpApi({
           const tabLifecycle = await releaseReviewReceipt(receipt);
           const returnedReceipt = { ...receipt, tabLifecycle };
           if (reviewRun.tabId) {
-            const nonterminal = new Set(['COMMITMENT_UNKNOWN', 'SENT_WAITING', 'SENT_UNREADABLE']).has(receipt?.terminalState);
+            const nonterminal = receipt?.phase !== 'TERMINAL';
             setLastOutcome(reviewRun.tabId, {
               status: nonterminal ? 'in_progress' : 'success',
               label: nonterminal
-                ? 'Strict review retained for observation'
+                ? 'Strict review retained for recovery'
                 : reviewRun.verifyExisting ? 'Strict review observed' : 'Strict review completed',
-              detail: receipt?.terminalState || receipt?.status || 'complete',
+              detail: `${receipt?.phase || 'UNKNOWN'}:${receipt?.commitment || 'UNKNOWN'}`,
               source: 'strict-review',
               kind: 'review_query',
               finishedAt: Date.now(),
@@ -1265,24 +1263,14 @@ export function startHttpApi({
             // Request validation and programming failures may not have created
             // an operation. Those remain ordinary HTTP errors below.
           }
-          const typedTransportStates = new Set([
-            'ZERO_SEND_FAILED',
-            'COMMITMENT_UNKNOWN',
-            'SENT_WAITING',
-            'SENT_UNREADABLE',
-            'SENT_INPUT_MISMATCH',
-            'SENT_MODEL_MISMATCH'
-          ]);
-          if (transportReceipt && typedTransportStates.has(transportReceipt.terminalState)) {
+          if (transportReceipt?.phase) {
             const tabLifecycle = await releaseReviewReceipt(transportReceipt);
             const returnedReceipt = { ...transportReceipt, tabLifecycle };
             if (reviewRun.tabId) {
               setLastOutcome(reviewRun.tabId, {
-                status: ['COMMITMENT_UNKNOWN', 'SENT_WAITING', 'SENT_UNREADABLE'].includes(transportReceipt.terminalState)
-                  ? 'in_progress'
-                  : 'error',
+                status: transportReceipt.phase === 'TERMINAL' ? 'success' : 'in_progress',
                 label: 'Strict review transport fact recorded',
-                detail: transportReceipt.terminalState,
+                detail: `${transportReceipt.phase}:${transportReceipt.commitment}`,
                 source: 'strict-review',
                 kind: 'review_query',
                 finishedAt: Date.now(),
