@@ -979,7 +979,7 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
 function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', triggerCount = 1 } = {}) {
   let menuOpen = false;
   let value = initialValue;
-  let keyboardActivations = 0;
+  let pointerActivations = 0;
   let arrowRightCount = 0;
   let sendActions = 0;
   const page = {
@@ -989,7 +989,7 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
       if (js.includes('agentifyOpenChatgptTargetMenuMarker')) {
         if (menuOpen) return { ok: true, alreadyOpen: true, menuCount: 1 };
         if (triggerCount !== 1) return { ok: false, triggerCount, menuCount: 0 };
-        return { ok: true, alreadyOpen: false, triggerCount: 1, menuCount: 0, focused: true };
+        return { ok: true, alreadyOpen: false, triggerCount: 1, menuCount: 0, rect: { x: 10, y: 10, w: 20, h: 20 } };
       }
       if (js.includes('agentifyVerifyChatgptTargetMenuOpenMarker')) {
         return { opened: menuOpen, menuCount: menuOpen ? 1 : 0 };
@@ -1033,21 +1033,13 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
       if (js.includes('reviewSendOnceMarker')) sendActions += 1;
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
-    async moveMouse() {
-      throw new Error('pointer_activation_forbidden');
-    },
-    async mouseDown() {
-      throw new Error('pointer_activation_forbidden');
-    },
+    async moveMouse() {},
+    async mouseDown() {},
     async mouseUp() {
-      throw new Error('pointer_activation_forbidden');
+      pointerActivations += 1;
+      menuOpen = true;
     },
     async sendKey(key) {
-      if (key === 'Enter') {
-        keyboardActivations += 1;
-        menuOpen = true;
-        return;
-      }
       if (key === 'Escape') {
         menuOpen = false;
         return;
@@ -1062,7 +1054,7 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
   };
   return {
     page,
-    state: () => ({ menuOpen, value, keyboardActivations, arrowRightCount, sendActions })
+    state: () => ({ menuOpen, value, pointerActivations, arrowRightCount, sendActions })
   };
 }
 
@@ -1083,7 +1075,7 @@ test('chatgpt-controller: one target menu proves selected product and Pro effort
   assert.deepEqual(fixture.state(), {
     menuOpen: false,
     value: 4,
-    keyboardActivations: 2,
+    pointerActivations: 2,
     arrowRightCount: 0,
     sendActions: 0
   });
@@ -1102,7 +1094,7 @@ test('chatgpt-controller: one target menu advances High to Pro before closing', 
   assert.deepEqual(fixture.state(), {
     menuOpen: false,
     value: 4,
-    keyboardActivations: 2,
+    pointerActivations: 2,
     arrowRightCount: 2,
     sendActions: 0
   });
@@ -1119,7 +1111,7 @@ test('chatgpt-controller: ambiguous target-menu triggers fail before activation'
     }),
     /chatgpt_target_menu_ambiguous/
   );
-  assert.equal(fixture.state().keyboardActivations, 0);
+  assert.equal(fixture.state().pointerActivations, 0);
   assert.equal(fixture.state().sendActions, 0);
 });
 

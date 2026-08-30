@@ -3211,13 +3211,13 @@ export class ChatGPTController {
         .filter(inComposerNeighborhood)
         .filter((node) => /^(?:High|Pro)$/i.test(normalize(node.getAttribute('aria-label') || node.textContent)));
       if (triggers.length !== 1) return { ok: false, triggerCount: triggers.length, menuCount: 0 };
-      triggers[0].focus();
+      const rect = triggers[0].getBoundingClientRect();
       return {
-        ok: document.activeElement === triggers[0],
+        ok: true,
         alreadyOpen: false,
         triggerCount: 1,
         menuCount: 0,
-        focused: document.activeElement === triggers[0]
+        rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
       };
     })()`);
     if (!target?.ok) {
@@ -3230,8 +3230,7 @@ export class ChatGPTController {
       throw error;
     }
     if (!target.alreadyOpen) {
-      if (!target.focused) throw new Error('chatgpt_target_menu_trigger_focus_unconfirmed');
-      await this.#sendKey('Enter');
+      await this.#clickAt(target.rect.x + target.rect.w / 2, target.rect.y + target.rect.h / 2);
       await sleep(150);
     }
     const opened = await this.#eval(`(() => {

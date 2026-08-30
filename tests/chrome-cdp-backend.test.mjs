@@ -4,7 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { ChromeCdpBrowserBackend, ChromeCdpConnection, chromeSpawnOptions } from '../chrome-cdp-backend.mjs';
+import {
+  ChromeCdpBrowserBackend,
+  ChromeCdpConnection,
+  ChromeCdpPageAdapter,
+  chromeSpawnOptions
+} from '../chrome-cdp-backend.mjs';
 
 class MockWebSocket {
   constructor() {
@@ -88,6 +93,64 @@ test('chrome-cdp-backend: Chrome spawn does not use shell on any platform', () =
   const opts = chromeSpawnOptions();
   assert.equal(opts.stdio, 'ignore');
   assert.equal(Object.hasOwn(opts, 'shell'), false);
+});
+
+test('chrome-cdp-backend: native pointer events carry the pressed-button state', async () => {
+  const calls = [];
+  const page = new ChromeCdpPageAdapter({
+    client: {
+      async send(method, params, sessionId) {
+        calls.push({ method, params, sessionId });
+      }
+    },
+    targetId: 'target-1',
+    sessionId: 'session-1'
+  });
+
+  await page.moveMouse(10, 20);
+  await page.mouseDown(10, 20, { button: 'left', clickCount: 1 });
+  await page.mouseUp(10, 20, { button: 'left', clickCount: 1 });
+
+  assert.deepEqual(calls, [
+    {
+      method: 'Input.dispatchMouseEvent',
+      params: {
+        type: 'mouseMoved',
+        x: 10,
+        y: 20,
+        button: 'none',
+        buttons: 0,
+        pointerType: 'mouse'
+      },
+      sessionId: 'session-1'
+    },
+    {
+      method: 'Input.dispatchMouseEvent',
+      params: {
+        type: 'mousePressed',
+        x: 10,
+        y: 20,
+        button: 'left',
+        buttons: 1,
+        clickCount: 1,
+        pointerType: 'mouse'
+      },
+      sessionId: 'session-1'
+    },
+    {
+      method: 'Input.dispatchMouseEvent',
+      params: {
+        type: 'mouseReleased',
+        x: 10,
+        y: 20,
+        button: 'left',
+        buttons: 0,
+        clickCount: 1,
+        pointerType: 'mouse'
+      },
+      sessionId: 'session-1'
+    }
+  ]);
 });
 
 test('chrome-cdp-backend: connect rejects if websocket closes before open', async () => {
