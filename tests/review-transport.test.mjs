@@ -5,8 +5,14 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { archiveReviewResponse, inspectReviewAdmission, runReviewQuery } from '../review-transport.mjs';
-import { readReviewTransportState, reviewTransportPath } from '../state.mjs';
+import {
+  archiveReviewResponse,
+  inspectReviewAdmission,
+  reviewExactRuntimePathRequestFingerprint,
+  reviewRequestFingerprint,
+  runReviewQuery
+} from '../review-transport.mjs';
+import { readReviewTransportState, reviewTransportPath, writeReviewTransportState } from '../state.mjs';
 import { reviewPlainTextIdentity } from '../review-text-identity.mjs';
 
 async function tempDir() {
@@ -47,6 +53,27 @@ function request(responsePath, overrides = {}) {
     ...overrides
   };
 }
+const frozenPosixResponsePath = '/home/fires/hmasd/docs/external-review/directions/voronoi_quadrature_field_policy/a486fa196984d912a504/pro_innovator/chatgpt/response.md';
+const frozenWslLocalhostResponsePath = String.raw`\\wsl.localhost\Ubuntu-24.04\home\fires\hmasd\docs\external-review\directions\voronoi_quadrature_field_policy\a486fa196984d912a504\pro_innovator\chatgpt\response.md`;
+const frozenWslDollarResponsePath = String.raw`\\wsl$\Ubuntu-24.04\home\fires\hmasd\docs\external-review\directions\voronoi_quadrature_field_policy\a486fa196984d912a504\pro_innovator\chatgpt\response.md`;
+function frozenFingerprintRequest(responsePath) {
+  return {
+    stableKey: 'vqfp-g5-witness-alignment-r01-pro-innovator-current-contract-2f053495-73cc-44b3-8849-834a43de27b8',
+    provider: 'chatgpt',
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    conversationUrl: 'https://chatgpt.com/',
+    conversationId: '__new__',
+    idempotencyKey: 'vqfp-g5-witness-alignment-r01-pro-innovator-current-contract-ff500569-be6a-4b40-b558-9e39892f261a',
+    promptSha256: 'f98c9f66c41f4d52b61c60ce9ec27b360e819adf61144a8ae9e85c0f98cf0049',
+    responsePath,
+    firstBinding: true,
+    geminiBootstrap: false,
+    geminiBootstrapContinuation: false,
+    bootstrapNonScientific: false
+  };
+}
+
 function legacyReviewState() {
   const now = 1_700_000_000_000;
   return {
@@ -206,6 +233,149 @@ function fakeTabs(controller) {
     get showCount() { return showCount; }
   };
 }
+async function formerFingerprintOperation(stateDir) {
+  const responsePath = String.raw`\\wsl.localhost\Ubuntu-24.04\home\fires\hmasd\review-response.md`;
+  const input = request(responsePath);
+  await assert.rejects(
+    runReviewQuery({
+      stateDir,
+      tabs: fakeTabs(fakeController({ preBoundaryFailures: 1 })),
+      request: input
+    }),
+    /synthetic_precommit_ui_failure/
+  );
+  const state = await readReviewTransportState(stateDir);
+  const operation = state.operations['operation-1'];
+  operation.operationId = '149f2bc3-e722-47c4-98fd-860ac2a2e343';
+  operation.requestFingerprint = reviewExactRuntimePathRequestFingerprint(operation);
+  await writeReviewTransportState(state, stateDir);
+  return { input, operationId: operation.operationId, formerFingerprint: operation.requestFingerprint };
+}
+
+test('review transport: frozen VQFP fingerprint projects POSIX and both WSL UNC spellings to one identity', () => {
+  const expected = 'db4b55ed34a7aaba53cde0a8ddc169c75af9ea8f6380f31cdf1283c70e0f878b';
+  for (const responsePath of [frozenPosixResponsePath, frozenWslLocalhostResponsePath, frozenWslDollarResponsePath]) {
+    assert.equal(reviewRequestFingerprint(frozenFingerprintRequest(responsePath)), expected);
+  }
+  assert.equal(
+    reviewRequestFingerprint(frozenFingerprintRequest(frozenPosixResponsePath)),
+    reviewExactRuntimePathRequestFingerprint(frozenFingerprintRequest(frozenPosixResponsePath))
+  );
+  assert.equal(
+    reviewExactRuntimePathRequestFingerprint(frozenFingerprintRequest(frozenWslLocalhostResponsePath)),
+    '2d30400032ad0dc11f88fc951cf004bf5e9e0a31ec62ddb3d8b35f26e1be05b9'
+  );
+  const ordinaryWindowsPath = String.raw`C:\Agentify\responses\review.md`;
+  assert.equal(
+    reviewRequestFingerprint(frozenFingerprintRequest(ordinaryWindowsPath)),
+    reviewExactRuntimePathRequestFingerprint(frozenFingerprintRequest(ordinaryWindowsPath))
+  );
+});
+
+test('review transport: exact zero-send runtime-path drift corrects once in place before repair', async () => {
+  const stateDir = await tempDir();
+  const { input, operationId, formerFingerprint } = await formerFingerprintOperation(stateDir);
+  const admission = await inspectReviewAdmission({ stateDir, request: input });
+  assert.equal(admission.repairable, true);
+
+  for (const expectedAttemptCount of [2, 3]) {
+    await assert.rejects(
+      runReviewQuery({
+        stateDir,
+        tabs: fakeTabs(fakeController({ preBoundaryFailures: 1 })),
+        request: input
+      }),
+      /synthetic_precommit_ui_failure/
+    );
+    const operation = (await readReviewTransportState(stateDir)).operations['operation-1'];
+    assert.equal(operation.operationId, operationId);
+    assert.deepEqual(
+      [operation.idempotencyKey, operation.stableKey],
+      [input.idempotencyKey, input.stableKey]
+    );
+    assert.equal(operation.responsePath, input.responsePath);
+    assert.equal(operation.requestFingerprint, admission.requestFingerprint);
+    assert.equal(operation.attemptCount, expectedAttemptCount);
+    assert.deepEqual(
+      [operation.providerUserMessageCount, operation.sendActivationCount, operation.userMessageId],
+      [0, 0, undefined]
+    );
+    assert.deepEqual(operation.fingerprintCorrection, {
+      from: formerFingerprint,
+      to: admission.requestFingerprint,
+      basis: 'wsl_unc_response_path_projection_v1'
+    });
+  }
+});
+
+test('review transport: fingerprint drift refuses sent, unresolved, immutable-field, and former-fingerprint mismatches', async () => {
+  const cases = [
+    {
+      name: 'sent',
+      change(operation) {
+        Object.assign(operation, {
+          phase: 'WAIT_RESPONSE',
+          commitment: 'ONE_EXACT',
+          recoverability: 'POSTCOMMIT_RECOVERY',
+          observability: 'FRESH_COMPLETE',
+          messageCapability: 'SEALED',
+          providerUserMessageCount: 1,
+          sendActivationCount: 1,
+          userMessageId: 'user-1',
+          turnConfirmationMode: 'agentify_review_causal_submission_v1',
+          productModelEvidence,
+          reasoningEffortEvidence
+        });
+      }
+    },
+    {
+      name: 'unresolved',
+      change(operation) {
+        Object.assign(operation, {
+          phase: 'VERIFY_COMMITMENT',
+          commitment: 'UNRESOLVED',
+          recoverability: 'OBSERVE_ONLY',
+          observability: 'LOST',
+          messageCapability: 'SEALED',
+          failure: { locus: 'COMMIT_BOUNDARY', code: 'INTERRUPTED_RESERVED_BOUNDARY' }
+        });
+      }
+    },
+    {
+      name: 'immutable field',
+      change(operation) {
+        operation.promptSha256 = 'b'.repeat(64);
+      }
+    },
+    {
+      name: 'former fingerprint',
+      change(operation) {
+        operation.requestFingerprint = 'c'.repeat(64);
+      }
+    }
+  ];
+
+  for (const scenario of cases) {
+    const stateDir = await tempDir();
+    const { input } = await formerFingerprintOperation(stateDir);
+    const state = await readReviewTransportState(stateDir);
+    scenario.change(state.operations['operation-1']);
+    await writeReviewTransportState(state, stateDir);
+    await assert.rejects(
+      inspectReviewAdmission({ stateDir, request: input }),
+      (error) => error?.message === 'review_idempotency_conflict',
+      scenario.name
+    );
+    const controller = fakeController();
+    await assert.rejects(
+      runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input }),
+      (error) => error?.message === 'review_idempotency_conflict',
+      scenario.name
+    );
+    assert.equal(controller.activations, 0);
+  }
+});
+
 test('review transport: legacy binding and idempotency tombstones are sealed before admission or intake', async () => {
   const collisions = [
     {

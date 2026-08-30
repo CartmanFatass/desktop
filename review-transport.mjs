@@ -16,6 +16,7 @@ const MIN_REVIEW_TIMEOUT_MS = 1_000;
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const REVIEW_OBSERVED_EXACT_TURN_MODEL = 'agentify_review_observed_exact_turn_v3';
+const WSL_RESPONSE_PATH_FINGERPRINT_CORRECTION_BASIS = 'wsl_unc_response_path_projection_v1';
 const stateLocks = new Map();
 const activeReviewExecutions = new Set();
 
@@ -132,6 +133,13 @@ function conversationIdentityFromUrl(value) {
   if (marker < 0 || marker + 1 >= parts.length) fail('review_invalid_request', { field: 'conversationUrl' });
   return { provider, conversationId: parts[marker + 1] };
 }
+function normalizeResponsePath(value) {
+  if (path.isAbsolute(value)) return path.resolve(value);
+  if (path.posix.isAbsolute(value)) return path.posix.normalize(value);
+  if (path.win32.isAbsolute(value)) return path.win32.normalize(value);
+  fail('review_invalid_request', { field: 'responsePath' });
+}
+
 function normalizeRequest(input) {
   const request = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   for (const legacy of ['model', 'expectedModel', 'expectedMode', 'modelEvidence']) if (Object.hasOwn(request, legacy)) fail('review_invalid_request', { field: legacy });
@@ -167,14 +175,24 @@ function normalizeRequest(input) {
   const verifyExisting = request.verifyExisting === true;
   const responsePath = request.responsePath == null ? null : requiredText(request.responsePath, 'responsePath', { max: 32_768 });
   if (!verifyExisting && !responsePath) fail('review_invalid_request', { field: 'responsePath' });
-  if (responsePath && !path.isAbsolute(responsePath)) fail('review_invalid_request', { field: 'responsePath' });
+  const normalizedResponsePath = responsePath ? normalizeResponsePath(responsePath) : null;
   const timeoutMs = Number(request.timeoutMs ?? MAX_REVIEW_TIMEOUT_MS);
   if (!Number.isInteger(timeoutMs) || timeoutMs < MIN_REVIEW_TIMEOUT_MS || timeoutMs > MAX_REVIEW_TIMEOUT_MS) fail('review_timeout_out_of_range');
   const existingTabId = request.existingTabId == null ? null : requiredText(request.existingTabId, 'existingTabId', { max: 512 });
-  return { stableKey, provider, productModel, reasoningEffort, conversationUrl, conversationId, idempotencyKey, prompt, promptSha256, responsePath: responsePath ? path.resolve(responsePath) : null, timeoutMs, verifyExisting, firstBinding, geminiBootstrap, geminiBootstrapContinuation, bootstrapNonScientific, existingTabId };
+  return { stableKey, provider, productModel, reasoningEffort, conversationUrl, conversationId, idempotencyKey, prompt, promptSha256, responsePath: normalizedResponsePath, timeoutMs, verifyExisting, firstBinding, geminiBootstrap, geminiBootstrapContinuation, bootstrapNonScientific, existingTabId };
 }
-function requestFingerprint(request) {
-  return sha256(JSON.stringify({ stableKey: request.stableKey, provider: request.provider, productModel: request.productModel, reasoningEffort: request.reasoningEffort, conversationUrl: request.conversationUrl, conversationId: request.conversationId, idempotencyKey: request.idempotencyKey, promptSha256: request.promptSha256, responsePath: request.responsePath, firstBinding: request.firstBinding, geminiBootstrap: request.geminiBootstrap, geminiBootstrapContinuation: request.geminiBootstrapContinuation, bootstrapNonScientific: request.bootstrapNonScientific }));
+function fingerprintResponsePath(responsePath) {
+  const wsl = /^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+\\(.*)$/i.exec(responsePath || '');
+  return wsl ? `/${wsl[1].replace(/\\/g, '/')}` : responsePath;
+}
+function requestFingerprintPayload(request, responsePath) {
+  return { stableKey: request.stableKey, provider: request.provider, productModel: request.productModel, reasoningEffort: request.reasoningEffort, conversationUrl: request.conversationUrl, conversationId: request.conversationId, idempotencyKey: request.idempotencyKey, promptSha256: request.promptSha256, responsePath, firstBinding: request.firstBinding, geminiBootstrap: request.geminiBootstrap, geminiBootstrapContinuation: request.geminiBootstrapContinuation, bootstrapNonScientific: request.bootstrapNonScientific };
+}
+export function reviewRequestFingerprint(request) {
+  return sha256(JSON.stringify(requestFingerprintPayload(request, fingerprintResponsePath(request.responsePath))));
+}
+export function reviewExactRuntimePathRequestFingerprint(request) {
+  return sha256(JSON.stringify(requestFingerprintPayload(request, request.responsePath)));
 }
 async function withStateLock(stateDir, fn) {
   const key = path.resolve(stateDir);
@@ -198,6 +216,35 @@ async function readStateLocked(stateDir) { return await withStateLock(stateDir, 
 function repairable(operation) {
   return operation?.phase === 'PREPARE_UI' && operation.commitment === 'ZERO_PROVEN' && operation.recoverability === 'PRECOMMIT_REPAIR' && operation.messageCapability === 'AVAILABLE' && operation.providerUserMessageCount === 0 && operation.sendActivationCount === 0 && !operation.userMessageId;
 }
+function sameImmutableRequest(operation, request) {
+  return [
+    'stableKey',
+    'provider',
+    'productModel',
+    'reasoningEffort',
+    'conversationUrl',
+    'conversationId',
+    'idempotencyKey',
+    'promptSha256',
+    'responsePath',
+    'firstBinding',
+    'geminiBootstrap',
+    'geminiBootstrapContinuation',
+    'bootstrapNonScientific'
+  ].every((field) => operation?.[field] === request[field]);
+}
+function correctableFingerprintDrift(operation, request, fingerprint) {
+  if (
+    request.verifyExisting ||
+    !repairable(operation) ||
+    !sameImmutableRequest(operation, request) ||
+    fingerprintResponsePath(request.responsePath) === request.responsePath
+  ) return null;
+  const formerFingerprint = reviewExactRuntimePathRequestFingerprint(request);
+  if (operation.requestFingerprint !== formerFingerprint) return null;
+  return { from: formerFingerprint, to: fingerprint, basis: WSL_RESPONSE_PATH_FINGERPRINT_CORRECTION_BASIS };
+}
+
 function rejectLegacyKeyReuse(state, request) {
   if (state.legacy?.idempotencyKeys.includes(request.idempotencyKey)) {
     fail('review_idempotency_conflict', { legacy: true, sealed: true, keyType: 'idempotency' });
@@ -230,11 +277,14 @@ function publicReceipt(operation) { const { responseText: _responseText, ...rece
 export async function inspectReviewAdmission({ stateDir, request: rawRequest }) {
   if (!stateDir) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
-  const fingerprint = requestFingerprint(request);
+  const fingerprint = reviewRequestFingerprint(request);
   const state = await readStateLocked(stateDir);
   rejectLegacyKeyReuse(state, request);
   const existing = state.operations[request.idempotencyKey] || null;
-  if (existing && existing.requestFingerprint !== fingerprint && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
+  const fingerprintCorrection = existing?.requestFingerprint === fingerprint
+    ? null
+    : correctableFingerprintDrift(existing, request, fingerprint);
+  if (existing && existing.requestFingerprint !== fingerprint && !fingerprintCorrection && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
   const mayRepair = !!existing && repairable(existing) && !request.verifyExisting;
   const observationOnly = request.verifyExisting || (!!existing && !mayRepair);
   return { idempotencyKey: request.idempotencyKey, requestFingerprint: fingerprint, exactExisting: !!existing, repairable: mayRepair, observationOnly, requiresSendCapacity: !observationOnly };
@@ -281,7 +331,7 @@ function observeArgs(operation, request) {
 async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, onTabResolved = null }) {
   if (!stateDir || !tabs) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
-  const fingerprint = requestFingerprint(request);
+  const fingerprint = reviewRequestFingerprint(request);
   const promptIdentity = reviewPlainTextIdentity(request.prompt);
   const intake = await mutateState(stateDir, async (state) => {
     const now = Date.now();
@@ -289,6 +339,13 @@ async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, on
     const binding = state.bindings[request.stableKey];
     const existing = state.operations[request.idempotencyKey];
     sealInterruptedReservation(existing);
+    const fingerprintCorrection = existing?.requestFingerprint === fingerprint
+      ? null
+      : correctableFingerprintDrift(existing, request, fingerprint);
+    if (fingerprintCorrection) {
+      existing.requestFingerprint = fingerprint;
+      existing.fingerprintCorrection = fingerprintCorrection;
+    }
     if (existing && existing.requestFingerprint !== fingerprint && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
     if (request.verifyExisting) {
       if (!existing || existing.commitment === 'ZERO_PROVEN') fail('review_observation_unavailable');

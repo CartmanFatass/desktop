@@ -114,6 +114,46 @@ test('state: current ledger is v3 only and repairable orthogonal state round-tri
   await writeReviewTransportState(value, dir);
   assert.deepEqual(await readReviewTransportState(dir), value);
 });
+test('state: WSL fingerprint correction provenance round-trips and validates exactly', async () => {
+  const dir = await tempDir();
+  const operation = {
+    ...repairableOperation(),
+    requestFingerprint: 'b'.repeat(64),
+    responsePath: String.raw`\\wsl.localhost\Ubuntu-24.04\home\fires\hmasd\response.md`,
+    fingerprintCorrection: {
+      from: 'a'.repeat(64),
+      to: 'b'.repeat(64),
+      basis: 'wsl_unc_response_path_projection_v1'
+    }
+  };
+  const value = stateWith(operation);
+  await writeReviewTransportState(value, dir);
+  assert.deepEqual(
+    (await readReviewTransportState(dir)).operations['operation-key'].fingerprintCorrection,
+    operation.fingerprintCorrection
+  );
+
+  const invalidCorrections = [
+    { ...operation.fingerprintCorrection, from: 'former' },
+    { ...operation.fingerprintCorrection, to: 'c'.repeat(64) },
+    { ...operation.fingerprintCorrection, basis: 'runtime_path_replacement' },
+    { ...operation.fingerprintCorrection, extra: true }
+  ];
+  for (const fingerprintCorrection of invalidCorrections) {
+    await assert.rejects(
+      writeReviewTransportState(stateWith({ ...operation, fingerprintCorrection }), dir),
+      /review_transport_state_invalid/
+    );
+  }
+  await assert.rejects(
+    writeReviewTransportState(
+      stateWith({ ...operation, responsePath: String.raw`\\server\share\response.md` }),
+      dir
+    ),
+    /review_transport_state_invalid/
+  );
+});
+
 test('state: current cutover operation identity remains ordinary current semantics', async () => {
   const dir = await tempDir();
   const idempotencyKey = 'chatgpt_gpt56sol_pro_full_ui_transport_contract_review_20260318';

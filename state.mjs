@@ -77,6 +77,7 @@ const REVIEW_FAILURE_LOCI = new Set([
 ]);
 const UPPER_CODE = /^[A-Z][A-Z0-9_]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const WSL_RESPONSE_PATH_FINGERPRINT_CORRECTION_BASIS = 'wsl_unc_response_path_projection_v1';
 const LEGACY_TRANSPORT_FIELDS = [
   'model',
   'expectedModel',
@@ -392,6 +393,24 @@ function validateFailure(failure) {
     throw new Error('review_transport_state_invalid');
   }
 }
+function validateFingerprintCorrection(operation) {
+  const correction = operation.fingerprintCorrection;
+  if (correction === undefined) return;
+  if (
+    !record(correction) ||
+    Object.keys(correction).length !== 3 ||
+    !Object.hasOwn(correction, 'from') ||
+    !Object.hasOwn(correction, 'to') ||
+    !Object.hasOwn(correction, 'basis') ||
+    !SHA256.test(String(correction.from || '')) ||
+    !SHA256.test(String(correction.to || '')) ||
+    correction.from === correction.to ||
+    correction.to !== operation.requestFingerprint ||
+    correction.basis !== WSL_RESPONSE_PATH_FINGERPRINT_CORRECTION_BASIS ||
+    !/^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+\\/i.test(operation.responsePath)
+  ) throw new Error('review_transport_state_invalid');
+}
+
 
 function validateReviewTransportState(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
@@ -470,6 +489,7 @@ function validateReviewTransportState(value) {
     validateTargetAxes(operation);
     validateEvidence(operation, { required: operation.commitment === 'ONE_EXACT' });
     validateFailure(operation.failure);
+    validateFingerprintCorrection(operation);
 
     if (
       operation.messageCapability === 'AVAILABLE' &&
