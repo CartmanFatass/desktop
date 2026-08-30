@@ -25,10 +25,8 @@ import {
   summarizeReviewComposerStructure
 } from '../chatgpt-controller.mjs';
 import {
-  REVIEW_CAUSAL_SUBMISSION_MODEL,
   REVIEW_PLAIN_TEXT_MODEL,
   compareReviewPlainText,
-  reviewBaselineMessageIdsSha256,
   reviewPlainTextIdentity,
   safeReviewPlainTextComparison
 } from '../review-text-identity.mjs';
@@ -36,17 +34,6 @@ import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacemen
 
 const textNode = (value) => ({ nodeType: 3, nodeValue: value });
 const elementNode = (tagName, ...childNodes) => ({ nodeType: 1, tagName, childNodes });
-const causalReceipt = (prompt, baselineMessageIds = [], operationId = 'test-operation') => ({
-  ok: true,
-  persisted: true,
-  identityModel: REVIEW_CAUSAL_SUBMISSION_MODEL,
-  operationId,
-  sendActionCount: 1,
-  clickCount: 1,
-  sourceSha256: reviewPlainTextIdentity(prompt).sourceSha256,
-  canonicalPromptSha256: reviewPlainTextIdentity(prompt).canonicalSha256,
-  baselineMessageIdsSha256: reviewBaselineMessageIdsSha256(baselineMessageIds)
-});
 
 function strictComposerEvaluateFixture({ prompt, existingDraft = '', failEmpty = false, failCaret = false } = {}) {
   let current = String(existingDraft);
@@ -385,7 +372,7 @@ test('chatgpt-controller: 7024-character structural fixture remains collision-re
   assert.notEqual(rejected.canonicalPromptSha256, rejected.observedCanonicalSha256);
 });
 
-test('chatgpt-controller: content-rebind receipt accepts browser space rebalance only under the same canonical hash', () => {
+test('chatgpt-controller: exact rendered identity accepts browser space rebalance only under the same canonical hash', () => {
   const expected = '  branch\n   nested\n';
   const rendered = '\u00a0 branch\n\u00a0  nested\n';
   const receipt = safeReviewPlainTextComparison(expected, rendered);
@@ -533,85 +520,6 @@ test('chatgpt-controller: composer mismatch diagnostics identify the first code-
 });
 
 
-test('chatgpt-controller: submission diagnosis injects the structure summarizer dependency', async () => {
-  const url = 'https://chatgpt.com/c/conversation-diagnostic';
-  const prompt = 'exact';
-  const page = {
-    async getUrl() { return url; },
-    async evaluate(js) {
-      assert.equal(js.includes('reviewSnapshotMarker'), true);
-      assert.equal(js.includes('const summarizeReviewComposerStructure ='), true);
-      assert.equal(js.includes('renderedProjection: serialized.renderedProjection || null'), true);
-      return {
-        messages: [{
-          order: 0,
-          role: 'user',
-          id: 'user-diagnostic',
-          text: prompt,
-          textLength: prompt.length,
-          textIdentityReadable: true,
-          textIdentityError: null,
-          textIdentityTag: null,
-          textIdentityDiagnostic: {
-            candidateCount: 1,
-            rootTag: 'DIV',
-            elementCount: 1,
-            textNodeCount: 1,
-            otherNodeCount: 0,
-            maxDepth: 1,
-            tagHistogram: { DIV: 1 }
-          }
-        }],
-        modelEvidence: 'GPT-5.6 Pro',
-        modelEvidenceCandidates: ['GPT-5.6 Pro'],
-        controlText: [],
-        selectorStop: false,
-        sendVisible: true
-      };
-    }
-  };
-  const controller = new ChatGPTController({ page, selectors: {} });
-  const result = await controller.inspectReviewSubmissionIdentity({
-    prompt,
-    baselineMessageIds: [],
-    expectedUrl: url,
-    expectedConversationId: 'conversation-diagnostic',
-    expectedModel: 'GPT-5.6 Pro'
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.serializedLength, prompt.length);
-});
-
-test('chatgpt-controller: submission diagnosis rejects multiple new user message identities', async () => {
-  const url = 'https://chatgpt.com/c/conversation-multiple';
-  const page = {
-    async getUrl() { return url; },
-    async evaluate() {
-      return {
-        messages: [
-          { order: 0, role: 'user', id: 'user-1', text: 'exact', textLength: 5, textIdentityReadable: true },
-          { order: 1, role: 'user', id: 'user-2', text: 'exact', textLength: 5, textIdentityReadable: true }
-        ],
-        modelEvidence: 'GPT-5.6 Pro',
-        modelEvidenceCandidates: ['GPT-5.6 Pro'],
-        controlText: [],
-        selectorStop: false,
-        sendVisible: true
-      };
-    }
-  };
-  const controller = new ChatGPTController({ page, selectors: {} });
-  const result = await controller.inspectReviewSubmissionIdentity({
-    prompt: 'exact',
-    baselineMessageIds: [],
-    expectedUrl: url,
-    expectedConversationId: 'conversation-multiple',
-    expectedModel: 'GPT-5.6 Pro'
-  });
-  assert.equal(result.ok, false);
-  assert.equal(result.providerUserMessageCount, 2);
-  assert.equal(result.exactMatchCount, 2);
-});
 
 test('chatgpt-controller: canonical turn entries collapse duplicate ChatGPT user wrappers but retain distinct turns', () => {
   const turn = (id) => ({ getAttribute: (name) => name === 'data-message-id' ? id : null });
@@ -1282,7 +1190,6 @@ test('chatgpt-controller: ChatGPT profile snapshot reports aggregate cookie pres
   assert.equal(result.cookiePresence.matchingCookieCount, 3);
   assert.equal(result.cookiePresence.nonEmpty, true);
   assert.equal(result.visibleControls.promptInsertCount, 0);
-  assert.equal(result.sendActivationCount, 0);
 });
 
 test('chatgpt-controller: send falls back to requestSubmit on the active composer before Enter', async () => {
@@ -1567,4 +1474,18 @@ test('chatgpt-controller: wait response recovers the completed latest exchange f
   assert.equal(result.text, 'completed answer');
   assert.equal(result.meta.recoveredFromIdle, true);
   assert.equal(result.meta.latestUserText, 'current scientific question');
+});
+
+test('chatgpt-controller: strict Send uses one hit-tested native pointer and no DOM click', () => {
+  const source = readFileSync(new URL('../chatgpt-controller.mjs', import.meta.url), 'utf8');
+  const start = source.indexOf('async #clickReviewSendOnce');
+  const end = source.indexOf('async #waitForReviewUserMessage', start);
+  assert.ok(start >= 0 && end > start);
+  const strictSend = source.slice(start, end);
+  assert.match(strictSend, /document\.elementFromPoint/);
+  assert.match(strictSend, /await onSendAttempted\?\./);
+  assert.match(strictSend, /await this\.#clickAt/);
+  assert.doesNotMatch(strictSend, /\.click\s*\(/);
+  assert.equal((strictSend.match(/await this\.#clickAt/g) || []).length, 1);
+  assert.ok(strictSend.indexOf('await onSendAttempted?.') < strictSend.indexOf('await this.#clickAt'));
 });

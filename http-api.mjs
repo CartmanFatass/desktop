@@ -156,18 +156,14 @@ export async function releaseStrictReviewTab({ tabs, defaultTabId, receipt } = {
     return { status: 'RETAINED_PROTECTED', tabId };
   }
 
-  const terminal = receipt?.phase === 'TERMINAL';
-  const repairable = receipt?.phase === 'PREPARE_UI' &&
-    receipt?.commitment === 'ZERO_PROVEN' &&
-    receipt?.recoverability === 'PRECOMMIT_REPAIR' &&
-    receipt?.messageCapability === 'AVAILABLE';
-  const observeOnly = receipt?.messageCapability === 'SEALED';
+  const sendAttempted = receipt?.sendAttempted === true;
+  const archived = receipt?.archive != null;
   const conversationId = concreteReviewConversationId(receipt);
-  if (!terminal && !repairable && !(observeOnly && conversationId)) {
+  if (sendAttempted && !archived && !conversationId) {
     return {
-      status: 'RETAINED_RECOVERY_HANDLE',
+      status: 'RETAINED_UNBOUND_TAB',
       tabId,
-      reason: 'concrete_conversation_id_unavailable'
+      reason: 'conversation_identity_unavailable'
     };
   }
 
@@ -1091,7 +1087,6 @@ export function startHttpApi({
         const body = await parseBody(req, { maxBytes: 8_192 });
         const tabId = String(body.tabId || '').trim();
         if (!tabId) throw new Error('missing_tabId');
-        await showTabForNativeInput(tabs, tabId);
         const controller = tabs.getControllerById(tabId);
         if (!controller) throw new Error('tab_not_found');
         if (typeof controller.operatorObserve !== 'function') throw new Error('operator_observe_unavailable');
@@ -1165,7 +1160,6 @@ export function startHttpApi({
           throw new Error('review_idempotency_conflict');
         }
         if (activeAdmission) throw new Error('review_operation_in_progress');
-        const joinsExactActiveOperation = false;
         const reserveSendCapacity = admission.requiresSendCapacity;
         if (reserveSendCapacity) {
           assertInflightCapacity({ governor, operationKind: 'strict-review' });
@@ -1180,11 +1174,10 @@ export function startHttpApi({
           id: runtimeKey.slice('review:'.length),
           kind: 'review_query',
           source: 'strict-review',
-          phase: body.verifyExisting === true ? 'observing_existing' : 'strict_transport',
+          phase: 'strict_transport',
           tabId: body.existingTabId ? String(body.existingTabId).trim() : null,
           stableKey: body.stableKey ? String(body.stableKey).trim() : null,
           idempotencyKey: body.idempotencyKey ? String(body.idempotencyKey).trim() : null,
-          verifyExisting: body.verifyExisting === true,
           startedAt,
           updatedAt: startedAt
         };
@@ -1203,13 +1196,6 @@ export function startHttpApi({
             ...receipt,
             tabId: receipt?.tabId || reviewRun.tabId || null
           };
-          if (joinsExactActiveOperation) {
-            return {
-              status: 'RETAINED_ACTIVE_OPERATION',
-              tabId: lifecycleReceipt.tabId,
-              conversationId: concreteReviewConversationId(lifecycleReceipt) || null
-            };
-          }
           const tabId = String(lifecycleReceipt.tabId || '').trim();
           if (!tabId) return await releaseStrictReviewTab({ tabs, defaultTabId, receipt: lifecycleReceipt });
           try {
@@ -1227,13 +1213,11 @@ export function startHttpApi({
         emitRuntimeChanged();
         let releaseUnboundRootWriter = null;
         try {
-          if (body.firstBinding === true && body.verifyExisting !== true) {
+          if (body.firstBinding === true) {
             releaseUnboundRootWriter = await acquireUnboundRootWriter({ provider: body.provider, reviewRun });
           }
-          if (!joinsExactActiveOperation) {
-            reserveReviewScope(reviewRun.stableKey ? `key:${reviewRun.stableKey}` : null);
-            reserveReviewScope(reviewRun.tabId ? `tab:${reviewRun.tabId}` : null);
-          }
+          reserveReviewScope(reviewRun.stableKey ? `key:${reviewRun.stableKey}` : null);
+          reserveReviewScope(reviewRun.tabId ? `tab:${reviewRun.tabId}` : null);
           const receipt = await runReviewQuery({
             stateDir,
             tabs,
@@ -1241,20 +1225,21 @@ export function startHttpApi({
             onTabResolved: async ({ tabId }) => {
               reviewRun.tabId = tabId;
               reviewRun.updatedAt = Date.now();
-              if (!joinsExactActiveOperation) reserveReviewScope(`tab:${tabId}`);
+              reserveReviewScope(`tab:${tabId}`);
               emitRuntimeChanged();
             }
           });
           const tabLifecycle = await releaseReviewReceipt(receipt);
           const returnedReceipt = { ...receipt, tabLifecycle };
           if (reviewRun.tabId) {
-            const nonterminal = receipt?.phase !== 'TERMINAL';
+            const archived = receipt?.archive != null;
+            const waiting = receipt?.sendAttempted === true && !archived;
             setLastOutcome(reviewRun.tabId, {
-              status: nonterminal ? 'in_progress' : 'success',
-              label: nonterminal
-                ? 'Strict review retained for recovery'
-                : reviewRun.verifyExisting ? 'Strict review observed' : 'Strict review completed',
-              detail: `${receipt?.phase || 'UNKNOWN'}:${receipt?.commitment || 'UNKNOWN'}`,
+              status: archived ? 'success' : waiting ? 'in_progress' : receipt?.error ? 'error' : 'in_progress',
+              label: archived
+                ? 'Strict review completed'
+                : waiting ? 'Strict review observing provider turn' : 'Strict review may retry before Send',
+              detail: receipt?.error?.code || (archived ? 'ARCHIVED' : waiting ? 'SEND_ATTEMPTED' : 'NOT_SENT'),
               source: 'strict-review',
               kind: 'review_query',
               finishedAt: Date.now(),
@@ -1273,14 +1258,15 @@ export function startHttpApi({
             // Request validation and programming failures may not have created
             // an operation. Those remain ordinary HTTP errors below.
           }
-          if (transportReceipt?.phase) {
+          if (transportReceipt?.operationId) {
             const tabLifecycle = await releaseReviewReceipt(transportReceipt);
             const returnedReceipt = { ...transportReceipt, tabLifecycle };
             if (reviewRun.tabId) {
+              const archived = transportReceipt.archive != null;
               setLastOutcome(reviewRun.tabId, {
-                status: transportReceipt.phase === 'TERMINAL' ? 'success' : 'in_progress',
+                status: archived ? 'success' : transportReceipt.error ? 'error' : 'in_progress',
                 label: 'Strict review transport fact recorded',
-                detail: `${transportReceipt.phase}:${transportReceipt.commitment}`,
+                detail: transportReceipt.error?.code || (transportReceipt.sendAttempted ? 'SEND_ATTEMPTED' : 'NOT_SENT'),
                 source: 'strict-review',
                 kind: 'review_query',
                 finishedAt: Date.now(),

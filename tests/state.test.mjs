@@ -14,57 +14,14 @@ import {
 } from '../state.mjs';
 
 async function tempDir() {
-  return await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-state-v3-'));
+  return await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-state-v4-'));
 }
 
-function repairableOperation() {
-  const now = Date.now();
-  return {
-    schemaVersion: 3,
-    operationId: 'operation-1',
-    idempotencyKey: 'operation-key',
-    requestFingerprint: 'fingerprint',
-    stableKey: 'stable-key',
-    provider: 'chatgpt',
-    productModel: 'GPT-5.6 Sol',
-    reasoningEffort: 'Pro',
-    conversationUrl: 'https://chatgpt.com/c/conversation-1',
-    conversationId: 'conversation-1',
-    promptSha256: 'a'.repeat(64),
-    responsePath: path.join(os.tmpdir(), 'response.txt'),
-    phase: 'PREPARE_UI',
-    commitment: 'ZERO_PROVEN',
-    recoverability: 'PRECOMMIT_REPAIR',
-    observability: 'FRESH_COMPLETE',
-    messageCapability: 'AVAILABLE',
-    failure: { locus: 'PRECOMMIT_UI', code: 'DIRECT_NO_ACTIVATION_RECEIPT' },
-    providerUserMessageCount: 0,
-    sendActivationCount: 0,
-    attemptCount: 2,
-    createdAt: now,
-    updatedAt: now
-  };
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
 }
 
-function stateWith(operation) {
-  return {
-    schemaVersion: 3,
-    bindings: {
-      'stable-key': {
-        stableKey: 'stable-key',
-        provider: 'chatgpt',
-        productModel: 'GPT-5.6 Sol',
-        reasoningEffort: 'Pro',
-        conversationUrl: 'https://chatgpt.com/c/conversation-1',
-        conversationId: 'conversation-1',
-        createdAt: operation.createdAt,
-        updatedAt: operation.updatedAt
-      }
-    },
-    operations: { 'operation-key': operation }
-  };
-}
-function legacyState() {
+function legacyV2State() {
   const now = 1_700_000_000_000;
   return {
     schemaVersion: 2,
@@ -73,8 +30,8 @@ function legacyState() {
         stableKey: 'legacy-binding',
         provider: 'chatgpt',
         model: 'GPT-5.4 Pro',
-        conversationUrl: 'https://chatgpt.com/c/legacy-conversation',
-        conversationId: 'legacy-conversation',
+        conversationUrl: 'https://chatgpt.com/c/legacy',
+        conversationId: 'legacy',
         createdAt: now,
         updatedAt: now
       }
@@ -88,9 +45,9 @@ function legacyState() {
         stableKey: 'legacy-binding',
         provider: 'chatgpt',
         model: 'GPT-5.4 Pro',
-        conversationUrl: 'https://chatgpt.com/c/legacy-conversation',
-        conversationId: 'legacy-conversation',
-        promptSha256: 'c'.repeat(64),
+        conversationUrl: 'https://chatgpt.com/c/legacy',
+        conversationId: 'legacy',
+        promptSha256: 'd'.repeat(64),
         status: 'SEND_INTENT',
         sendCount: 0,
         sendActionCount: 0,
@@ -102,353 +59,254 @@ function legacyState() {
   };
 }
 
-function legacyBytes(state = legacyState()) {
-  return Buffer.from(` ${JSON.stringify(state, null, 3)}\n`, 'utf8');
+function legacyMetadata(rawBytes) {
+  const digest = sha256(rawBytes);
+  return {
+    archiveBasename: `review-transport.v2-${digest}.json`,
+    sha256: digest,
+    sourceSchemaVersion: 2,
+    bindingKeys: ['legacy-binding'],
+    idempotencyKeys: ['legacy-operation']
+  };
 }
 
-
-test('state: current ledger is v3 only and repairable orthogonal state round-trips', async () => {
-  const dir = await tempDir();
-  assert.deepEqual(await readReviewTransportState(dir), { schemaVersion: 3, bindings: {}, operations: {} });
-  const value = stateWith(repairableOperation());
-  await writeReviewTransportState(value, dir);
-  assert.deepEqual(await readReviewTransportState(dir), value);
-});
-test('state: WSL fingerprint correction provenance round-trips and validates exactly', async () => {
-  const dir = await tempDir();
-  const operation = {
-    ...repairableOperation(),
-    requestFingerprint: 'b'.repeat(64),
-    responsePath: String.raw`\\wsl.localhost\Ubuntu-24.04\home\fires\hmasd\response.md`,
-    fingerprintCorrection: {
-      from: 'a'.repeat(64),
-      to: 'b'.repeat(64),
-      basis: 'wsl_unc_response_path_projection_v1'
-    }
-  };
-  const value = stateWith(operation);
-  await writeReviewTransportState(value, dir);
-  assert.deepEqual(
-    (await readReviewTransportState(dir)).operations['operation-key'].fingerprintCorrection,
-    operation.fingerprintCorrection
-  );
-
-  const invalidCorrections = [
-    { ...operation.fingerprintCorrection, from: 'former' },
-    { ...operation.fingerprintCorrection, to: 'c'.repeat(64) },
-    { ...operation.fingerprintCorrection, basis: 'runtime_path_replacement' },
-    { ...operation.fingerprintCorrection, extra: true }
-  ];
-  for (const fingerprintCorrection of invalidCorrections) {
-    await assert.rejects(
-      writeReviewTransportState(stateWith({ ...operation, fingerprintCorrection }), dir),
-      /review_transport_state_invalid/
-    );
-  }
-  await assert.rejects(
-    writeReviewTransportState(
-      stateWith({ ...operation, responsePath: String.raw`\\server\share\response.md` }),
-      dir
-    ),
-    /review_transport_state_invalid/
-  );
-});
-
-test('state: current cutover operation identity remains ordinary current semantics', async () => {
-  const dir = await tempDir();
-  const idempotencyKey = 'chatgpt_gpt56sol_pro_full_ui_transport_contract_review_20260318';
-  const operation = {
-    ...repairableOperation(),
-    operationId: '40c7053e-0c8f-44af-907f-c4d0b841c66d',
-    idempotencyKey
-  };
-  const value = stateWith(operation);
-  value.operations = { [idempotencyKey]: operation };
-
-  await writeReviewTransportState(value, dir);
-  const loaded = await readReviewTransportState(dir);
-  assert.equal(loaded.operations[idempotencyKey].operationId, operation.operationId);
-  assert.deepEqual(
-    [
-      loaded.operations[idempotencyKey].phase,
-      loaded.operations[idempotencyKey].commitment,
-      loaded.operations[idempotencyKey].recoverability,
-      loaded.operations[idempotencyKey].messageCapability
-    ],
-    ['PREPARE_UI', 'ZERO_PROVEN', 'PRECOMMIT_REPAIR', 'AVAILABLE']
-  );
-});
-
-
-test('state: read-only v2 projection preserves provenance without mutating either state or archive', async () => {
-  const dir = await tempDir();
-  const file = reviewTransportPath(dir);
-  const bytes = legacyBytes();
-  await fs.writeFile(file, bytes);
-
-  const projected = await readReviewTransportStateReadOnly(dir);
-
-  assert.equal(projected.schemaVersion, 3);
-  assert.deepEqual(projected.bindings, {});
-  assert.deepEqual(projected.operations, {});
-  assert.deepEqual(projected.legacy.bindingKeys, ['legacy-binding']);
-  assert.deepEqual(projected.legacy.idempotencyKeys, ['legacy-operation']);
-  assert.equal(projected.legacy.sourceSchemaVersion, 2);
-  assert.equal(projected.legacy.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
-  assert.deepEqual(await fs.readFile(file), bytes);
-  await assert.rejects(
-    fs.readFile(path.join(dir, projected.legacy.archiveBasename)),
-    (error) => error?.code === 'ENOENT'
-  );
-});
-
-test('state: valid v2 cuts over to empty active v3 with an exact immutable archive and reruns idempotently', async () => {
-  const dir = await tempDir();
-  const file = reviewTransportPath(dir);
-  const bytes = legacyBytes();
-  await fs.writeFile(file, bytes);
-
-  const cutover = await readReviewTransportState(dir);
-  const archivePath = path.join(dir, cutover.legacy.archiveBasename);
-
-  assert.deepEqual(cutover.bindings, {});
-  assert.deepEqual(cutover.operations, {});
-  assert.deepEqual(await fs.readFile(archivePath), bytes);
-  assert.deepEqual(await readReviewTransportState(dir), cutover);
-  assert.deepEqual(await fs.readFile(archivePath), bytes);
-  await writeReviewTransportState(cutover, dir);
-  assert.deepEqual(await readReviewTransportState(dir), cutover);
-  assert.deepEqual(await fs.readFile(archivePath), bytes);
-});
-
-test('state: matching pre-existing v2 archive resumes cutover and mismatched bytes refuse unchanged', async () => {
-  const bytes = legacyBytes();
-  for (const matches of [true, false]) {
-    const dir = await tempDir();
-    const file = reviewTransportPath(dir);
-    await fs.writeFile(file, bytes);
-    const projected = await readReviewTransportStateReadOnly(dir);
-    const archivePath = path.join(dir, projected.legacy.archiveBasename);
-    const archiveBytes = matches ? bytes : Buffer.from('not the legacy ledger', 'utf8');
-    await fs.writeFile(archivePath, archiveBytes);
-
-    if (matches) {
-      const cutover = await readReviewTransportState(dir);
-      assert.deepEqual(cutover.legacy, projected.legacy);
-    } else {
-      await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
-      assert.deepEqual(await fs.readFile(file), bytes);
-    }
-    assert.deepEqual(await fs.readFile(archivePath), archiveBytes);
-  }
-});
-test('state: unsupported directory fsync still verifies the published archive and completes cutover', async () => {
-  for (const code of ['EPERM', 'EINVAL', 'ENOTSUP', 'EBADF', 'EISDIR']) {
-    const dir = await tempDir();
-    const file = reviewTransportPath(dir);
-    const bytes = legacyBytes();
-    await fs.writeFile(file, bytes);
-    let syncCalls = 0;
-
-    const cutover = await readReviewTransportState(dir, {
-      syncDirectory: async () => {
-        syncCalls += 1;
-        const error = new Error('directory sync unavailable');
-        error.code = code;
-        throw error;
+function productionV3State(legacy) {
+  const createdAt = 1_710_000_000_000;
+  const sendBoundaryEnteredAt = 1_710_000_000_500;
+  return {
+    schemaVersion: 3,
+    bindings: {
+      'vqfp-binding': {
+        stableKey: 'vqfp-binding',
+        provider: 'chatgpt',
+        productModel: 'GPT-5.6 Sol',
+        reasoningEffort: 'Pro',
+        conversationUrl: 'https://chatgpt.com/',
+        conversationId: '__new__',
+        createdAt,
+        updatedAt: sendBoundaryEnteredAt
       }
-    });
-
-    assert.equal(syncCalls, 1);
-    assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).schemaVersion, 3);
-    assert.deepEqual(
-      await fs.readFile(path.join(dir, cutover.legacy.archiveBasename)),
-      bytes
-    );
-  }
-});
-
-test('state: unexpected directory fsync errors refuse replacement while exact archive retry remains idempotent', async () => {
-  const dir = await tempDir();
-  const file = reviewTransportPath(dir);
-  const bytes = legacyBytes();
-  await fs.writeFile(file, bytes);
-
-  await assert.rejects(
-    readReviewTransportState(dir, {
-      syncDirectory: async () => {
-        const error = new Error('synthetic_directory_sync_failure');
-        error.code = 'EIO';
-        throw error;
+    },
+    operations: {
+      'vqfp-operation': {
+        schemaVersion: 3,
+        operationId: 'ff500569-be6a-4b40-b558-9e39892f261a',
+        idempotencyKey: 'vqfp-operation',
+        requestFingerprint: 'f'.repeat(64),
+        stableKey: 'vqfp-binding',
+        provider: 'chatgpt',
+        productModel: 'GPT-5.6 Sol',
+        reasoningEffort: 'Pro',
+        conversationUrl: 'https://chatgpt.com/',
+        conversationId: '__new__',
+        responsePath: '/home/fires/hmasd/vqfp-response.md',
+        promptSha256: 'e'.repeat(64),
+        phase: 'VERIFY_COMMITMENT',
+        commitment: 'UNRESOLVED',
+        recoverability: 'OBSERVE_ONLY',
+        observability: 'LOST',
+        messageCapability: 'SEALED',
+        failure: { locus: 'COMMIT_BOUNDARY', code: 'INTERRUPTED_RESERVED_BOUNDARY' },
+        providerUserMessageCount: 0,
+        sendActivationCount: 0,
+        attemptCount: 1,
+        sendBoundaryEnteredAt,
+        createdAt,
+        updatedAt: sendBoundaryEnteredAt
+      },
+      'completed-operation': {
+        schemaVersion: 3,
+        operationId: 'completed-operation-id',
+        idempotencyKey: 'completed-operation',
+        requestFingerprint: 'a'.repeat(64),
+        stableKey: 'vqfp-binding',
+        provider: 'chatgpt',
+        productModel: 'GPT-5.6 Sol',
+        reasoningEffort: 'Pro',
+        conversationUrl: 'https://chatgpt.com/c/completed',
+        conversationId: 'completed',
+        responsePath: '/home/fires/hmasd/completed-response.md',
+        promptSha256: 'c'.repeat(64),
+        phase: 'TERMINAL',
+        commitment: 'ONE_EXACT',
+        recoverability: 'NONE',
+        observability: 'FRESH_COMPLETE',
+        messageCapability: 'SEALED',
+        failure: { locus: 'NONE', code: 'NONE' },
+        providerUserMessageCount: 1,
+        sendActivationCount: 1,
+        attemptCount: 1,
+        sendBoundaryEnteredAt,
+        userMessageId: 'provider-user-complete',
+        assistantMessageId: 'provider-assistant-complete',
+        turnConfirmationMode: 'agentify_review_causal_submission_v1',
+        productModelEvidence: {
+          requestedProductModel: 'GPT-5.6 Sol',
+          matchedLabel: 'GPT-5.6 Sol',
+          scopedMatchCount: 1
+        },
+        reasoningEffortEvidence: {
+          requestedReasoningEffort: 'Pro',
+          matchedLabel: 'Pro',
+          scopedMatchCount: 1,
+          role: 'slider',
+          actionOwner: 'Power',
+          min: 0,
+          max: 4,
+          value: 4
+        },
+        archive: {
+          path: '/home/fires/hmasd/completed-response.md',
+          sha256: 'b'.repeat(64),
+          sizeBytes: 17,
+          projection: 'exact',
+          verifiedAt: sendBoundaryEnteredAt + 4_000
+        },
+        completedAt: sendBoundaryEnteredAt + 4_000,
+        createdAt,
+        updatedAt: sendBoundaryEnteredAt + 4_000
       }
-    }),
-    /synthetic_directory_sync_failure/
-  );
-  assert.deepEqual(await fs.readFile(file), bytes);
+    },
+    legacy
+  };
+}
 
-  const projected = await readReviewTransportStateReadOnly(dir);
-  const archivePath = path.join(dir, projected.legacy.archiveBasename);
-  assert.deepEqual(await fs.readFile(archivePath), bytes);
+function receipt(overrides = {}) {
+  const now = 1_720_000_000_000;
+  return {
+    schemaVersion: 4,
+    operationId: 'operation-id',
+    idempotencyKey: 'operation-key',
+    requestFingerprint: 'a'.repeat(64),
+    stableKey: 'binding-key',
+    provider: 'chatgpt',
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    conversationUrl: 'https://chatgpt.com/c/current',
+    conversationId: 'current',
+    promptSha256: 'b'.repeat(64),
+    responsePath: '/tmp/response.txt',
+    sendAttempted: false,
+    sendAttemptedAt: null,
+    providerUserMessageId: null,
+    providerAssistantMessageId: null,
+    observedConversationUrl: null,
+    observedConversationId: null,
+    archive: null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides
+  };
+}
 
-  let retrySyncCalls = 0;
-  const cutover = await readReviewTransportState(dir, {
-    syncDirectory: async () => {
-      retrySyncCalls += 1;
-      throw new Error('existing archive must bypass directory sync');
-    }
+function stateWithReceipt(operation) {
+  return {
+    schemaVersion: 4,
+    bindings: {},
+    operations: { [operation.idempotencyKey]: operation }
+  };
+}
+
+test('state: fresh review transport is the minimal v4 ledger', async () => {
+  const stateDir = await tempDir();
+  assert.deepEqual(defaultReviewTransportState(), {
+    schemaVersion: 4,
+    bindings: {},
+    operations: {}
   });
-  assert.equal(retrySyncCalls, 0);
-  assert.deepEqual(cutover.legacy, projected.legacy);
-  assert.deepEqual(await fs.readFile(archivePath), bytes);
+  assert.deepEqual(await readReviewTransportState(stateDir), defaultReviewTransportState());
 });
 
-
-test('state: v3 legacy provenance revalidates archive presence, bytes, and tombstone keys', async () => {
-  for (const corruption of ['missing', 'bytes', 'keys']) {
-    const dir = await tempDir();
-    const file = reviewTransportPath(dir);
-    const bytes = legacyBytes();
-    await fs.writeFile(file, bytes);
-    const cutover = await readReviewTransportState(dir);
-    const archivePath = path.join(dir, cutover.legacy.archiveBasename);
-    if (corruption === 'missing') await fs.rm(archivePath);
-    if (corruption === 'bytes') await fs.writeFile(archivePath, 'changed legacy bytes', 'utf8');
-    if (corruption === 'keys') {
-      const persisted = JSON.parse(await fs.readFile(file, 'utf8'));
-      persisted.legacy.idempotencyKeys = [];
-      await fs.writeFile(file, `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
-    }
-    await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
-  }
-});
-
-test('state: corrupt v2 identity and count invariants refuse without mutation', async () => {
-  const corruptStates = [];
-  const wrongIdentity = legacyState();
-  wrongIdentity.operations['legacy-operation'].idempotencyKey = 'other-operation';
-  corruptStates.push(wrongIdentity);
-  const wrongCount = legacyState();
-  wrongCount.operations['legacy-operation'].sendCount = 2;
-  corruptStates.push(wrongCount);
-
-  for (const state of corruptStates) {
-    const dir = await tempDir();
-    const bytes = legacyBytes(state);
-    const file = reviewTransportPath(dir);
-    await fs.writeFile(file, bytes);
-    await assert.rejects(readReviewTransportState(dir), /review_transport_state_invalid/);
-    assert.deepEqual(await fs.readFile(file), bytes);
-  }
-});
-test('state: legacy and current ledgers accept Windows absolute response paths and refuse relative paths', async () => {
-  const absolutePaths = [
-    String.raw`C:\Agentify\responses\review.txt`,
-    String.raw`\\server\share\Agentify\responses\review.txt`
-  ];
-
-  for (const responsePath of absolutePaths) {
-    const legacyDir = await tempDir();
-    const legacy = legacyState();
-    legacy.operations['legacy-operation'].responsePath = responsePath;
-    await fs.writeFile(reviewTransportPath(legacyDir), legacyBytes(legacy));
-    assert.equal(
-      (await readReviewTransportStateReadOnly(legacyDir)).legacy.idempotencyKeys[0],
-      'legacy-operation'
-    );
-
-    const currentDir = await tempDir();
-    const operation = { ...repairableOperation(), responsePath };
-    await writeReviewTransportState(stateWith(operation), currentDir);
-    assert.equal(
-      (await readReviewTransportState(currentDir)).operations['operation-key'].responsePath,
-      responsePath
-    );
-  }
-
-  const relativePath = path.join('responses', 'review.txt');
-  const legacyDir = await tempDir();
-  const legacy = legacyState();
-  legacy.operations['legacy-operation'].responsePath = relativePath;
-  await fs.writeFile(reviewTransportPath(legacyDir), legacyBytes(legacy));
+test('state: receipt invariants reject impossible send and message facts', async () => {
+  const stateDir = await tempDir();
   await assert.rejects(
-    readReviewTransportStateReadOnly(legacyDir),
+    writeReviewTransportState(stateWithReceipt(receipt({ sendAttempted: true })), stateDir),
     /review_transport_state_invalid/
   );
-
-  const currentDir = await tempDir();
-  const operation = { ...repairableOperation(), responsePath: relativePath };
   await assert.rejects(
-    writeReviewTransportState(stateWith(operation), currentDir),
+    writeReviewTransportState(stateWithReceipt(receipt({ providerUserMessageId: 'user-1' })), stateDir),
+    /review_transport_state_invalid/
+  );
+  await assert.rejects(
+    writeReviewTransportState(stateWithReceipt(receipt({ providerAssistantMessageId: 'assistant-1' })), stateDir),
+    /review_transport_state_invalid/
+  );
+  await assert.rejects(
+    writeReviewTransportState(stateWithReceipt(receipt({
+      sendAttempted: true,
+      sendAttemptedAt: Date.now(),
+      providerUserMessageId: 'user-1',
+      archive: {
+        path: '/tmp/response.txt',
+        sha256: 'c'.repeat(64),
+        sizeBytes: 1,
+        projection: 'exact',
+        verifiedAt: Date.now()
+      }
+    })), stateDir),
+    /review_transport_state_invalid/
+  );
+  await assert.rejects(
+    writeReviewTransportState(stateWithReceipt(receipt({ updatedAt: Date.now() + 0.5 })), stateDir),
     /review_transport_state_invalid/
   );
 });
 
+test('state: exact v3 bytes migrate once to v4 and preserve v2 tombstones and no-resend facts', async () => {
+  const stateDir = await tempDir();
+  const v2Bytes = Buffer.from(`${JSON.stringify(legacyV2State(), null, 3)}\n`, 'utf8');
+  const legacy = legacyMetadata(v2Bytes);
+  await fs.writeFile(path.join(stateDir, legacy.archiveBasename), v2Bytes);
 
-test('state: unknown ledger versions remain unsupported and unchanged', async () => {
-  for (const schemaVersion of [1, 4]) {
-    const dir = await tempDir();
-    const file = reviewTransportPath(dir);
-    const bytes = Buffer.from(`${JSON.stringify({ schemaVersion, bindings: {}, operations: {} }, null, 2)}\n`);
-    await fs.writeFile(file, bytes);
-    await assert.rejects(readReviewTransportState(dir), /review_transport_state_version_unsupported/);
-    assert.deepEqual(await fs.readFile(file), bytes);
-  }
+  const v3 = productionV3State(legacy);
+  const v3Bytes = Buffer.from(`  ${JSON.stringify(v3, null, 1)}\n`, 'utf8');
+  await fs.writeFile(reviewTransportPath(stateDir), v3Bytes);
+  const expectedV3Archive = `review-transport.v3-${sha256(v3Bytes)}.json`;
+
+  const projectedReadOnly = await readReviewTransportStateReadOnly(stateDir);
+  assert.equal(projectedReadOnly.schemaVersion, 4);
+  await assert.rejects(fs.access(path.join(stateDir, expectedV3Archive)));
+  assert.deepEqual(await fs.readFile(reviewTransportPath(stateDir)), v3Bytes);
+
+  const migrated = await readReviewTransportState(stateDir);
+  assert.equal(migrated.schemaVersion, 4);
+  assert.deepEqual(migrated.legacy, legacy);
+  assert.equal(migrated.v3Archive.archiveBasename, expectedV3Archive);
+  assert.deepEqual(await fs.readFile(path.join(stateDir, expectedV3Archive)), v3Bytes);
+  assert.deepEqual(await fs.readFile(path.join(stateDir, legacy.archiveBasename)), v2Bytes);
+
+  const operation = migrated.operations['vqfp-operation'];
+  assert.equal(operation.sendAttempted, true);
+  assert.equal(operation.sendAttemptedAt, v3.operations['vqfp-operation'].sendBoundaryEnteredAt);
+  assert.equal(operation.providerUserMessageId, null);
+  assert.equal(operation.providerAssistantMessageId, null);
+  assert.deepEqual(operation.error, { code: 'INTERRUPTED_RESERVED_BOUNDARY' });
+  const completed = migrated.operations['completed-operation'];
+  assert.equal(completed.providerUserMessageId, 'provider-user-complete');
+  assert.equal(completed.providerAssistantMessageId, 'provider-assistant-complete');
+  assert.deepEqual(completed.archive, v3.operations['completed-operation'].archive);
+  assert.equal(completed.error, null);
+  for (const deleted of [
+    'phase',
+    'commitment',
+    'recoverability',
+    'observability',
+    'messageCapability',
+    'providerUserMessageCount',
+    'sendActivationCount',
+    'attemptCount'
+  ]) assert.equal(Object.hasOwn(operation, deleted), false);
+
+  const onceBytes = await fs.readFile(reviewTransportPath(stateDir));
+  await readReviewTransportState(stateDir);
+  assert.deepEqual(await fs.readFile(reviewTransportPath(stateDir)), onceBytes);
 });
 
-test('state: legacy overloaded authority fields are rejected', async () => {
-  const dir = await tempDir();
-  for (const legacy of ['model', 'expectedModel', 'expectedMode', 'modelEvidence', 'status', 'terminalState', 'sendCount', 'sendActionCount', 'newUserMessageCount']) {
-    const operation = { ...repairableOperation(), [legacy]: 'legacy' };
-    await assert.rejects(writeReviewTransportState(stateWith(operation), dir), /review_transport_state_invalid/);
-  }
-});
-
-test('state: exact terminal archive requires exact target evidence and raw-byte archive identity', async () => {
-  const operation = {
-    ...repairableOperation(),
-    phase: 'TERMINAL',
-    commitment: 'ONE_EXACT',
-    recoverability: 'NONE',
-    observability: 'FRESH_COMPLETE',
-    messageCapability: 'SEALED',
-    failure: { locus: 'NONE', code: 'NONE' },
-    providerUserMessageCount: 1,
-    sendActivationCount: 1,
-    userMessageId: 'user-1',
-    turnConfirmationMode: 'agentify_review_causal_submission_v1',
-    assistantMessageId: 'assistant-1',
-    productModelEvidence: {
-      requestedProductModel: 'GPT-5.6 Sol',
-      matchedLabel: 'GPT-5.6 Sol',
-      selectionView: 'chatgpt_product_model_menu',
-      role: 'menuitemradio',
-      scopedMatchCount: 1
-    },
-    reasoningEffortEvidence: {
-      requestedReasoningEffort: 'Pro',
-      matchedLabel: 'Pro',
-      selectionView: 'chatgpt_reasoning_effort_slider',
-      role: 'slider',
-      actionOwner: 'Power',
-      scopedMatchCount: 1,
-      min: 0,
-      max: 4,
-      value: 4
-    },
-    archive: {
-      path: path.join(os.tmpdir(), 'response.txt'),
-      sha256: 'b'.repeat(64),
-      sizeBytes: 17,
-      projection: 'exact',
-      verifiedAt: Date.now()
-    }
-  };
-  const dir = await tempDir();
-  await writeReviewTransportState(stateWith(operation), dir);
-
-  operation.archive = { ...operation.archive, path: path.join(os.tmpdir(), 'raw-response.txt') };
-  await assert.rejects(writeReviewTransportState(stateWith(operation), dir), /review_transport_state_invalid/);
-
-  operation.archive = { ...operation.archive, path: operation.responsePath, projection: 'terminal_lf_v1' };
-  await assert.rejects(writeReviewTransportState(stateWith(operation), dir), /review_transport_state_invalid/);
+test('state: uncut v2 active state is historical input and is never rewritten', async () => {
+  const stateDir = await tempDir();
+  const bytes = Buffer.from(`${JSON.stringify(legacyV2State(), null, 2)}\n`, 'utf8');
+  await fs.writeFile(reviewTransportPath(stateDir), bytes);
+  await assert.rejects(readReviewTransportState(stateDir), /review_transport_state_version_unsupported/);
+  assert.deepEqual(await fs.readFile(reviewTransportPath(stateDir)), bytes);
 });

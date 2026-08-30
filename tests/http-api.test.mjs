@@ -32,7 +32,7 @@ test('http-api: strict pre-send busy and post-send identity ambiguity are confli
   assert.equal(mapErrorToHttp(new Error('review_user_message_content_mismatch')).code, 409);
 });
 
-test('http-api: strict review releases replaceable tabs and retains only an unbound recovery handle', async () => {
+test('http-api: strict review release is projected from receipt facts', async () => {
   const closed = [];
   const tabs = {
     async closeTab(tabId) {
@@ -44,8 +44,8 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      phase: 'TERMINAL',
-      commitment: 'ONE_EXACT',
+      sendAttempted: true,
+      archive: { projection: 'exact' },
       tabId: 'complete-tab',
       conversationId: 'conversation-complete'
     }
@@ -54,20 +54,28 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      phase: 'WAIT_RESPONSE',
-      commitment: 'ONE_EXACT',
-      messageCapability: 'SEALED',
+      sendAttempted: true,
+      archive: null,
       tabId: 'waiting-tab',
       conversationId: 'conversation-waiting'
+    }
+  });
+  const retryable = await releaseStrictReviewTab({
+    tabs,
+    defaultTabId: 'default-tab',
+    receipt: {
+      sendAttempted: false,
+      archive: null,
+      tabId: 'retryable-tab',
+      conversationId: 'conversation-retryable'
     }
   });
   const unbound = await releaseStrictReviewTab({
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      phase: 'VERIFY_COMMITMENT',
-      commitment: 'UNRESOLVED',
-      messageCapability: 'SEALED',
+      sendAttempted: true,
+      archive: null,
       tabId: 'unbound-tab',
       conversationId: '__new__'
     }
@@ -76,18 +84,18 @@ test('http-api: strict review releases replaceable tabs and retains only an unbo
     tabs,
     defaultTabId: 'default-tab',
     receipt: {
-      phase: 'WAIT_RESPONSE',
-      commitment: 'ONE_EXACT',
-      messageCapability: 'SEALED',
+      sendAttempted: true,
+      archive: null,
       tabId: 'default-tab',
       conversationId: 'conversation-default'
     }
   });
 
-  assert.deepEqual(closed, ['complete-tab', 'waiting-tab']);
+  assert.deepEqual(closed, ['complete-tab', 'waiting-tab', 'retryable-tab']);
   assert.equal(complete.status, 'CLOSED');
   assert.equal(waiting.status, 'CLOSED');
-  assert.equal(unbound.status, 'RETAINED_RECOVERY_HANDLE');
+  assert.equal(retryable.status, 'CLOSED');
+  assert.equal(unbound.status, 'RETAINED_UNBOUND_TAB');
   assert.equal(protectedView.status, 'RETAINED_PROTECTED');
 });
 
@@ -100,8 +108,8 @@ test('http-api: tab cleanup failure is reported without changing the transport f
     },
     defaultTabId: 'default-tab',
     receipt: {
-      phase: 'TERMINAL',
-      commitment: 'ONE_EXACT',
+      sendAttempted: true,
+      archive: { projection: 'exact' },
       tabId: 'completed-tab',
       conversationId: 'conversation-complete'
     }
@@ -122,8 +130,7 @@ test('http-api: reasoning-effort preflight carries no prompt or strict operation
         provider: 'chatgpt',
         conversationUrl: 'https://chatgpt.com/',
         reasoningEffortEvidence: { requestedReasoningEffort: 'Pro', matchedLabel: 'Pro', value: 4 },
-        promptInsertCount: 0,
-        sendActivationCount: 0
+        promptInsertCount: 0
       };
     }
   };
@@ -155,7 +162,7 @@ test('http-api: reasoning-effort diagnostic has no prompt or strict operation su
   const controller = {
     async reviewReasoningEffortDiagnostics(args) {
       seen.push(args);
-      return { provider: 'chatgpt', sliderCount: 1, value: 4, promptInsertCount: 0, sendActivationCount: 0 };
+      return { provider: 'chatgpt', sliderCount: 1, value: 4, promptInsertCount: 0 };
     }
   };
   const tabs = { listTabs: () => [{ id: 'effort-tab', key: 'effort', vendorId: 'chatgpt' }], getControllerById: () => controller };

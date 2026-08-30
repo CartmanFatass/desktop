@@ -135,7 +135,7 @@ registerTool(
   'agentify_review_query',
   {
     description:
-      'Strict current-v3 ChatGPT or Gemini review transport. Requires separate provider productModel and reasoningEffort axes, binds one idempotency key to one provider-visible user message, and writes raw immutable assistant UTF-8 bytes to responsePath while returning a separate structured receipt.',
+      'Strict v4 ChatGPT or Gemini review transport. Persists one minimal immutable receipt, activates one hit-tested native Send at most once, observes provider message identities, and archives exact assistant UTF-8 bytes at responsePath.',
     inputSchema: {
       stableKey: z.string().describe('Persistent stable binding key.'),
       provider: z.enum(['chatgpt', 'gemini']).describe('Exact provider identity.'),
@@ -147,9 +147,9 @@ registerTool(
       prompt: z.string().optional().describe('Exact prompt bytes to submit once. Use either prompt or promptPath.'),
       promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is submitted once. Use either promptPath or prompt.'),
       promptSha256: z.string().optional().describe('Optional tool-local integrity check. When omitted Agentify computes it internally.'),
-      responsePath: z.string().describe('Absolute path for raw immutable assistant UTF-8 response bytes. TERMINAL is unavailable until this exact file is atomically committed and verified; the structured receipt remains separate.'),
-      timeoutMs: z.number().optional().describe('Natural-completion wait window, up to 45 minutes. Agentify returns a nonterminal state when generation continues.'),
-      verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.'),
+      responsePath: z.string().describe('Absolute path for exact immutable assistant UTF-8 response bytes. A non-null archive receipt is published only after this file is atomically committed and verified.'),
+      timeoutMs: z.number().optional().describe('Natural-completion observation window, up to 45 minutes. A sent receipt remains observable when generation continues.'),
+      verifyExisting: z.boolean().optional().describe('Require an existing exact operation. sendAttempted=false retries directly; sendAttempted=true observes only and never sends again.'),
       firstBinding: z.boolean().optional().describe('Bind a clean provider-root conversation to its concrete identity created by the one send.'),
       geminiBootstrap: z.boolean().optional().describe('Gemini-only, non-scientific first-binding bootstrap. Requires firstBinding and bootstrapNonScientific.'),
       geminiBootstrapContinuation: z.boolean().optional().describe('Gemini-only one-time authorized continuation after a committed non-scientific bootstrap; allows one recorded model transition.'),
@@ -411,8 +411,8 @@ registerTool(
 );
 
 // This ledger-only operation deliberately has no page or prompt input. It
-// exposes durable strict-operation facts without providing a route to prepare,
-// send, or recover a provider turn.
+// exposes the persisted receipt facts without preparing, sending, or observing
+// a provider turn.
 registerTool(
   'agentify_review_observe',
   {
