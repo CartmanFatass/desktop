@@ -976,26 +976,43 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
   assert.equal(modelLabelMatches('High', 'Pro'), false);
 });
 
-function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', triggerCount = 1 } = {}) {
+function targetMenuFixture({
+  initialValue = 4,
+  productModel = 'GPT-5.6 Sol',
+  triggerCount = 1,
+  menuOpenAfterChecks = 0,
+  openedMenuCount = 1
+} = {}) {
   let menuOpen = false;
+  let menuPending = false;
   let value = initialValue;
   let pointerActivations = 0;
   let arrowRightCount = 0;
   let sendActions = 0;
+  const verificationChecks = [];
   const page = {
     async getUrl() { return 'https://chatgpt.com/'; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('agentifyOpenChatgptTargetMenuMarker')) {
-        if (menuOpen) return { ok: true, alreadyOpen: true, menuCount: 1 };
+        if (menuOpen && openedMenuCount === 1) return { ok: true, alreadyOpen: true, menuCount: 1 };
+        if (menuOpen && openedMenuCount > 1) return { ok: false, triggerCount: 0, menuCount: openedMenuCount };
         if (triggerCount !== 1) return { ok: false, triggerCount, menuCount: 0 };
         return { ok: true, alreadyOpen: false, triggerCount: 1, menuCount: 0, rect: { x: 10, y: 10, w: 20, h: 20 } };
       }
       if (js.includes('agentifyVerifyChatgptTargetMenuOpenMarker')) {
-        return { opened: menuOpen, menuCount: menuOpen ? 1 : 0 };
+        const activationIndex = verificationChecks.length - 1;
+        if (activationIndex >= 0) verificationChecks[activationIndex] += 1;
+        if (menuPending && verificationChecks[activationIndex] >= menuOpenAfterChecks) {
+          menuPending = false;
+          menuOpen = true;
+        }
+        const menuCount = menuOpen ? openedMenuCount : 0;
+        return { opened: menuCount === 1, menuCount };
       }
       if (js.includes('agentifyCloseChatgptTargetMenuMarker')) {
-        return { closed: !menuOpen, visibleTargetMenuCount: menuOpen ? 1 : 0 };
+        const menuCount = menuOpen ? openedMenuCount : 0;
+        return { closed: menuCount === 0, visibleTargetMenuCount: menuCount };
       }
       if (js.includes('agentifyChatgptProductModelStateMarker')) {
         return {
@@ -1004,7 +1021,7 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
           matchedLabel: menuOpen && productModel === 'GPT-5.6 Sol' ? productModel : null,
           selectionView: 'chatgpt_target_menu_product_list',
           role: 'menuitemradio',
-          menuCount: menuOpen ? 1 : 0,
+          menuCount: menuOpen ? openedMenuCount : 0,
           scopedMatchCount: menuOpen && productModel === 'GPT-5.6 Sol' ? 1 : 0,
           selectedMatchCount: menuOpen && productModel === 'GPT-5.6 Sol' ? 1 : 0
         };
@@ -1017,7 +1034,7 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
           selectionView: 'chatgpt_target_menu_reasoning_slider',
           role: 'slider',
           actionOwner: menuOpen ? 'Power' : null,
-          menuCount: menuOpen ? 1 : 0,
+          menuCount: menuOpen ? openedMenuCount : 0,
           scopedMatchCount: menuOpen ? 1 : 0,
           sliderCount: menuOpen ? 1 : 0,
           ownerCount: menuOpen ? 1 : 0,
@@ -1037,11 +1054,14 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
     async mouseDown() {},
     async mouseUp() {
       pointerActivations += 1;
-      menuOpen = true;
+      verificationChecks.push(0);
+      menuPending = menuOpenAfterChecks > 0;
+      menuOpen = !menuPending;
     },
     async sendKey(key) {
       if (key === 'Escape') {
         menuOpen = false;
+        menuPending = false;
         return;
       }
       if (key === 'ArrowRight') {
@@ -1054,7 +1074,8 @@ function targetMenuFixture({ initialValue = 4, productModel = 'GPT-5.6 Sol', tri
   };
   return {
     page,
-    state: () => ({ menuOpen, value, pointerActivations, arrowRightCount, sendActions })
+    state: () => ({ menuOpen, value, pointerActivations, arrowRightCount, sendActions }),
+    verificationChecks: () => [...verificationChecks]
   };
 }
 
@@ -1098,6 +1119,73 @@ test('chatgpt-controller: one target menu advances High to Pro before closing', 
     arrowRightCount: 2,
     sendActions: 0
   });
+});
+
+test('chatgpt-controller: delayed target-menu render is accepted after the unique activation', async () => {
+  const fixture = targetMenuFixture({ menuOpenAfterChecks: 2 });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  const result = await controller.reviewPreflight({
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    timeoutMs: 5_000
+  });
+
+  assert.equal(result.productModelEvidence.matchedLabel, 'GPT-5.6 Sol');
+  assert.equal(result.reasoningEffortEvidence.matchedLabel, 'Pro');
+  assert.deepEqual(fixture.verificationChecks(), [2, 2]);
+  assert.equal(fixture.state().sendActions, 0);
+});
+
+test('chatgpt-controller: target-menu observation polling never repeats the native activation', async () => {
+  const fixture = targetMenuFixture({ menuOpenAfterChecks: 4 });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  await controller.reviewPreflight({
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    timeoutMs: 5_000
+  });
+
+  assert.deepEqual(fixture.verificationChecks(), [4, 4]);
+  assert.equal(fixture.state().pointerActivations, 2);
+  assert.equal(fixture.state().sendActions, 0);
+});
+
+test('chatgpt-controller: persistent target-menu absence times out before Send without a second click', async () => {
+  const fixture = targetMenuFixture({ menuOpenAfterChecks: Infinity });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  await assert.rejects(
+    controller.reviewPreflight({
+      productModel: 'GPT-5.6 Sol',
+      reasoningEffort: 'Pro',
+      timeoutMs: 5_000
+    }),
+    /chatgpt_target_menu_open_unconfirmed/
+  );
+
+  assert.ok(fixture.verificationChecks()[0] > 1);
+  assert.equal(fixture.state().pointerActivations, 1);
+  assert.equal(fixture.state().sendActions, 0);
+});
+
+test('chatgpt-controller: multiple target menus appearing after activation remain ambiguous', async () => {
+  const fixture = targetMenuFixture({ menuOpenAfterChecks: 2, openedMenuCount: 2 });
+  const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
+  await assert.rejects(
+    controller.reviewPreflight({
+      productModel: 'GPT-5.6 Sol',
+      reasoningEffort: 'Pro',
+      timeoutMs: 5_000
+    }),
+    (error) => {
+      assert.equal(error.message, 'chatgpt_target_menu_ambiguous');
+      assert.deepEqual(error.data, { triggerCount: 1, menuCount: 2 });
+      return true;
+    }
+  );
+
+  assert.deepEqual(fixture.verificationChecks(), [2]);
+  assert.equal(fixture.state().pointerActivations, 1);
+  assert.equal(fixture.state().sendActions, 0);
 });
 
 test('chatgpt-controller: ambiguous target-menu triggers fail before activation', async () => {

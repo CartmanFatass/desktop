@@ -3231,23 +3231,32 @@ export class ChatGPTController {
     }
     if (!target.alreadyOpen) {
       await this.#clickAt(target.rect.x + target.rect.w / 2, target.rect.y + target.rect.h / 2);
-      await sleep(150);
     }
-    const opened = await this.#eval(`(() => {
-      const agentifyVerifyChatgptTargetMenuOpenMarker = true;
-      const visible = (node) => {
-        const rect = node?.getBoundingClientRect?.();
-        const style = node ? window.getComputedStyle(node) : null;
-        return !!rect && rect.width > 0 && rect.height > 0 &&
-          style?.display !== 'none' && style?.visibility !== 'hidden';
-      };
-      const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
-        .filter(visible)
-        .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
-      return { opened: menus.length === 1, menuCount: menus.length };
-    })()`);
-    if (!opened?.opened) throw new Error('chatgpt_target_menu_open_unconfirmed');
-    return { ...target, ...opened };
+    const openDeadline = Date.now() + 2_000;
+    while (true) {
+      const opened = await this.#eval(`(() => {
+        const agentifyVerifyChatgptTargetMenuOpenMarker = true;
+        const visible = (node) => {
+          const rect = node?.getBoundingClientRect?.();
+          const style = node ? window.getComputedStyle(node) : null;
+          return !!rect && rect.width > 0 && rect.height > 0 &&
+            style?.display !== 'none' && style?.visibility !== 'hidden';
+        };
+        const menus = Array.from(document.querySelectorAll('[role="menu"][data-state="open"]'))
+          .filter(visible)
+          .filter((menu) => menu.querySelector('[data-testid="composer-intelligence-picker-content"]'));
+        return { opened: menus.length === 1, menuCount: menus.length };
+      })()`);
+      if (opened?.menuCount > 1) {
+        const error = new Error('chatgpt_target_menu_ambiguous');
+        error.data = { triggerCount: target?.triggerCount || 0, menuCount: opened.menuCount };
+        throw error;
+      }
+      if (opened?.opened) return { ...target, ...opened };
+      const remainingMs = openDeadline - Date.now();
+      if (remainingMs <= 0) throw new Error('chatgpt_target_menu_open_unconfirmed');
+      await sleep(Math.min(100, remainingMs));
+    }
   }
 
   async #closeChatgptTargetMenu() {
