@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { archiveReviewResponse, inspectReviewAdmission, runReviewQuery } from '../review-transport.mjs';
-import { readReviewTransportState } from '../state.mjs';
+import { readReviewTransportState, reviewTransportPath } from '../state.mjs';
 import { reviewPlainTextIdentity } from '../review-text-identity.mjs';
 
 async function tempDir() {
@@ -47,6 +47,52 @@ function request(responsePath, overrides = {}) {
     ...overrides
   };
 }
+function legacyReviewState() {
+  const now = 1_700_000_000_000;
+  return {
+    schemaVersion: 2,
+    bindings: {
+      'legacy-binding': {
+        stableKey: 'legacy-binding',
+        provider: 'chatgpt',
+        model: 'GPT-5.4 Pro',
+        conversationUrl: 'https://chatgpt.com/c/legacy-conversation',
+        conversationId: 'legacy-conversation',
+        createdAt: now,
+        updatedAt: now
+      }
+    },
+    operations: {
+      'legacy-operation': {
+        schemaVersion: 2,
+        operationId: 'legacy-operation-id',
+        idempotencyKey: 'legacy-operation',
+        requestFingerprint: 'legacy-fingerprint',
+        stableKey: 'legacy-binding',
+        provider: 'chatgpt',
+        model: 'GPT-5.4 Pro',
+        conversationUrl: 'https://chatgpt.com/c/legacy-conversation',
+        conversationId: 'legacy-conversation',
+        promptSha256: 'd'.repeat(64),
+        status: 'SEND_INTENT',
+        sendCount: 0,
+        sendActionCount: 0,
+        newUserMessageCount: 0,
+        createdAt: now,
+        updatedAt: now
+      }
+    }
+  };
+}
+
+async function writeLegacyReviewState(stateDir) {
+  await fs.writeFile(
+    reviewTransportPath(stateDir),
+    `${JSON.stringify(legacyReviewState(), null, 2)}\n`,
+    'utf8'
+  );
+}
+
 
 function completion() {
   const observedAt = Date.now();
@@ -160,6 +206,66 @@ function fakeTabs(controller) {
     get showCount() { return showCount; }
   };
 }
+test('review transport: legacy binding and idempotency tombstones are sealed before admission or intake', async () => {
+  const collisions = [
+    {
+      overrides: { stableKey: 'legacy-binding' },
+      error: 'review_binding_mismatch',
+      keyType: 'binding'
+    },
+    {
+      overrides: { idempotencyKey: 'legacy-operation' },
+      error: 'review_idempotency_conflict',
+      keyType: 'idempotency'
+    }
+  ];
+
+  for (const collision of collisions) {
+    const stateDir = await tempDir();
+    await writeLegacyReviewState(stateDir);
+    const input = request(path.join(stateDir, 'response.txt'), collision.overrides);
+    const expectedError = (error) => {
+      assert.equal(error?.message, collision.error);
+      assert.deepEqual(error?.data, { legacy: true, sealed: true, keyType: collision.keyType });
+      return true;
+    };
+
+    await assert.rejects(inspectReviewAdmission({ stateDir, request: input }), expectedError);
+    const controller = fakeController({ completeImmediately: true });
+    await assert.rejects(
+      runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input }),
+      expectedError
+    );
+
+    const state = await readReviewTransportState(stateDir);
+    assert.deepEqual(state.bindings, {});
+    assert.deepEqual(state.operations, {});
+    assert.equal(controller.activations, 0);
+  }
+});
+
+test('review transport: a fresh v3 identity remains eligible after legacy cutover', async () => {
+  const stateDir = await tempDir();
+  await writeLegacyReviewState(stateDir);
+  const input = request(path.join(stateDir, 'response.txt'));
+
+  const admission = await inspectReviewAdmission({ stateDir, request: input });
+  assert.deepEqual(
+    [admission.exactExisting, admission.observationOnly, admission.requiresSendCapacity],
+    [false, false, true]
+  );
+
+  const controller = fakeController({ completeImmediately: true });
+  const receipt = await runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input });
+  const state = await readReviewTransportState(stateDir);
+
+  assert.equal(receipt.commitment, 'ONE_EXACT');
+  assert.equal(controller.activations, 1);
+  assert.equal(state.operations['operation-1'].operationId, receipt.operationId);
+  assert.deepEqual(state.legacy.bindingKeys, ['legacy-binding']);
+  assert.deepEqual(state.legacy.idempotencyKeys, ['legacy-operation']);
+});
+
 
 test('review transport: two pre-boundary failures and same-key success consume one provider message', async () => {
   const stateDir = await tempDir();

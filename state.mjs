@@ -88,6 +88,235 @@ const LEGACY_TRANSPORT_FIELDS = [
   'sendActionCount',
   'newUserMessageCount'
 ];
+const LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION = 2;
+const LEGACY_REVIEW_STATUSES = new Set([
+  'SEND_INTENT',
+  'PREPARED',
+  'SUBMITTED',
+  'OBSERVING',
+  'BLOCKED',
+  'COMPLETE'
+]);
+
+function record(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+function absolutePath(value) {
+  return typeof value === 'string' && value.length > 0 && (
+    path.isAbsolute(value) ||
+    path.posix.isAbsolute(value) ||
+    path.win32.isAbsolute(value)
+  );
+}
+
+
+function sha256Bytes(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function validLegacyCount(value, { required = false } = {}) {
+  return (!required && value === undefined) || (Number.isInteger(value) && [0, 1].includes(value));
+}
+
+function sortedUniqueStrings(value) {
+  return Array.isArray(value) &&
+    value.every(nonEmptyString) &&
+    value.every((entry, index) => index === 0 || value[index - 1] < entry);
+}
+
+function sameStrings(left, right) {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+function validateLegacyReviewTransportState(value) {
+  if (!record(value) || value.schemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    throw new Error('review_transport_state_invalid');
+  }
+  if (!record(value.bindings) || !record(value.operations)) {
+    throw new Error('review_transport_state_invalid');
+  }
+  if (value.migrationHistory !== undefined) {
+    const migration = Array.isArray(value.migrationHistory) && value.migrationHistory.length === 1
+      ? value.migrationHistory[0]
+      : null;
+    const inferredKeys = new Set();
+    if (
+      !record(migration) ||
+      migration.migrationId !== 'review_transport_v1_to_v2_complete_send_action_count' ||
+      migration.fromSchemaVersion !== 1 ||
+      migration.toSchemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION ||
+      !Array.isArray(migration.inferredFields) ||
+      migration.inferredFields.some((entry) => {
+        if (
+          !record(entry) ||
+          !nonEmptyString(entry.idempotencyKey) ||
+          !nonEmptyString(entry.operationId) ||
+          entry.field !== 'sendActionCount' ||
+          entry.value !== 1 ||
+          entry.basis !== 'validated_complete_send_and_completion_evidence' ||
+          inferredKeys.has(entry.idempotencyKey)
+        ) return true;
+        inferredKeys.add(entry.idempotencyKey);
+        const operation = value.operations[entry.idempotencyKey];
+        return (
+          !record(operation) ||
+          operation.operationId !== entry.operationId ||
+          operation.status !== 'COMPLETE' ||
+          operation.sendActionCount !== 1
+        );
+      })
+    ) throw new Error('review_transport_state_invalid');
+  }
+
+  for (const [key, binding] of Object.entries(value.bindings)) {
+    if (
+      !nonEmptyString(key) ||
+      !record(binding) ||
+      binding.stableKey !== key ||
+      !['chatgpt', 'gemini'].includes(binding.provider) ||
+      !nonEmptyString(binding.model) ||
+      !nonEmptyString(binding.conversationUrl) ||
+      !nonEmptyString(binding.conversationId) ||
+      !Number.isFinite(binding.createdAt) ||
+      !Number.isFinite(binding.updatedAt)
+    ) throw new Error('review_transport_state_invalid');
+
+    if (binding.geminiBootstrap !== undefined) {
+      const bootstrap = binding.geminiBootstrap;
+      if (
+        binding.provider !== 'gemini' ||
+        !record(bootstrap) ||
+        bootstrap.nonScientific !== true ||
+        !nonEmptyString(bootstrap.bootstrapOperationId) ||
+        !nonEmptyString(bootstrap.bootstrapModel) ||
+        typeof bootstrap.continuationConsumed !== 'boolean'
+      ) throw new Error('review_transport_state_invalid');
+    }
+  }
+
+  for (const [key, operation] of Object.entries(value.operations)) {
+    if (
+      !nonEmptyString(key) ||
+      !record(operation) ||
+      operation.idempotencyKey !== key ||
+      !nonEmptyString(operation.operationId) ||
+      !nonEmptyString(operation.requestFingerprint) ||
+      !nonEmptyString(operation.stableKey) ||
+      !['chatgpt', 'gemini'].includes(operation.provider) ||
+      !nonEmptyString(operation.model) ||
+      !nonEmptyString(operation.conversationUrl) ||
+      !nonEmptyString(operation.conversationId) ||
+      !SHA256.test(String(operation.promptSha256 || '')) ||
+      !LEGACY_REVIEW_STATUSES.has(operation.status) ||
+      !validLegacyCount(operation.sendCount, { required: true }) ||
+      !validLegacyCount(operation.sendActionCount) ||
+      !validLegacyCount(operation.newUserMessageCount) ||
+      !Number.isFinite(operation.createdAt) ||
+      !Number.isFinite(operation.updatedAt) ||
+      (operation.responsePath !== undefined && !absolutePath(operation.responsePath)) ||
+      (operation.sendBoundaryEnteredAt !== undefined && !Number.isFinite(operation.sendBoundaryEnteredAt)) ||
+      (operation.baselineMessageIds !== undefined && (
+        !Array.isArray(operation.baselineMessageIds) ||
+        operation.baselineMessageIds.some((entry) => !nonEmptyString(entry)) ||
+        new Set(operation.baselineMessageIds).size !== operation.baselineMessageIds.length
+      )) ||
+      (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) ||
+      (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId))
+    ) throw new Error('review_transport_state_invalid');
+
+    const observedFields = [
+      'observedUserMessageId',
+      'observedUserMessageAt',
+      'observedConversationUrl',
+      'observedConversationId',
+      'observedCommitmentClass',
+      'observedTurnEvidence'
+    ];
+    const observedCount = observedFields.filter((field) => operation[field] !== undefined).length;
+    if (observedCount !== 0 && (
+      observedCount !== observedFields.length ||
+      !nonEmptyString(operation.observedUserMessageId) ||
+      !Number.isFinite(operation.observedUserMessageAt) ||
+      !nonEmptyString(operation.observedConversationUrl) ||
+      !nonEmptyString(operation.observedConversationId) ||
+      ![
+        'turn_exact',
+        'turn_unreadable',
+        'turn_content_mismatch',
+        'turn_causal_exact_rendered_unreadable',
+        'turn_causal_exact_rendered_mismatch'
+      ].includes(operation.observedCommitmentClass) ||
+      !record(operation.observedTurnEvidence) ||
+      operation.sendActionCount !== 1 ||
+      operation.newUserMessageCount !== 1 ||
+      (operation.userMessageId !== undefined && operation.userMessageId !== operation.observedUserMessageId)
+    )) throw new Error('review_transport_state_invalid');
+
+    if (operation.causalSendReceipt !== undefined && (
+      !record(operation.causalSendReceipt) ||
+      operation.causalSendReceipt.identityModel !== 'agentify_review_causal_submission_v1' ||
+      operation.causalSendReceipt.operationId !== operation.operationId ||
+      operation.causalSendReceipt.sendActionCount !== 1 ||
+      operation.causalSendReceipt.clickCount !== 1 ||
+      operation.causalSendReceipt.sourceSha256 !== operation.promptSha256 ||
+      !SHA256.test(String(operation.causalSendReceipt.canonicalPromptSha256 || '')) ||
+      !SHA256.test(String(operation.causalSendReceipt.baselineMessageIdsSha256 || ''))
+    )) throw new Error('review_transport_state_invalid');
+
+    if (operation.status === 'PREPARED' && (
+      !Array.isArray(operation.baselineMessageIds) ||
+      operation.sendCount !== 0 ||
+      operation.userMessageId !== undefined
+    )) throw new Error('review_transport_state_invalid');
+    if (operation.status === 'SUBMITTED' && (
+      operation.sendCount !== 1 ||
+      !nonEmptyString(operation.userMessageId)
+    )) throw new Error('review_transport_state_invalid');
+    if (operation.status === 'COMPLETE' && (
+      operation.sendCount !== 1 ||
+      operation.sendActionCount !== 1 ||
+      !nonEmptyString(operation.userMessageId) ||
+      !nonEmptyString(operation.assistantMessageId) ||
+      operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
+      !Number.isFinite(operation.completedAt)
+    )) throw new Error('review_transport_state_invalid');
+  }
+
+  return {
+    bindingKeys: Object.keys(value.bindings).sort(),
+    idempotencyKeys: Object.keys(value.operations).sort()
+  };
+}
+
+function legacyArchiveBasename(sha256) {
+  return `review-transport.v2-${sha256}.json`;
+}
+
+function legacyMetadata(rawBytes, legacyState) {
+  const { bindingKeys, idempotencyKeys } = validateLegacyReviewTransportState(legacyState);
+  const sha256 = sha256Bytes(rawBytes);
+  return {
+    archiveBasename: legacyArchiveBasename(sha256),
+    sha256,
+    sourceSchemaVersion: LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION,
+    bindingKeys,
+    idempotencyKeys
+  };
+}
+
+function validateLegacyMetadata(value) {
+  if (value === undefined) return null;
+  if (
+    !record(value) ||
+    !SHA256.test(String(value.sha256 || '')) ||
+    value.archiveBasename !== legacyArchiveBasename(value.sha256) ||
+    path.basename(value.archiveBasename) !== value.archiveBasename ||
+    value.sourceSchemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION ||
+    !sortedUniqueStrings(value.bindingKeys) ||
+    !sortedUniqueStrings(value.idempotencyKeys)
+  ) throw new Error('review_transport_state_invalid');
+  return value;
+}
 
 export function defaultReviewTransportState() {
   return { schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION, bindings: {}, operations: {} };
@@ -172,6 +401,12 @@ function validateReviewTransportState(value) {
   if (!value.operations || typeof value.operations !== 'object' || Array.isArray(value.operations)) {
     throw new Error('review_transport_state_invalid');
   }
+  const legacy = validateLegacyMetadata(value.legacy);
+  if (legacy && (
+    legacy.bindingKeys.some((key) => Object.hasOwn(value.bindings, key)) ||
+    legacy.idempotencyKeys.some((key) => Object.hasOwn(value.operations, key))
+  )) throw new Error('review_transport_state_invalid');
+
 
   for (const [key, binding] of Object.entries(value.bindings)) {
     if (
@@ -215,7 +450,7 @@ function validateReviewTransportState(value) {
       !nonEmptyString(operation.stableKey) ||
       !nonEmptyString(operation.conversationUrl) ||
       !nonEmptyString(operation.conversationId) ||
-      !path.isAbsolute(String(operation.responsePath || '')) ||
+      !absolutePath(operation.responsePath) ||
       !SHA256.test(String(operation.promptSha256 || '')) ||
       !REVIEW_PHASES.has(operation.phase) ||
       !REVIEW_COMMITMENTS.has(operation.commitment) ||
@@ -269,7 +504,7 @@ function validateReviewTransportState(value) {
         !archive ||
         typeof archive !== 'object' ||
         Array.isArray(archive) ||
-        !path.isAbsolute(String(archive.path || '')) ||
+        !absolutePath(archive.path) ||
         archive.path !== operation.responsePath ||
         !SHA256.test(String(archive.sha256 || '')) ||
         !Number.isInteger(archive.sizeBytes) ||
@@ -383,28 +618,137 @@ export async function writeState(state, stateDir = defaultStateDir()) {
   await atomicWriteFile(statePath(stateDir), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-export async function readReviewTransportStateReadOnly(stateDir = defaultStateDir()) {
+async function readReviewTransportBytes(stateDir) {
   try {
-    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed?.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
-      throw new Error('review_transport_state_version_unsupported');
-    }
-    return validateReviewTransportState(parsed);
+    return await fs.readFile(reviewTransportPath(stateDir));
   } catch (error) {
-    if (error?.code === 'ENOENT') return defaultReviewTransportState();
-    if (['review_transport_state_invalid', 'review_transport_state_version_unsupported'].includes(String(error?.message || ''))) throw error;
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function parseReviewTransportBytes(rawBytes) {
+  try {
+    return JSON.parse(rawBytes.toString('utf8'));
+  } catch (error) {
     throw new Error('review_transport_state_invalid', { cause: error });
   }
 }
 
+function legacyProjection(rawBytes, parsed) {
+  return {
+    ...defaultReviewTransportState(),
+    legacy: legacyMetadata(rawBytes, parsed)
+  };
+}
+
+async function verifyLegacyArchive(stateDir, metadata) {
+  if (!metadata) return;
+  try {
+    const rawBytes = await fs.readFile(path.join(stateDir, metadata.archiveBasename));
+    if (sha256Bytes(rawBytes) !== metadata.sha256) {
+      throw new Error('review_transport_state_invalid');
+    }
+    const observed = legacyMetadata(rawBytes, parseReviewTransportBytes(rawBytes));
+    if (
+      observed.archiveBasename !== metadata.archiveBasename ||
+      observed.sourceSchemaVersion !== metadata.sourceSchemaVersion ||
+      !sameStrings(observed.bindingKeys, metadata.bindingKeys) ||
+      !sameStrings(observed.idempotencyKeys, metadata.idempotencyKeys)
+    ) throw new Error('review_transport_state_invalid');
+  } catch (error) {
+    if (error?.message === 'review_transport_state_invalid') throw error;
+    throw new Error('review_transport_state_invalid', { cause: error });
+  }
+}
+
+async function publishLegacyArchive(stateDir, metadata, rawBytes) {
+  const archivePath = path.join(stateDir, metadata.archiveBasename);
+  const verifyExisting = async () => {
+    const observed = await fs.readFile(archivePath);
+    if (!observed.equals(rawBytes)) throw new Error('review_transport_state_invalid');
+  };
+  try {
+    await verifyExisting();
+    return;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const temporaryPath = path.join(
+    stateDir,
+    `.${metadata.archiveBasename}.tmp-${process.pid}-${crypto.randomUUID()}`
+  );
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, 'wx', 0o600);
+    await handle.writeFile(rawBytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    try {
+      await fs.link(temporaryPath, archivePath);
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      await verifyExisting();
+      return;
+    }
+    const directory = await fs.open(stateDir, 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+    await verifyExisting();
+  } finally {
+    await handle?.close().catch(() => {});
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+async function validateCurrentReviewTransportState(parsed, stateDir) {
+  const normalized = validateReviewTransportState(parsed);
+  await verifyLegacyArchive(stateDir, normalized.legacy);
+  return normalized;
+}
+
+export async function readReviewTransportStateReadOnly(stateDir = defaultStateDir()) {
+  const rawBytes = await readReviewTransportBytes(stateDir);
+  if (!rawBytes) return defaultReviewTransportState();
+  const parsed = parseReviewTransportBytes(rawBytes);
+  if (parsed?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    return legacyProjection(rawBytes, parsed);
+  }
+  if (parsed?.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    throw new Error('review_transport_state_version_unsupported');
+  }
+  return await validateCurrentReviewTransportState(parsed, stateDir);
+}
+
 export async function readReviewTransportState(stateDir = defaultStateDir()) {
-  return await readReviewTransportStateReadOnly(stateDir);
+  const rawBytes = await readReviewTransportBytes(stateDir);
+  if (!rawBytes) return defaultReviewTransportState();
+  const parsed = parseReviewTransportBytes(rawBytes);
+  if (parsed?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    const normalized = legacyProjection(rawBytes, parsed);
+    await publishLegacyArchive(stateDir, normalized.legacy, rawBytes);
+    await atomicWriteFile(
+      reviewTransportPath(stateDir),
+      `${JSON.stringify(normalized, null, 2)}\n`,
+      { mode: 0o600 }
+    );
+    return normalized;
+  }
+  if (parsed?.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION) {
+    throw new Error('review_transport_state_version_unsupported');
+  }
+  return await validateCurrentReviewTransportState(parsed, stateDir);
 }
 
 export async function writeReviewTransportState(state, stateDir = defaultStateDir()) {
-  await ensureStateDir(stateDir);
   const normalized = validateReviewTransportState(state);
+  await verifyLegacyArchive(stateDir, normalized.legacy);
+  await ensureStateDir(stateDir);
   await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   return normalized;
 }

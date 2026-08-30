@@ -198,6 +198,15 @@ async function readStateLocked(stateDir) { return await withStateLock(stateDir, 
 function repairable(operation) {
   return operation?.phase === 'PREPARE_UI' && operation.commitment === 'ZERO_PROVEN' && operation.recoverability === 'PRECOMMIT_REPAIR' && operation.messageCapability === 'AVAILABLE' && operation.providerUserMessageCount === 0 && operation.sendActivationCount === 0 && !operation.userMessageId;
 }
+function rejectLegacyKeyReuse(state, request) {
+  if (state.legacy?.idempotencyKeys.includes(request.idempotencyKey)) {
+    fail('review_idempotency_conflict', { legacy: true, sealed: true, keyType: 'idempotency' });
+  }
+  if (state.legacy?.bindingKeys.includes(request.stableKey)) {
+    fail('review_binding_mismatch', { legacy: true, sealed: true, keyType: 'binding' });
+  }
+}
+
 function sealInterruptedReservation(operation) {
   if (operation?.phase !== 'ARMED' || operation.messageCapability !== 'RESERVED') return false;
   operation.phase = 'VERIFY_COMMITMENT';
@@ -223,6 +232,7 @@ export async function inspectReviewAdmission({ stateDir, request: rawRequest }) 
   const request = normalizeRequest(rawRequest);
   const fingerprint = requestFingerprint(request);
   const state = await readStateLocked(stateDir);
+  rejectLegacyKeyReuse(state, request);
   const existing = state.operations[request.idempotencyKey] || null;
   if (existing && existing.requestFingerprint !== fingerprint && !matchesExistingObservation(existing, request)) fail('review_idempotency_conflict');
   const mayRepair = !!existing && repairable(existing) && !request.verifyExisting;
@@ -275,6 +285,7 @@ async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, on
   const promptIdentity = reviewPlainTextIdentity(request.prompt);
   const intake = await mutateState(stateDir, async (state) => {
     const now = Date.now();
+    rejectLegacyKeyReuse(state, request);
     const binding = state.bindings[request.stableKey];
     const existing = state.operations[request.idempotencyKey];
     sealInterruptedReservation(existing);
