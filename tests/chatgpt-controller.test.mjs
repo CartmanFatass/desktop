@@ -976,98 +976,39 @@ test('chatgpt-controller: strict model labels match only after whitespace and ca
   assert.equal(modelLabelMatches('High', 'Pro'), false);
 });
 
-function closedTargetMenusFixture(initialValue) {
-  let productOpen = false;
-  let effortOpen = false;
-  let value = initialValue;
-  let pointerActivations = 0;
-  let powerActivations = 0;
-  let arrowRightCount = 0;
+function combinedProControlFixture(scopedMatchCount = 1) {
   let sendActions = 0;
+  let pointerActivations = 0;
+  let keyActivations = 0;
   const page = {
     async getUrl() { return 'https://chatgpt.com/'; },
     async evaluate(js) {
       if (js.includes('const hasTurnstile')) return readyState();
-      if (js.includes('agentifyChatgptProductModelStateMarker')) {
+      if (js.includes('agentifyChatgptCombinedProControlStateMarker')) {
         return {
-          matched: productOpen,
-          requestedProductModel: 'GPT-5.6 Sol',
-          matchedLabel: productOpen ? 'GPT-5.6 Sol' : null,
-          selectionView: 'chatgpt_product_model_menu',
-          role: 'menuitemradio',
-          scopedMatchCount: productOpen ? 1 : 0,
-          selectedMatchCount: productOpen ? 1 : 0
+          matched: scopedMatchCount === 1,
+          providerVisibleLabel: scopedMatchCount === 1 ? 'Pro' : null,
+          selectionView: 'chatgpt_combined_pro_control',
+          role: 'button',
+          scopedMatchCount
         };
-      }
-      if (js.includes('agentifyOpenChatgptProductModelViewMarker')) {
-        return { ok: true, rect: { x: 10, y: 10, w: 20, h: 20 } };
-      }
-      if (js.includes('agentifyChooseChatgptProductModelMarker')) {
-        return { ok: true, selected: true, rect: { x: 10, y: 10, w: 20, h: 20 } };
-      }
-      if (js.includes('agentifyCloseChatgptProductModelViewMarker')) {
-        return { closed: !productOpen, visibleSelectionViewCount: productOpen ? 1 : 0 };
-      }
-      if (js.includes('agentifyChatgptReasoningSliderStateMarker')) {
-        if (!effortOpen) {
-          return { matched: false, requestedReasoningEffort: 'Pro', scopedMatchCount: 0, error: 'reasoning_effort_slider_unavailable' };
-        }
-        return {
-          matched: value === 4,
-          requestedReasoningEffort: 'Pro',
-          matchedLabel: value === 4 ? 'Pro' : null,
-          selectionView: 'chatgpt_reasoning_effort_slider',
-          role: 'slider',
-          actionOwner: 'Power',
-          scopedMatchCount: 1,
-          min: 0,
-          max: 4,
-          value,
-          targetValue: 4
-        };
-      }
-      if (js.includes('agentifyOpenChatgptReasoningEffortViewMarker')) {
-        return { ok: true, ownerCount: 1, actionOwner: 'Power' };
-      }
-      if (js.includes('agentifyCloseChatgptReasoningEffortViewMarker')) {
-        return { closed: !effortOpen, visibleSliderCount: effortOpen ? 1 : 0 };
       }
       if (js.includes('reviewSendOnceMarker')) sendActions += 1;
       throw new Error(`unexpected_eval:${js.slice(0, 100)}`);
     },
-    async moveMouse() {},
-    async mouseDown() {},
-    async mouseUp() {
-      pointerActivations += 1;
-      productOpen = true;
-    },
-    async sendKey(key) {
-      if (key === 'Escape') {
-        if (effortOpen) effortOpen = false;
-        else productOpen = false;
-        return;
-      }
-      if (key === 'Space') {
-        powerActivations += 1;
-        effortOpen = true;
-        return;
-      }
-      if (key === 'ArrowRight') {
-        arrowRightCount += 1;
-        value += 1;
-        return;
-      }
-      throw new Error(`forbidden_target_key:${key}`);
-    }
+    async moveMouse() { pointerActivations += 1; },
+    async mouseDown() { pointerActivations += 1; },
+    async mouseUp() { pointerActivations += 1; },
+    async sendKey() { keyActivations += 1; }
   };
   return {
     page,
-    state: () => ({ productOpen, effortOpen, value, pointerActivations, powerActivations, arrowRightCount, sendActions })
+    state: () => ({ sendActions, pointerActivations, keyActivations })
   };
 }
 
-test('chatgpt-controller: closed target menus select product, advance High 2 to Pro 4, and close before Send', async () => {
-  const fixture = closedTargetMenusFixture(2);
+test('chatgpt-controller: one visible composer Pro control binds product and effort without UI mutation', async () => {
+  const fixture = combinedProControlFixture();
   const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
   const result = await controller.reviewPreflight({
     productModel: 'GPT-5.6 Sol',
@@ -1076,39 +1017,34 @@ test('chatgpt-controller: closed target menus select product, advance High 2 to 
   });
 
   assert.equal(result.productModelEvidence.matchedLabel, 'GPT-5.6 Sol');
-  assert.equal(result.productModelEvidence.closed, true);
+  assert.equal(result.productModelEvidence.providerVisibleLabel, 'Pro');
+  assert.equal(result.productModelEvidence.selectionView, 'chatgpt_combined_pro_control');
   assert.equal(result.reasoningEffortEvidence.matchedLabel, 'Pro');
-  assert.equal(result.reasoningEffortEvidence.closed, true);
-  assert.equal(result.reasoningEffortEvidence.stepCount, 2);
+  assert.equal(result.reasoningEffortEvidence.providerVisibleLabel, 'Pro');
+  assert.equal(result.reasoningEffortEvidence.stepCount, 0);
   assert.deepEqual(fixture.state(), {
-    productOpen: false,
-    effortOpen: false,
-    value: 4,
-    pointerActivations: 1,
-    powerActivations: 1,
-    arrowRightCount: 2,
-    sendActions: 0
+    sendActions: 0,
+    pointerActivations: 0,
+    keyActivations: 0
   });
 });
 
-test('chatgpt-controller: closed already-Pro effort view performs no arrow repair and closes cleanly', async () => {
-  const fixture = closedTargetMenusFixture(4);
+test('chatgpt-controller: ambiguous composer Pro controls fail before UI mutation', async () => {
+  const fixture = combinedProControlFixture(2);
   const controller = new ChatGPTController({ page: fixture.page, selectors: {} });
-  const result = await controller.reviewPreflight({
-    productModel: 'GPT-5.6 Sol',
-    reasoningEffort: 'Pro',
-    timeoutMs: 5_000
-  });
 
-  assert.equal(result.reasoningEffortEvidence.stepCount, 0);
+  await assert.rejects(
+    controller.reviewPreflight({
+      productModel: 'GPT-5.6 Sol',
+      reasoningEffort: 'Pro',
+      timeoutMs: 5_000
+    }),
+    /chatgpt_combined_pro_control_ambiguous/
+  );
   assert.deepEqual(fixture.state(), {
-    productOpen: false,
-    effortOpen: false,
-    value: 4,
-    pointerActivations: 1,
-    powerActivations: 1,
-    arrowRightCount: 0,
-    sendActions: 0
+    sendActions: 0,
+    pointerActivations: 0,
+    keyActivations: 0
   });
 });
 
