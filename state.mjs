@@ -97,6 +97,8 @@ const LEGACY_REVIEW_STATUSES = new Set([
   'BLOCKED',
   'COMPLETE'
 ]);
+const DIRECTORY_SYNC_UNAVAILABLE = new Set(['EPERM', 'EINVAL', 'ENOTSUP', 'EBADF', 'EISDIR']);
+
 
 function record(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -662,7 +664,21 @@ async function verifyLegacyArchive(stateDir, metadata) {
   }
 }
 
-async function publishLegacyArchive(stateDir, metadata, rawBytes) {
+async function syncDirectory(directoryPath) {
+  const directory = await fs.open(directoryPath, 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+async function publishLegacyArchive(
+  stateDir,
+  metadata,
+  rawBytes,
+  { syncDirectory: syncPublishedDirectory = syncDirectory } = {}
+) {
   const archivePath = path.join(stateDir, metadata.archiveBasename);
   const verifyExisting = async () => {
     const observed = await fs.readFile(archivePath);
@@ -693,11 +709,10 @@ async function publishLegacyArchive(stateDir, metadata, rawBytes) {
       await verifyExisting();
       return;
     }
-    const directory = await fs.open(stateDir, 'r');
     try {
-      await directory.sync();
-    } finally {
-      await directory.close();
+      await syncPublishedDirectory(stateDir);
+    } catch (error) {
+      if (!DIRECTORY_SYNC_UNAVAILABLE.has(error?.code)) throw error;
     }
     await verifyExisting();
   } finally {
@@ -725,13 +740,16 @@ export async function readReviewTransportStateReadOnly(stateDir = defaultStateDi
   return await validateCurrentReviewTransportState(parsed, stateDir);
 }
 
-export async function readReviewTransportState(stateDir = defaultStateDir()) {
+export async function readReviewTransportState(
+  stateDir = defaultStateDir(),
+  publishOptions = {}
+) {
   const rawBytes = await readReviewTransportBytes(stateDir);
   if (!rawBytes) return defaultReviewTransportState();
   const parsed = parseReviewTransportBytes(rawBytes);
   if (parsed?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
     const normalized = legacyProjection(rawBytes, parsed);
-    await publishLegacyArchive(stateDir, normalized.legacy, rawBytes);
+    await publishLegacyArchive(stateDir, normalized.legacy, rawBytes, publishOptions);
     await atomicWriteFile(
       reviewTransportPath(stateDir),
       `${JSON.stringify(normalized, null, 2)}\n`,

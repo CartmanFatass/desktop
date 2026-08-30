@@ -202,6 +202,66 @@ test('state: matching pre-existing v2 archive resumes cutover and mismatched byt
     assert.deepEqual(await fs.readFile(archivePath), archiveBytes);
   }
 });
+test('state: unsupported directory fsync still verifies the published archive and completes cutover', async () => {
+  for (const code of ['EPERM', 'EINVAL', 'ENOTSUP', 'EBADF', 'EISDIR']) {
+    const dir = await tempDir();
+    const file = reviewTransportPath(dir);
+    const bytes = legacyBytes();
+    await fs.writeFile(file, bytes);
+    let syncCalls = 0;
+
+    const cutover = await readReviewTransportState(dir, {
+      syncDirectory: async () => {
+        syncCalls += 1;
+        const error = new Error('directory sync unavailable');
+        error.code = code;
+        throw error;
+      }
+    });
+
+    assert.equal(syncCalls, 1);
+    assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).schemaVersion, 3);
+    assert.deepEqual(
+      await fs.readFile(path.join(dir, cutover.legacy.archiveBasename)),
+      bytes
+    );
+  }
+});
+
+test('state: unexpected directory fsync errors refuse replacement while exact archive retry remains idempotent', async () => {
+  const dir = await tempDir();
+  const file = reviewTransportPath(dir);
+  const bytes = legacyBytes();
+  await fs.writeFile(file, bytes);
+
+  await assert.rejects(
+    readReviewTransportState(dir, {
+      syncDirectory: async () => {
+        const error = new Error('synthetic_directory_sync_failure');
+        error.code = 'EIO';
+        throw error;
+      }
+    }),
+    /synthetic_directory_sync_failure/
+  );
+  assert.deepEqual(await fs.readFile(file), bytes);
+
+  const projected = await readReviewTransportStateReadOnly(dir);
+  const archivePath = path.join(dir, projected.legacy.archiveBasename);
+  assert.deepEqual(await fs.readFile(archivePath), bytes);
+
+  let retrySyncCalls = 0;
+  const cutover = await readReviewTransportState(dir, {
+    syncDirectory: async () => {
+      retrySyncCalls += 1;
+      throw new Error('existing archive must bypass directory sync');
+    }
+  });
+  assert.equal(retrySyncCalls, 0);
+  assert.deepEqual(cutover.legacy, projected.legacy);
+  assert.deepEqual(await fs.readFile(archivePath), bytes);
+});
+
 
 test('state: v3 legacy provenance revalidates archive presence, bytes, and tombstone keys', async () => {
   for (const corruption of ['missing', 'bytes', 'keys']) {
