@@ -310,6 +310,12 @@ async function resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault = f
   return defaultTabId;
 }
 
+async function showTabForNativeInput(tabs, tabId) {
+  const presenter = tabs.getWindowById(tabId);
+  if (typeof presenter?.show !== 'function') throw new Error('tab_presenter_unavailable');
+  await presenter.show();
+}
+
 function getTabMeta(tabs, tabId) {
   const rows = Array.isArray(tabs?.listTabs?.()) ? tabs.listTabs() : [];
   return rows.find((row) => String(row?.id || '') === String(tabId || '')) || null;
@@ -1031,6 +1037,7 @@ export function startHttpApi({
         }
         const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        await showTabForNativeInput(tabs, tabId);
         const controller = tabs.getControllerById(tabId);
         if (typeof controller?.reviewPreflight !== 'function') throw new Error('review_preflight_unavailable');
         const result = await runExclusive(controller, async () => controller.reviewPreflight({ productModel, reasoningEffort, timeoutMs }));
@@ -1046,6 +1053,7 @@ export function startHttpApi({
         if (reasoningEffort !== 'Pro') throw new Error('review_invalid_request');
         const timeoutMs = positiveIntOr(body.timeoutMs, 20_000, 60_000);
         const tabId = await resolveTab({ tabs, defaultTabId, body, url, showTabsByDefault: governor.showTabsByDefault, createIfMissing: false, vendors });
+        await showTabForNativeInput(tabs, tabId);
         const controller = tabs.getControllerById(tabId);
         if (typeof controller?.reviewReasoningEffortPreflight !== 'function') throw new Error('review_reasoning_effort_preflight_unavailable');
         const result = await runExclusive(controller, async () => controller.reviewReasoningEffortPreflight({ reasoningEffort, timeoutMs }));
@@ -1083,6 +1091,7 @@ export function startHttpApi({
         const body = await parseBody(req, { maxBytes: 8_192 });
         const tabId = String(body.tabId || '').trim();
         if (!tabId) throw new Error('missing_tabId');
+        await showTabForNativeInput(tabs, tabId);
         const controller = tabs.getControllerById(tabId);
         if (!controller) throw new Error('tab_not_found');
         if (typeof controller.operatorObserve !== 'function') throw new Error('operator_observe_unavailable');
@@ -1095,6 +1104,7 @@ export function startHttpApi({
         const tabId = String(body.tabId || '').trim();
         if (!tabId) throw new Error('missing_tabId');
         if (tabId === defaultTabId) throw new Error('operator_protected_default_mutation_forbidden');
+        await showTabForNativeInput(tabs, tabId);
         const controller = tabs.getControllerById(tabId);
         if (!controller) throw new Error('tab_not_found');
         if (typeof controller.operatorAct !== 'function') throw new Error('operator_act_unavailable');

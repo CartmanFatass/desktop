@@ -114,6 +114,7 @@ test('http-api: tab cleanup failure is reported without changing the transport f
 test('http-api: reasoning-effort preflight carries no prompt or strict operation surface', async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-reasoning-effort-'));
   const seen = [];
+  let showCount = 0;
   const controller = {
     async reviewReasoningEffortPreflight(args) {
       seen.push(args);
@@ -128,7 +129,12 @@ test('http-api: reasoning-effort preflight carries no prompt or strict operation
   };
   const tabs = {
     listTabs: () => [{ id: 'effort-tab', key: 'effort', vendorId: 'chatgpt' }],
-    getControllerById: () => controller
+    getControllerById: () => controller,
+    getWindowById: () => ({
+      async show() {
+        showCount += 1;
+      }
+    })
   };
   const server = await startHttpApi({ port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-reasoning-effort', stateDir, getStatus: async () => ({ ok: true }) });
   t.after(() => server.close());
@@ -139,6 +145,7 @@ test('http-api: reasoning-effort preflight carries no prompt or strict operation
   assert.equal(res.status, 200);
   assert.equal(data.result.reasoningEffortEvidence.matchedLabel, 'Pro');
   assert.deepEqual(seen, [{ reasoningEffort: 'Pro', timeoutMs: 1_000 }]);
+  assert.equal(showCount, 1);
   assert.deepEqual((await readReviewTransportState(stateDir)).operations, {});
 });
 

@@ -144,11 +144,20 @@ function fakeController({ preBoundaryFailures = 0, crashAfterBoundary = false, c
 }
 
 function fakeTabs(controller) {
+  let showCount = 0;
   return {
     async ensureTab() { return 'tab-1'; },
     async adoptTab() {},
     getControllerById() { return controller; },
-    updateTabUrl() {}
+    getWindowById() {
+      return {
+        async show() {
+          showCount += 1;
+        }
+      };
+    },
+    updateTabUrl() {},
+    get showCount() { return showCount; }
   };
 }
 
@@ -158,16 +167,18 @@ test('review transport: two pre-boundary failures and same-key success consume o
   const controller = fakeController({ preBoundaryFailures: 2 });
   const input = request(responsePath);
 
-  await assert.rejects(runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input }), /synthetic_precommit_ui_failure/);
+  const tabs = fakeTabs(controller);
+  await assert.rejects(runReviewQuery({ stateDir, tabs, request: input }), /synthetic_precommit_ui_failure/);
   let admission = await inspectReviewAdmission({ stateDir, request: input });
   assert.equal(admission.repairable, true);
-  await assert.rejects(runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input }), /synthetic_precommit_ui_failure/);
-  const receipt = await runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input });
+  await assert.rejects(runReviewQuery({ stateDir, tabs, request: input }), /synthetic_precommit_ui_failure/);
+  const receipt = await runReviewQuery({ stateDir, tabs, request: input });
 
   assert.equal(receipt.attemptCount, 3);
   assert.equal(receipt.providerUserMessageCount, 1);
   assert.equal(receipt.sendActivationCount, 1);
   assert.equal(controller.activations, 1);
+  assert.equal(tabs.showCount, 3);
   assert.equal(receipt.commitment, 'ONE_EXACT');
   assert.equal(receipt.messageCapability, 'SEALED');
 });

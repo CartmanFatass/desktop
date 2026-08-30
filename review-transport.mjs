@@ -308,7 +308,10 @@ async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, on
       await tabs.adoptTab({ id: request.existingTabId, key: request.stableKey, name: request.stableKey, url: request.conversationUrl, vendorId: request.provider, vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT' });
     }
     const liveIdentity = request.verifyExisting ? request : intake.binding || request;
-    tabId = await tabs.ensureTab({ key: request.stableKey, name: request.stableKey, url: liveIdentity.conversationUrl, vendorId: request.provider, vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT', show: false, exactUrl: true });
+    tabId = await tabs.ensureTab({ key: request.stableKey, name: request.stableKey, url: liveIdentity.conversationUrl, vendorId: request.provider, vendorName: request.provider === 'gemini' ? 'Gemini' : 'ChatGPT', show: true, exactUrl: true });
+    const presenter = tabs.getWindowById(tabId);
+    if (typeof presenter?.show !== 'function') fail('review_tab_presenter_unavailable');
+    await presenter.show();
     controller = tabs.getControllerById(tabId);
   } catch (error) {
     await mutateState(stateDir, async (state) => {
