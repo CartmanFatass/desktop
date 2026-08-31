@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { mapErrorToHttp, releaseStrictReviewTab, startHttpApi } from '../http-api.mjs';
+import { mapErrorToHttp, startHttpApi } from '../http-api.mjs';
 import { readReviewTransportState } from '../state.mjs';
 import {
   REVIEW_CAUSAL_SUBMISSION_MODEL,
@@ -32,91 +32,106 @@ test('http-api: strict pre-send busy and post-send identity ambiguity are confli
   assert.equal(mapErrorToHttp(new Error('review_user_message_content_mismatch')).code, 409);
 });
 
-test('http-api: strict review release is projected from receipt facts', async () => {
-  const closed = [];
-  const tabs = {
-    async closeTab(tabId) {
-      closed.push(tabId);
-    }
-  };
 
-  const complete = await releaseStrictReviewTab({
-    tabs,
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: true,
-      archive: { projection: 'exact' },
-      tabId: 'complete-tab',
-      conversationId: 'conversation-complete'
-    }
-  });
-  const waiting = await releaseStrictReviewTab({
-    tabs,
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: true,
-      archive: null,
-      tabId: 'waiting-tab',
-      conversationId: 'conversation-waiting'
-    }
-  });
-  const retryable = await releaseStrictReviewTab({
-    tabs,
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: false,
-      archive: null,
-      tabId: 'retryable-tab',
-      conversationId: 'conversation-retryable'
-    }
-  });
-  const unbound = await releaseStrictReviewTab({
-    tabs,
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: true,
-      archive: null,
-      tabId: 'unbound-tab',
-      conversationId: '__new__'
-    }
-  });
-  const protectedView = await releaseStrictReviewTab({
-    tabs,
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: true,
-      archive: null,
-      tabId: 'default-tab',
-      conversationId: 'conversation-default'
-    }
-  });
-
-  assert.deepEqual(closed, ['complete-tab', 'waiting-tab', 'retryable-tab']);
-  assert.equal(complete.status, 'CLOSED');
-  assert.equal(waiting.status, 'CLOSED');
-  assert.equal(retryable.status, 'CLOSED');
-  assert.equal(unbound.status, 'RETAINED_UNBOUND_TAB');
-  assert.equal(protectedView.status, 'RETAINED_PROTECTED');
-});
-
-test('http-api: tab cleanup failure is reported without changing the transport fact', async () => {
-  const result = await releaseStrictReviewTab({
-    tabs: {
-      async closeTab() {
-        throw new Error('chrome_cdp_disconnected');
+test('http-api: strict review calls v4 transport directly and never sends twice', async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-review-v4-'));
+  const responsePath = path.join(stateDir, 'response.txt');
+  let reviewCalls = 0;
+  let inExclusive = false;
+  const responseText = 'exact response';
+  const responseSha256 = reviewPlainTextIdentity(responseText).sourceSha256;
+  const controller = {
+    async runExclusive(fn) {
+      assert.equal(inExclusive, false);
+      inExclusive = true;
+      try {
+        return await fn();
+      } finally {
+        inExclusive = false;
       }
     },
-    defaultTabId: 'default-tab',
-    receipt: {
-      sendAttempted: true,
-      archive: { projection: 'exact' },
-      tabId: 'completed-tab',
-      conversationId: 'conversation-complete'
+    async reviewQuery(args) {
+      assert.equal(inExclusive, true);
+      reviewCalls += 1;
+      const promptIdentity = reviewPlainTextIdentity(args.prompt);
+      await args.onPrepared({ baselineMessageIds: ['history-1'] });
+      await args.onComposerVerified({
+        ok: true,
+        textModel: REVIEW_PLAIN_TEXT_MODEL,
+        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
+        sourceSha256: promptIdentity.sourceSha256,
+        canonicalPromptSha256: promptIdentity.canonicalSha256,
+        observedCanonicalSha256: promptIdentity.canonicalSha256
+      });
+      await args.onSendAttempted();
+      await args.onUserTurnObserved({
+        observedUserMessageId: 'user-1',
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId
+      });
+      return {
+        userMessageId: 'user-1',
+        conversationUrl: args.expectedUrl,
+        conversationId: args.expectedConversationId
+      };
+    },
+    async observeReviewResponse() {
+      const observedAt = Date.now();
+      return {
+        userMessageId: 'user-1',
+        assistantMessageId: 'assistant-1',
+        conversationUrl: 'https://chatgpt.com/c/http-review',
+        conversationId: 'http-review',
+        text: responseText,
+        snapshots: [
+          { assistantMessageId: 'assistant-1', textSha256: responseSha256, observedAt },
+          { assistantMessageId: 'assistant-1', textSha256: responseSha256, observedAt: observedAt + 3_000 }
+        ],
+        controls: { stop: false, continue: false, retry: false },
+        clickedControls: []
+      };
     }
+  };
+  const tabs = {
+    listTabs: () => [{ id: 'review-tab', key: 'http-review' }],
+    ensureTab: async () => 'review-tab',
+    getWindowById: () => ({ async show() {} }),
+    getControllerById: () => controller,
+    updateTabUrl() {}
+  };
+  const server = await startHttpApi({
+    port: 0,
+    token: 'secret',
+    tabs,
+    defaultTabId: 'default-tab',
+    serverId: 'sid-review',
+    stateDir,
+    getStatus: async () => ({ ok: true })
   });
+  t.after(() => server.close());
+  const port = server.address().port;
+  const body = {
+    stableKey: 'http-review',
+    provider: 'chatgpt',
+    productModel: 'GPT-5.6 Sol',
+    reasoningEffort: 'Pro',
+    conversationUrl: 'https://chatgpt.com/c/http-review',
+    conversationId: 'http-review',
+    idempotencyKey: 'http-review-operation',
+    prompt: 'exact prompt',
+    responsePath,
+    timeoutMs: 5_000
+  };
 
-  assert.equal(result.status, 'CLOSE_FAILED');
-  assert.equal(result.error, 'chrome_cdp_disconnected');
+  const first = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
+  assert.equal(first.res.status, 200);
+  assert.equal(first.data.receipt.sendAttempted, true);
+  assert.equal(first.data.receipt.providerAssistantMessageId, 'assistant-1');
+
+  const second = await req({ port, token: 'secret', method: 'POST', pth: '/review-query', body });
+  assert.equal(second.res.status, 200);
+  assert.equal(second.data.receipt.operationId, first.data.receipt.operationId);
+  assert.equal(reviewCalls, 1);
 });
 
 test('http-api: reasoning-effort preflight carries no prompt or strict operation surface', async (t) => {
@@ -218,43 +233,6 @@ test('http-api: operator surface observes non-default tabs but rejects protected
   assert.deepEqual(calls, [['observe', { tabId: 't1' }]]);
 });
 
-test('http-api: controller refresh is fixed-generation-only, refuses strict activity, and preserves failed-refresh state', async (t) => {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-controller-refresh-'));
-  let generation = 0;
-  let refreshCalls = 0;
-  const digest0 = 'a'.repeat(64);
-  const digest1 = 'b'.repeat(64);
-  const runtime = () => ({ supported: true, generation, sourceDigest: generation === 0 ? digest0 : digest1, sourceModules: [] });
-  const tabs = { listTabs: () => [{ id: 't0', key: 'default', protectedTab: true }], getControllerById: () => ({}) };
-  const server = await startHttpApi({
-    port: 0, token: 'secret', tabs, defaultTabId: 't0', serverId: 'sid-refresh', stateDir, getStatus: async () => ({ ok: true }),
-    getControllerRuntimeState: runtime,
-    onControllerRuntimeRefresh: async ({ expectedGeneration, expectedSourceDigest }) => {
-      refreshCalls += 1;
-      if (expectedGeneration !== generation || expectedSourceDigest !== (generation === 0 ? digest0 : digest1)) {
-        throw new Error('controller_refresh_expected_generation_mismatch');
-      }
-      generation = 1;
-      return runtime();
-    }
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-  const status = await req({ port, token: 'secret', method: 'GET', pth: '/runtime-controller-refresh-status' });
-  assert.equal(status.res.status, 200);
-  assert.equal(status.data.runtime.controllerRuntime.generation, 0);
-  const rejected = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0, modulePath: 'evil.mjs' } });
-  assert.equal(rejected.res.status, 409);
-  assert.equal(rejected.data.error, 'controller_refresh_request_invalid');
-  const refreshed = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0 } });
-  assert.equal(refreshed.res.status, 200);
-  assert.equal(refreshCalls, 1);
-  assert.equal(refreshed.data.result.generation, 1);
-  const stale = await req({ port, token: 'secret', method: 'POST', pth: '/runtime-controller-refresh', body: { expectedGeneration: 0, expectedSourceDigest: digest0 } });
-  assert.equal(stale.res.status, 409);
-  assert.equal(generation, 1);
-});
-
 
 test('http-api: health is public and returns serverId', async (t) => {
   const tabs = { listTabs: () => [], ensureTab: async () => 't1', createTab: async () => 't1', closeTab: async () => true, getControllerById: () => ({}) };
@@ -353,7 +331,7 @@ test('http-api: status surfaces active query runtime and stop can cancel it', as
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
   });
   t.after(() => server.close());
@@ -420,7 +398,7 @@ test('http-api: status surfaces source, phase, blocked state, and last outcome f
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
   });
   t.after(() => server.close());
@@ -482,7 +460,7 @@ test('http-api: same-tab query/send requests are rejected while a run is already
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 5, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
   });
   t.after(() => server.close());
@@ -555,7 +533,7 @@ test('http-api: wait-response joins the active query without a second controller
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
   });
   t.after(() => server.close());
@@ -605,7 +583,7 @@ test('http-api: wait-response returns in-progress before the client deadline wit
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async ({ tabId }) => ({ ok: true, tabId, url: 'https://chatgpt.com/', blocked: false, promptVisible: true, kind: null, tabs: tabs.listTabs() })
   });
   t.after(() => { releaseQuery?.(); server.close(); });
@@ -650,7 +628,7 @@ test('http-api: conversation routes list sessions and open a clean composer on t
     defaultTabId: 't0',
     serverId: 'sid-test',
     stateDir: '/tmp',
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
+    getSettings: async () => ({ showTabsByDefault: false }),
     getStatus: async () => ({ ok: true })
   });
   t.after(() => server.close());
@@ -1542,57 +1520,6 @@ test('http-api: query rejects relative local paths on the direct HTTP surface', 
   assert.equal(r.data.data?.field, 'attachments');
 });
 
-test('http-api: invalid query input does not consume rate-limit budget', async (t) => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-budget-validation-'));
-  const missing = path.join(dir, 'missing.txt');
-  let queries = 0;
-  const controller = {
-    runExclusive: async (fn) => await fn(),
-    query: async () => {
-      queries += 1;
-      return { text: 'ok', codeBlocks: [], meta: {} };
-    }
-  };
-  const tabs = {
-    listTabs: () => [{ id: 't0', key: 'default', vendorId: 'chatgpt' }],
-    ensureTab: async () => 't0',
-    createTab: async () => 't0',
-    closeTab: async () => true,
-    getControllerById: () => controller
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-test',
-    stateDir: dir,
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: 1, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false }),
-    getStatus: async () => ({ ok: true })
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-
-  const bad = await req({
-    port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/query',
-    body: { prompt: 'bad', attachments: [missing] }
-  });
-  assert.equal(bad.res.status, 400);
-  assert.equal(bad.data.error, 'missing_attachment_path');
-
-  const good = await req({
-    port,
-    token: 'secret',
-    method: 'POST',
-    pth: '/query',
-    body: { prompt: 'good', attachments: [] }
-  });
-  assert.equal(good.res.status, 200);
-  assert.equal(queries, 1);
-});
 
 test('http-api: artifacts save/list/open-folder work', async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-http-artifacts-'));
@@ -2822,110 +2749,6 @@ test('http-api: ensure-ready timeout maps to 408 with details', async (t) => {
   assert.deepEqual(r.data.data, { kind: 'login' });
 });
 
-test('http-api: query returns 429 when maxInflightQueries exceeded', async (t) => {
-  let started = 0;
-  let release;
-  const gate = new Promise((r) => (release = r));
-
-  const controllers = new Map();
-  const getController = (id) => {
-    if (!controllers.has(id)) {
-      controllers.set(id, {
-        runExclusive: async (fn) => await fn(),
-        query: async () => {
-          started += 1;
-          await gate;
-          return { text: 'ok' };
-        }
-      });
-    }
-    return controllers.get(id);
-  };
-
-  const tabs = {
-    listTabs: () => [{ id: 't0', key: 'default' }, { id: 't1', key: 'q1' }, { id: 't2', key: 'q2' }],
-    ensureTab: async ({ key }) => {
-      if (key === 'q1') return 't1';
-      if (key === 'q2') return 't2';
-      return 't0';
-    },
-    createTab: async () => 't0',
-    closeTab: async () => true,
-    getControllerById: (id) => getController(id)
-  };
-
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-test',
-    stateDir: '/tmp',
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 1, maxQueriesPerMinute: 999, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-
-  const q1 = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q1', prompt: 'hi' } });
-  // Give the server a moment to enter the handler and increment inflight.
-  for (let i = 0; i < 50 && started === 0; i++) await new Promise((r) => setTimeout(r, 5));
-
-  const q2 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q2', prompt: 'hi2' } });
-  assert.equal(q2.res.status, 429);
-  assert.equal(q2.data.error, 'rate_limited');
-  assert.equal(q2.data.reason, 'max_inflight');
-  const q3 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q2', prompt: 'still blocked' } });
-  assert.equal(q3.res.status, 429);
-  assert.equal(q3.data.reason, 'max_inflight');
-
-  release();
-  const q1r = await q1;
-  assert.equal(q1r.res.status, 200);
-});
-
-
-test('http-api: query pacing returns 429 with retryAfterMs when max wait is 0', async (t) => {
-  let calls = 0;
-  const controller = {
-    runExclusive: async (fn) => await fn(),
-    query: async () => {
-      calls += 1;
-      return { text: 'ok' };
-    }
-  };
-  const tabs = {
-    listTabs: () => [{ id: 't0', key: 'default' }],
-    ensureTab: async () => 't0',
-    createTab: async () => 't0',
-    closeTab: async () => true,
-    getControllerById: () => controller
-  };
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-test',
-    stateDir: '/tmp',
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 10, maxQueriesPerMinute: 999, minTabGapMs: 5_000, minGlobalGapMs: 0, showTabsByDefault: false })
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-
-  const q1 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hi' } });
-  assert.equal(q1.res.status, 200);
-
-  const q2 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hi2' } });
-  assert.equal(q2.res.status, 429);
-  assert.equal(q2.data.error, 'rate_limited');
-  assert.equal(q2.data.reason, 'tab_gap');
-  assert.equal(typeof q2.data.retryAfterMs, 'number');
-  assert.ok(q2.data.retryAfterMs > 0);
-
-  assert.equal(calls, 1);
-});
 
 test('http-api: invalid tabId returns 404', async (t) => {
   const tabs = {
@@ -3053,108 +2876,4 @@ test('http-api: shutdown calls onShutdown', async (t) => {
   // Give the async handler a moment.
   await new Promise((r2) => setTimeout(r2, 10));
   assert.equal(called, 1);
-});
-
-test('http-api: query rate limits (qpm + inflight)', async (t) => {
-  const tabs = {
-    listTabs: () => [{ id: 't0', key: 'default' }, { id: 't1', key: 'q1' }, { id: 't2', key: 'q2' }],
-    ensureTab: async ({ key }) => {
-      if (key === 'q1') return 't1';
-      if (key === 'q2') return 't2';
-      return 't0';
-    },
-    createTab: async () => 't0',
-    closeTab: async () => true,
-    getControllerById: () => ({
-      query: async () => ({ text: 'ok', codeBlocks: [], meta: {} })
-    })
-  };
-
-  let inflightBlock = false;
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-test',
-    stateDir: '/tmp',
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => {
-      if (inflightBlock) return { maxInflightQueries: 1, maxQueriesPerMinute: 100, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false };
-      return { maxInflightQueries: 2, maxQueriesPerMinute: 1, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false };
-    }
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-
-  const r1 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hi', attachments: [] } });
-  assert.equal(r1.res.status, 200);
-
-  const r2 = await req({ port, token: 'secret', method: 'POST', pth: '/query', body: { prompt: 'hi2', attachments: [] } });
-  assert.equal(r2.res.status, 429);
-  assert.equal(r2.data.error, 'rate_limited');
-  assert.equal(r2.data.reason, 'qpm');
-
-  // Inflight: simulate by having controller.query hang while maxInflightQueries=1.
-  inflightBlock = true;
-  let resolveHang;
-  const hang = new Promise((r) => (resolveHang = r));
-  tabs.getControllerById = () => ({
-    query: async () => {
-      await hang;
-      return { text: 'ok', codeBlocks: [], meta: {} };
-    }
-  });
-
-  const p1 = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q1', prompt: 'a', attachments: [] } });
-  // Let the first request enter inflight.
-  await new Promise((r) => setTimeout(r, 20));
-  const p2 = req({ port, token: 'secret', method: 'POST', pth: '/query', body: { key: 'q2', prompt: 'b', attachments: [] } });
-
-  const p2Res = await p2;
-  assert.equal(p2Res.res.status, 429);
-  assert.equal(p2Res.data.reason, 'max_inflight');
-
-  resolveHang();
-  const p1Res = await p1;
-  assert.equal(p1Res.res.status, 200);
-});
-
-test('http-api: send uses governor too', async (t) => {
-  const tabs = {
-    listTabs: () => [],
-    ensureTab: async () => 't0',
-    createTab: async () => 't0',
-    closeTab: async () => true,
-    getControllerById: () => ({
-      send: async () => ({ ok: true })
-    })
-  };
-
-  let qpm = 1;
-  const server = await startHttpApi({
-    port: 0,
-    token: 'secret',
-    tabs,
-    defaultTabId: 't0',
-    serverId: 'sid-test',
-    stateDir: '/tmp',
-    getStatus: async () => ({ ok: true }),
-    getSettings: async () => ({ maxInflightQueries: 2, maxQueriesPerMinute: qpm, minTabGapMs: 0, minGlobalGapMs: 0, showTabsByDefault: false })
-  });
-  t.after(() => server.close());
-  const port = server.address().port;
-
-  const r1 = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'hi', stopAfterSend: true } });
-  assert.equal(r1.res.status, 200);
-
-  // Immediately sending again should trip qpm=1.
-  const r2 = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'hi2' } });
-  assert.equal(r2.res.status, 429);
-  assert.equal(r2.data.reason, 'qpm');
-
-  // Increase qpm and ensure the bucket adjusts.
-  qpm = 100;
-  const r3 = await req({ port, token: 'secret', method: 'POST', pth: '/send', body: { text: 'hi3' } });
-  assert.equal(r3.res.status, 200);
 });

@@ -160,23 +160,6 @@ export class TabManager {
     });
   }
 
-  async refreshControllers({ createController, validateController = null } = {}) {
-    if (typeof createController !== 'function') throw new Error('controller_refresh_factory_missing');
-    return await this.mutex.run(async () => {
-      const prepared = [];
-      for (const tab of this.tabs.values()) {
-        if (tab.session?.isClosed?.()) throw new Error('controller_refresh_tab_closed');
-        const controller = await createController({ tabId: tab.id, page: tab.session.page, session: tab.session, previousController: tab.controller });
-        if (!controller || typeof controller !== 'object') throw new Error('controller_refresh_controller_invalid');
-        if (typeof validateController === 'function') await validateController({ tab, controller });
-        prepared.push({ tab, controller });
-      }
-      for (const item of prepared) item.tab.controller = item.controller;
-      this.createController = createController;
-      this.onChanged?.();
-      return { reboundTabIds: prepared.map(({ tab }) => tab.id) };
-    });
-  }
 
   async adoptTab({ id, key, name, url, vendorId, vendorName } = {}) {
     return await this.mutex.run(async () => {

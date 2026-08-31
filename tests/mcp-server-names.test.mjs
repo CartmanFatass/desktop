@@ -43,8 +43,6 @@ test('mcp-server registers agentify_* tools only', async () => {
   assert.ok(src.includes("path: '/operator-wait'"), 'expected operator wait endpoint forwarding');
   assert.equal(src.includes("'agentify_review_prompt_sha256_preflight'"), false, 'caller SHA preflight must stay absent');
   assert.equal(src.includes("'agentify_review_cancel_prepared'"), false, 'redundant zero-send retirement tool must stay absent');
-  assert.ok(src.includes("'agentify_review_observe'"), 'expected native ledger-only strict observation tool');
-  assert.ok(src.includes("path: '/review-observe'"), 'expected native review-observe endpoint forwarding');
   for (const field of ['stableKey', 'provider', 'productModel', 'reasoningEffort', 'conversationUrl', 'conversationId', 'idempotencyKey', 'promptSha256', 'responsePath', 'verifyExisting', 'firstBinding', 'existingTabId']) {
     assert.ok(src.includes(`${field}:`), `expected ${field} review field`);
   }

@@ -20,7 +20,6 @@ test('package manifest is publishable under @agentify/desktop with npx-friendly 
   assert.ok(manifest.files.includes('bin/'));
   assert.ok(manifest.files.includes('main.mjs'));
   assert.ok(manifest.files.includes('mcp-server.mjs'));
-  assert.ok(manifest.files.includes('controller-refresh.mjs'));
   assert.ok(manifest.files.includes('operator-control.mjs'));
   assert.ok(manifest.files.includes('ui/'));
   assert.ok(!manifest.files.includes('tests/'));

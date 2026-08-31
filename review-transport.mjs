@@ -13,8 +13,26 @@ const MAX_REVIEW_TIMEOUT_MS = 45 * 60_000;
 const MIN_REVIEW_TIMEOUT_MS = 1_000;
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const REVIEW_REQUEST_FIELDS = new Set([
+  'stableKey',
+  'provider',
+  'productModel',
+  'reasoningEffort',
+  'conversationUrl',
+  'conversationId',
+  'idempotencyKey',
+  'prompt',
+  'promptSha256',
+  'responsePath',
+  'timeoutMs',
+  'verifyExisting',
+  'firstBinding',
+  'geminiBootstrap',
+  'geminiBootstrapContinuation',
+  'bootstrapNonScientific',
+  'existingTabId'
+]);
 const stateLocks = new Map();
-const activeReviewExecutions = new Set();
 
 function fail(code, data = null) {
   const error = new Error(code);
@@ -127,7 +145,8 @@ function normalizeResponsePath(value) {
 
 function normalizeRequest(input) {
   const request = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-  for (const legacy of ['model', 'expectedModel', 'expectedMode', 'modelEvidence']) if (Object.hasOwn(request, legacy)) fail('review_invalid_request', { field: legacy });
+  const unknownField = Object.keys(request).find((field) => !REVIEW_REQUEST_FIELDS.has(field));
+  if (unknownField) fail('review_invalid_request', { field: unknownField });
   const stableKey = requiredText(request.stableKey, 'stableKey', { max: 128 });
   const idempotencyKey = requiredText(request.idempotencyKey, 'idempotencyKey', { max: 128 });
   if (!KEY_RE.test(stableKey) || !KEY_RE.test(idempotencyKey)) fail('review_invalid_request', { field: 'key' });
@@ -208,12 +227,12 @@ function sameImmutableRequest(operation, request) {
   ].every((field) => operation?.[field] === request[field]);
 }
 
-function rejectLegacyKeyReuse(state, request) {
-  if (state.legacy?.idempotencyKeys.includes(request.idempotencyKey)) {
-    fail('review_idempotency_conflict', { legacy: true, sealed: true, keyType: 'idempotency' });
+function rejectRetiredKeyReuse(state, request) {
+  if (state.retiredIdempotencyKeys.includes(request.idempotencyKey)) {
+    fail('review_idempotency_conflict', { keyType: 'idempotency' });
   }
-  if (state.legacy?.bindingKeys.includes(request.stableKey)) {
-    fail('review_binding_mismatch', { legacy: true, sealed: true, keyType: 'binding' });
+  if (state.retiredStableKeys.includes(request.stableKey)) {
+    fail('review_binding_mismatch', { keyType: 'binding' });
   }
 }
 
@@ -233,32 +252,7 @@ function sameTarget(left, right) { return left?.provider === right.provider && l
 function sameBinding(binding, request) { return binding?.stableKey === request.stableKey && sameTarget(binding, request) && binding.conversationUrl === request.conversationUrl && binding.conversationId === request.conversationId; }
 function publicReceipt(operation) { return { ...operation }; }
 
-export async function inspectReviewAdmission({ stateDir, request: rawRequest }) {
-  if (!stateDir) fail('review_transport_misconfigured');
-  const request = normalizeRequest(rawRequest);
-  const fingerprint = reviewRequestFingerprint(request);
-  const state = await readStateLocked(stateDir);
-  rejectLegacyKeyReuse(state, request);
-  const existing = state.operations[request.idempotencyKey] || null;
-  if (
-    existing &&
-    (existing.requestFingerprint !== fingerprint || !sameImmutableRequest(existing, request))
-  ) fail('review_idempotency_conflict');
-  return {
-    idempotencyKey: request.idempotencyKey,
-    requestFingerprint: fingerprint,
-    requiresSendCapacity: !existing?.sendAttempted
-  };
-}
 
-export async function observeReviewOperation({ stateDir, idempotencyKey, operationId = null }) {
-  if (!stateDir) fail('review_transport_misconfigured');
-  const key = requiredText(idempotencyKey, 'idempotencyKey', { max: 512 });
-  const operation = (await readStateLocked(stateDir)).operations[key];
-  if (!operation) fail('review_operation_not_found');
-  if (operationId && operation.operationId !== operationId) fail('review_operation_identity_mismatch');
-  return publicReceipt(operation);
-}
 function validateCompletion(result, request, expectedUserMessageId) {
   if (!result || typeof result !== 'object') fail('review_identity_unreadable');
   if (result.conversationUrl !== request.conversationUrl || result.conversationId !== request.conversationId) {
@@ -307,14 +301,14 @@ function observeArgs(operation, request) {
   };
 }
 
-async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, onTabResolved = null }) {
+export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTabResolved = null }) {
   if (!stateDir || !tabs) fail('review_transport_misconfigured');
   const request = normalizeRequest(rawRequest);
   const fingerprint = reviewRequestFingerprint(request);
   const promptIdentity = reviewPlainTextIdentity(request.prompt);
   const intake = await mutateState(stateDir, async (state) => {
     const now = Date.now();
-    rejectLegacyKeyReuse(state, request);
+    rejectRetiredKeyReuse(state, request);
     const binding = state.bindings[request.stableKey];
     const existing = state.operations[request.idempotencyKey];
     if (
@@ -583,21 +577,6 @@ async function runReviewQueryExecution({ stateDir, tabs, request: rawRequest, on
       operation.updatedAt = Date.now();
     }).catch(() => {});
     throw error;
-  }
-}
-export async function runReviewQuery(args) {
-  const stateDir = args?.stateDir;
-  const idempotencyKey = args?.request?.idempotencyKey;
-  if (!stateDir || typeof idempotencyKey !== 'string' || !idempotencyKey) {
-    return await runReviewQueryExecution(args || {});
-  }
-  const executionKey = `${path.resolve(stateDir)}\0${idempotencyKey}`;
-  if (activeReviewExecutions.has(executionKey)) fail('review_operation_in_progress');
-  activeReviewExecutions.add(executionKey);
-  try {
-    return await runReviewQueryExecution(args);
-  } finally {
-    activeReviewExecutions.delete(executionKey);
   }
 }
 

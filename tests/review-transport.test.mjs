@@ -7,10 +7,9 @@ import path from 'node:path';
 
 import {
   archiveReviewResponse,
-  inspectReviewAdmission,
   runReviewQuery
 } from '../review-transport.mjs';
-import { readReviewTransportState } from '../state.mjs';
+import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
 import { reviewPlainTextIdentity } from '../review-text-identity.mjs';
 
 async function tempDir() {
@@ -127,7 +126,6 @@ test('review transport: a pre-send error stays retryable and the retry sends onc
   assert.equal(failed.sendAttempted, false);
   assert.equal(failed.sendAttemptedAt, null);
   assert.deepEqual(failed.error, { code: 'SYNTHETIC_PRE_SEND_FAILURE' });
-  assert.equal((await inspectReviewAdmission({ stateDir, request: input })).requiresSendCapacity, true);
 
   const receipt = await runReviewQuery({ stateDir, tabs: fakeTabs(controller), request: input });
   assert.equal(activations, 1);
@@ -177,5 +175,33 @@ test('review transport: re-entry after sendAttempted observes only and never act
   assert.equal(activations, 1);
   assert.equal(reviewCalls, 1);
   assert.equal(observationCalls, 1);
-  assert.equal((await inspectReviewAdmission({ stateDir, request: input })).requiresSendCapacity, false);
+});
+
+test('review transport: retired keys reject reuse without historical archive state', async () => {
+  const stateDir = await tempDir();
+  const responsePath = path.join(stateDir, 'response.txt');
+  await writeReviewTransportState({
+    schemaVersion: 4,
+    bindings: {},
+    operations: {},
+    retiredIdempotencyKeys: ['operation-1'],
+    retiredStableKeys: ['retired-binding']
+  }, stateDir);
+
+  await assert.rejects(
+    runReviewQuery({ stateDir, tabs: fakeTabs({}), request: request(responsePath) }),
+    /review_idempotency_conflict/
+  );
+  await assert.rejects(
+    runReviewQuery({
+      stateDir,
+      tabs: fakeTabs({}),
+      request: {
+        ...request(responsePath),
+        stableKey: 'retired-binding',
+        idempotencyKey: 'operation-2'
+      }
+    }),
+    /review_binding_mismatch/
+  );
 });

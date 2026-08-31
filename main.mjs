@@ -15,7 +15,8 @@ import {
   resolveChromeProfileMode,
   resolveChromeProfileName
 } from './browser-backend.mjs';
-import { loadControllerGeneration } from './controller-refresh.mjs';
+import { ChatGPTController } from './chatgpt-controller.mjs';
+import { NativeOperatorControl } from './operator-control.mjs';
 import { startHttpApi } from './http-api.mjs';
 import { TabManager } from './tab-manager.mjs';
 import { defaultStateDir, ensureToken, readSettings, writeSettings, defaultSettings, writeState } from './state.mjs';
@@ -151,7 +152,6 @@ async function main() {
   const chromeProfileName = resolveChromeProfileName({ settings });
   const serverId = crypto.randomUUID();
   const sourceIdentity = readSourceIdentity();
-  let controllerGeneration = await loadControllerGeneration({ moduleRoot: __dirname, generation: 0 });
 
   const notify = (body) => {
     try {
@@ -233,28 +233,21 @@ async function main() {
   });
   await watchFolders.start();
 
-  const makeControllerFactory = (loaded) => async ({ tabId, page }) => {
-      const controller = new loaded.ChatGPTController({
-        page,
-        selectors,
-        stateDir,
-        operatorControlFactory: ({ page: controllerPage }) => new loaded.NativeOperatorControl({ page: controllerPage }),
-        onBlocked: async (st) => {
-          await tabs.needsAttention(tabId, st);
-        },
-        onUnblocked: async () => {
-          await tabs.resolvedAttention(tabId);
-        }
-      });
-      controller.serverId = serverId;
-      controller.controllerGeneration = loaded.generation;
-      controller.controllerSourceDigest = loaded.sourceDigest;
-      return controller;
-    };
-  const validateRefreshedController = async ({ controller }) => {
-    for (const method of ['getUrl', 'detectChallenge', 'runExclusive', 'operatorObserve', 'operatorAct', 'operatorWait']) {
-      if (typeof controller?.[method] !== 'function') throw new Error('controller_refresh_required_surface_missing');
-    }
+  const createController = async ({ tabId, page }) => {
+    const controller = new ChatGPTController({
+      page,
+      selectors,
+      stateDir,
+      operatorControlFactory: ({ page: controllerPage }) => new NativeOperatorControl({ page: controllerPage }),
+      onBlocked: async (st) => {
+        await tabs.needsAttention(tabId, st);
+      },
+      onUnblocked: async () => {
+        await tabs.resolvedAttention(tabId);
+      }
+    });
+    controller.serverId = serverId;
+    return controller;
   };
 
   const tabs = new TabManager({
@@ -262,10 +255,9 @@ async function main() {
     maxTabs: Number(process.env.AGENTIFY_DESKTOP_MAX_TABS || 12),
     onNeedsAttention,
     onChanged: emitTabsChanged,
-    createController: (...args) => makeControllerFactory(controllerGeneration)(...args)
+    createController
   });
 
-  // Default tab for legacy callers (no tabId).
   const defaultVendor =
     vendors.find((v) => v.id === 'chatgpt') ||
     vendors[0] || { id: 'chatgpt', name: 'ChatGPT', url: 'https://chatgpt.com/', status: 'supported' };
@@ -338,7 +330,7 @@ async function main() {
       stateDir,
       browserBackend: browserBackendKind,
       browser: browserState,
-      runtime: server?.getRuntimeState?.() || { inflightQueries: 0, activeQueries: [] }
+      runtime: server?.getRuntimeState?.() || { activeQueries: [], lastOutcomes: [] }
     };
   });
 
@@ -354,10 +346,6 @@ async function main() {
     }
     const next = { ...settings };
     const has = (k) => Object.prototype.hasOwnProperty.call(args || {}, k);
-    if (has('maxInflightQueries')) next.maxInflightQueries = args.maxInflightQueries;
-    if (has('maxQueriesPerMinute')) next.maxQueriesPerMinute = args.maxQueriesPerMinute;
-    if (has('minTabGapMs')) next.minTabGapMs = args.minTabGapMs;
-    if (has('minGlobalGapMs')) next.minGlobalGapMs = args.minGlobalGapMs;
     if (has('browserBackend')) next.browserBackend = args.browserBackend;
     if (has('chromeDebugPort')) next.chromeDebugPort = args.chromeDebugPort;
     if (has('chromeExecutablePath')) next.chromeExecutablePath = args.chromeExecutablePath;
@@ -651,21 +639,6 @@ async function main() {
         onRuntimeChanged: async () => {
           emitTabsChanged();
         },
-        getControllerRuntimeState: () => ({
-          supported: true,
-          generation: controllerGeneration.generation,
-          sourceDigest: controllerGeneration.sourceDigest,
-          sourceModules: controllerGeneration.sourceModules
-        }),
-        onControllerRuntimeRefresh: async ({ expectedGeneration, expectedSourceDigest }) => {
-          if (expectedGeneration !== controllerGeneration.generation || expectedSourceDigest !== controllerGeneration.sourceDigest) {
-            throw new Error('controller_refresh_expected_generation_mismatch');
-          }
-          const next = await loadControllerGeneration({ moduleRoot: __dirname, generation: controllerGeneration.generation + 1 });
-          const rebound = await tabs.refreshControllers({ createController: makeControllerFactory(next), validateController: validateRefreshedController });
-          controllerGeneration = next;
-          return { supported: true, generation: next.generation, sourceDigest: next.sourceDigest, sourceModules: next.sourceModules, ...rebound };
-        },
         getStatus: async ({ tabId }) => {
           const resolvedTabId = tabId || defaultTabId;
           const controller = tabs.getControllerById(resolvedTabId);
@@ -682,11 +655,6 @@ async function main() {
             indicators: challenge?.indicators || null,
             browser: browserBackend.getState?.() || browserState,
             tabs: tabs.listTabs(),
-            controllerRuntime: {
-              generation: controllerGeneration.generation,
-              sourceDigest: controllerGeneration.sourceDigest,
-              sourceModules: controllerGeneration.sourceModules
-            }
           };
         }
       });

@@ -379,65 +379,7 @@ registerTool(
   }
 );
 
-// Native local lifecycle control. It has no tab, provider, prompt, or source
-// path input and therefore cannot become a transport or browser-control path.
-registerTool(
-  'agentify_runtime_controller_refresh_status',
-  {
-    description: 'Read the loaded Agentify controller generation and fixed-source digest. This is local runtime metadata only and never opens or changes a tab.',
-    inputSchema: {}
-  },
-  async () => {
-    const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'GET', path: '/runtime-controller-refresh-status' });
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
-  }
-);
 
-registerTool(
-  'agentify_runtime_controller_refresh',
-  {
-    description: 'Locally refresh the fixed Agentify controller/observer modules without restarting Agentify, Chrome, profile, or tabs. Requires the exact currently loaded generation and source digest; refuses while any query or strict operation is active. It cannot send or create a provider operation.',
-    inputSchema: {
-      expectedGeneration: z.number().int().nonnegative(),
-      expectedSourceDigest: z.string().regex(/^[0-9a-f]{64}$/)
-    }
-  },
-  async ({ expectedGeneration, expectedSourceDigest }) => {
-    const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'POST', path: '/runtime-controller-refresh', body: { expectedGeneration, expectedSourceDigest } });
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
-  }
-);
-
-// This ledger-only operation deliberately has no page or prompt input. It
-// exposes the persisted receipt facts without preparing, sending, or observing
-// a provider turn.
-registerTool(
-  'agentify_review_observe',
-  {
-    description:
-      'Observe one durable strict-review ledger operation without opening a tab, reading a prompt, editing a composer, or sending a provider turn.',
-    inputSchema: {
-      idempotencyKey: z.string().describe('Exact immutable strict operation key.'),
-      operationId: z.string().optional().describe('Optional exact durable operation id for identity cross-check.')
-    }
-  },
-  async ({ idempotencyKey, operationId }) => {
-    const conn = await getConn();
-    const data = await requestJson({
-      ...conn,
-      method: 'POST',
-      path: '/review-observe',
-      body: { idempotencyKey, operationId }
-    });
-    const result = data.result || null;
-    return {
-      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
-      structuredContent: { result }
-    };
-  }
-);
 
 registerTool(
   'agentify_read_page',
