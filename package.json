@@ -22,7 +22,6 @@
     "chrome-cdp-backend.mjs",
     "config.mjs",
     "context-packer.mjs",
-    "controller-refresh.mjs",
     "electron-browser-backend.mjs",
     "http-api.mjs",
     "main.mjs",

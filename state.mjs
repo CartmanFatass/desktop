@@ -35,340 +35,221 @@ export function reviewTransportPath(stateDir = defaultStateDir()) {
   return path.join(stateDir, 'review-transport.json');
 }
 
-const REVIEW_TRANSPORT_SCHEMA_VERSION = 2;
-const LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION = 1;
-const LEGACY_SEND_ACTION_MIGRATION_ID = 'review_transport_v1_to_v2_complete_send_action_count';
-const LEGACY_SEND_ACTION_MIGRATION_BASIS = 'validated_complete_send_and_completion_evidence';
+const REVIEW_TRANSPORT_SCHEMA_VERSION = 4;
+const REVIEW_TRANSPORT_FIELDS = new Set([
+  'schemaVersion',
+  'bindings',
+  'operations',
+  'retiredIdempotencyKeys',
+  'retiredStableKeys'
+]);
+const UPPER_CODE = /^[A-Z][A-Z0-9_]*$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
+function record(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function epochMilliseconds(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function absolutePath(value) {
+  return typeof value === 'string' && value.length > 0 && (
+    path.isAbsolute(value) ||
+    path.posix.isAbsolute(value) ||
+    path.win32.isAbsolute(value)
+  );
+}
+
+function sortedUniqueStrings(value) {
+  return Array.isArray(value) &&
+    value.every(nonEmptyString) &&
+    value.every((entry, index) => index === 0 || value[index - 1] < entry);
+}
 
 export function defaultReviewTransportState() {
-  return { schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION, bindings: {}, operations: {} };
+  return {
+    schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
+    bindings: {},
+    operations: {},
+    retiredIdempotencyKeys: [],
+    retiredStableKeys: []
+  };
 }
 
-function validateMigrationHistory(value, nonEmptyString) {
-  if (value.migrationHistory === undefined) return;
-  if (!Array.isArray(value.migrationHistory) || value.migrationHistory.length !== 1) {
-    throw new Error('review_transport_state_invalid');
-  }
-  const migration = value.migrationHistory[0];
-  if (
-    !migration ||
-    typeof migration !== 'object' ||
-    Array.isArray(migration) ||
-    migration.migrationId !== LEGACY_SEND_ACTION_MIGRATION_ID ||
-    migration.fromSchemaVersion !== LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION ||
-    migration.toSchemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
-    !Array.isArray(migration.inferredFields)
-  ) {
-    throw new Error('review_transport_state_invalid');
-  }
-  const seen = new Set();
-  for (const inference of migration.inferredFields) {
-    const operation = value.operations?.[inference?.idempotencyKey];
-    if (
-      !inference ||
-      typeof inference !== 'object' ||
-      Array.isArray(inference) ||
-      !nonEmptyString(inference.idempotencyKey) ||
-      !nonEmptyString(inference.operationId) ||
-      inference.field !== 'sendActionCount' ||
-      inference.value !== 1 ||
-      inference.basis !== LEGACY_SEND_ACTION_MIGRATION_BASIS ||
-      seen.has(inference.idempotencyKey) ||
-      !operation ||
-      operation.operationId !== inference.operationId ||
-      operation.status !== 'COMPLETE' ||
-      operation.sendActionCount !== 1
-    ) {
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+
+// Owner requirement 2026-09-04 (HMASD .codex/hmasd-transport.toml [provider]):
+// GPT-6 Astra in Pro mode, closed label "6 Pro". The strict picker exposes the
+// checked product as "Latest" or the explicit "GPT-6 Astra" menuitemradio; both
+// are accepted for new requests. "GPT-5.6 Sol" remains readable only so that
+// persisted historical operations still load; new requests cannot select it.
+export const CHATGPT_REVIEW_PRODUCT_MODELS = Object.freeze(['GPT-6 Astra', 'Latest']);
+export const CHATGPT_REVIEW_LEGACY_PRODUCT_MODELS = Object.freeze(['GPT-5.6 Sol']);
+export const CHATGPT_REVIEW_REASONING_EFFORT = 'Pro';
+
+function validateTargetAxes(value) {
+  if (!nonEmptyString(value.productModel)) throw new Error('review_transport_state_invalid');
+  if (value.provider === 'chatgpt') {
+    const knownProductModel = CHATGPT_REVIEW_PRODUCT_MODELS.includes(value.productModel) ||
+      CHATGPT_REVIEW_LEGACY_PRODUCT_MODELS.includes(value.productModel);
+    if (!knownProductModel || value.reasoningEffort !== CHATGPT_REVIEW_REASONING_EFFORT) {
       throw new Error('review_transport_state_invalid');
     }
-    seen.add(inference.idempotencyKey);
+  } else if (value.provider === 'gemini') {
+    if (value.reasoningEffort !== null) throw new Error('review_transport_state_invalid');
+  } else {
+    throw new Error('review_transport_state_invalid');
   }
 }
 
-function validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount = false } = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('review_transport_state_invalid');
-  const expectedSchemaVersion = allowLegacyCompleteMissingSendActionCount
-    ? LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION
-    : REVIEW_TRANSPORT_SCHEMA_VERSION;
-  if (value.schemaVersion !== expectedSchemaVersion) throw new Error('review_transport_state_invalid');
-  if (!value.bindings || typeof value.bindings !== 'object' || Array.isArray(value.bindings)) {
-    throw new Error('review_transport_state_invalid');
-  }
-  if (!value.operations || typeof value.operations !== 'object' || Array.isArray(value.operations)) {
-    throw new Error('review_transport_state_invalid');
-  }
-  const nonEmptyString = (entry) => typeof entry === 'string' && entry.length > 0;
+
+
+
+const V4_OPERATION_FIELDS = new Set([
+  'schemaVersion',
+  'operationId',
+  'idempotencyKey',
+  'requestFingerprint',
+  'stableKey',
+  'provider',
+  'productModel',
+  'reasoningEffort',
+  'conversationUrl',
+  'conversationId',
+  'promptSha256',
+  'responsePath',
+  'sendAttempted',
+  'sendAttemptedAt',
+  'baselineMessageIds',
+  'providerUserMessageId',
+  'providerAssistantMessageId',
+  'observedConversationUrl',
+  'observedConversationId',
+  'archive',
+  'error',
+  'createdAt',
+  'updatedAt'
+]);
+
+function validateArchive(archive, responsePath) {
+  if (archive === null) return;
+  if (
+    !record(archive) ||
+    !absolutePath(archive.path) ||
+    archive.path !== responsePath ||
+    !SHA256.test(String(archive.sha256 || '')) ||
+    !Number.isInteger(archive.sizeBytes) ||
+    archive.sizeBytes <= 0 ||
+    archive.projection !== 'exact' ||
+    !epochMilliseconds(archive.verifiedAt)
+  ) throw new Error('review_transport_state_invalid');
+}
+
+function validateReceiptError(error) {
+  if (error === null) return;
+  if (
+    !record(error) ||
+    Object.keys(error).length !== 1 ||
+    !UPPER_CODE.test(String(error.code || '')) ||
+    error.code === 'NONE'
+  ) throw new Error('review_transport_state_invalid');
+}
+
+
+function validateReviewTransportState(value) {
+  if (
+    !record(value) ||
+    value.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
+    Object.keys(value).some((field) => !REVIEW_TRANSPORT_FIELDS.has(field)) ||
+    !record(value.bindings) ||
+    !record(value.operations) ||
+    !sortedUniqueStrings(value.retiredIdempotencyKeys) ||
+    !sortedUniqueStrings(value.retiredStableKeys) ||
+    value.retiredIdempotencyKeys.some((key) => Object.hasOwn(value.operations, key)) ||
+    value.retiredStableKeys.some((key) => Object.hasOwn(value.bindings, key))
+  ) throw new Error('review_transport_state_invalid');
+
   for (const [key, binding] of Object.entries(value.bindings)) {
     if (
       !nonEmptyString(key) ||
-      !binding ||
-      typeof binding !== 'object' ||
-      Array.isArray(binding) ||
+      !record(binding) ||
       binding.stableKey !== key ||
-      !nonEmptyString(binding.provider) ||
-      !nonEmptyString(binding.model) ||
       !nonEmptyString(binding.conversationUrl) ||
       !nonEmptyString(binding.conversationId) ||
-      !Number.isFinite(binding.createdAt) ||
-      !Number.isFinite(binding.updatedAt)
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
+      !epochMilliseconds(binding.createdAt) ||
+      !epochMilliseconds(binding.updatedAt)
+    ) throw new Error('review_transport_state_invalid');
+    validateTargetAxes(binding);
     if (binding.geminiBootstrap !== undefined) {
       const bootstrap = binding.geminiBootstrap;
       if (
-        binding.provider !== 'gemini' || !bootstrap || typeof bootstrap !== 'object' || Array.isArray(bootstrap) ||
-        bootstrap.nonScientific !== true || !nonEmptyString(bootstrap.bootstrapOperationId) ||
-        !nonEmptyString(bootstrap.bootstrapModel) || typeof bootstrap.continuationConsumed !== 'boolean' ||
-        (bootstrap.continuationConsumed && (!nonEmptyString(bootstrap.continuationOperationId) || !nonEmptyString(bootstrap.continuationModel))) ||
-        (!bootstrap.continuationConsumed && (bootstrap.continuationOperationId !== undefined || bootstrap.continuationModel !== undefined))
+        binding.provider !== 'gemini' ||
+        !record(bootstrap) ||
+        bootstrap.nonScientific !== true ||
+        !nonEmptyString(bootstrap.bootstrapOperationId) ||
+        !nonEmptyString(bootstrap.bootstrapProductModel) ||
+        typeof bootstrap.continuationConsumed !== 'boolean'
       ) throw new Error('review_transport_state_invalid');
     }
   }
-  const statuses = new Set(['SEND_INTENT', 'PREPARED', 'SUBMITTED', 'OBSERVING', 'BLOCKED', 'COMPLETE']);
+
   for (const [key, operation] of Object.entries(value.operations)) {
     if (
       !nonEmptyString(key) ||
-      !operation ||
-      typeof operation !== 'object' ||
-      Array.isArray(operation) ||
+      !record(operation) ||
+      Object.keys(operation).some((field) => !V4_OPERATION_FIELDS.has(field)) ||
+      operation.schemaVersion !== REVIEW_TRANSPORT_SCHEMA_VERSION ||
       operation.idempotencyKey !== key ||
       !nonEmptyString(operation.operationId) ||
-      !nonEmptyString(operation.requestFingerprint) ||
+      !SHA256.test(String(operation.requestFingerprint || '')) ||
       !nonEmptyString(operation.stableKey) ||
-      !nonEmptyString(operation.provider) ||
-      !nonEmptyString(operation.model) ||
       !nonEmptyString(operation.conversationUrl) ||
       !nonEmptyString(operation.conversationId) ||
-      !/^[0-9a-f]{64}$/.test(String(operation.promptSha256 || '')) ||
-      !statuses.has(operation.status) ||
-      !Number.isInteger(operation.sendCount) ||
-      operation.sendCount < 0 ||
-      operation.sendCount > 1 ||
-      !Number.isFinite(operation.createdAt) ||
-      !Number.isFinite(operation.updatedAt)
-    ) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.baselineMessageIds !== undefined) {
-      if (
-        !Array.isArray(operation.baselineMessageIds) ||
-        operation.baselineMessageIds.some((id) => !nonEmptyString(id)) ||
-        new Set(operation.baselineMessageIds).size !== operation.baselineMessageIds.length
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    const geminiBootstrap = operation.geminiBootstrap === true;
-    const geminiBootstrapContinuation = operation.geminiBootstrapContinuation === true;
-    const bootstrapNonScientific = operation.bootstrapNonScientific === true;
-    if (
-      (operation.geminiBootstrap !== undefined && typeof operation.geminiBootstrap !== 'boolean') ||
-      (operation.geminiBootstrapContinuation !== undefined && typeof operation.geminiBootstrapContinuation !== 'boolean') ||
-      (operation.bootstrapNonScientific !== undefined && typeof operation.bootstrapNonScientific !== 'boolean') ||
-      (geminiBootstrap && (operation.provider !== 'gemini' || operation.firstBinding !== true || !bootstrapNonScientific)) ||
-      (geminiBootstrapContinuation && operation.provider !== 'gemini') ||
-      (geminiBootstrap && geminiBootstrapContinuation)
+      !absolutePath(operation.responsePath) ||
+      !SHA256.test(String(operation.promptSha256 || '')) ||
+      typeof operation.sendAttempted !== 'boolean' ||
+      (operation.sendAttemptedAt !== null && !epochMilliseconds(operation.sendAttemptedAt)) ||
+      (operation.providerUserMessageId !== null && !nonEmptyString(operation.providerUserMessageId)) ||
+      (operation.providerAssistantMessageId !== null && !nonEmptyString(operation.providerAssistantMessageId)) ||
+      (operation.observedConversationUrl !== null && !nonEmptyString(operation.observedConversationUrl)) ||
+      (operation.observedConversationId !== null && !nonEmptyString(operation.observedConversationId)) ||
+      !epochMilliseconds(operation.createdAt) ||
+      !epochMilliseconds(operation.updatedAt)
     ) throw new Error('review_transport_state_invalid');
-    if (operation.userMessageId !== undefined && !nonEmptyString(operation.userMessageId)) {
+    validateTargetAxes(operation);
+    // Missing/null baseline is a readable legacy or not-yet-prepared receipt,
+    // never authority to infer an unobserved submission from historical text.
+    if (operation.baselineMessageIds != null && (
+      !Array.isArray(operation.baselineMessageIds) ||
+      operation.baselineMessageIds.some((id) => !nonEmptyString(id)) ||
+      new Set(operation.baselineMessageIds).size !== operation.baselineMessageIds.length
+    )) throw new Error('review_transport_state_invalid');
+    validateArchive(operation.archive, operation.responsePath);
+    validateReceiptError(operation.error);
+    if (operation.sendAttempted !== (operation.sendAttemptedAt !== null)) {
       throw new Error('review_transport_state_invalid');
     }
-    if (operation.responsePath !== undefined && (!path.isAbsolute(operation.responsePath) || !nonEmptyString(operation.responsePath))) {
+    if (operation.providerUserMessageId !== null && !operation.sendAttempted) {
       throw new Error('review_transport_state_invalid');
     }
-    if (operation.sendBoundaryEnteredAt !== undefined && !Number.isFinite(operation.sendBoundaryEnteredAt)) {
+    if (operation.providerAssistantMessageId !== null && operation.providerUserMessageId === null) {
       throw new Error('review_transport_state_invalid');
     }
-    const hasObservedUserTurn = operation.observedUserMessageId !== undefined;
-    if (hasObservedUserTurn) {
-      const observedCommitmentClasses = new Set([
-        'turn_exact',
-        'turn_unreadable',
-        'turn_content_mismatch',
-        'turn_causal_exact_rendered_unreadable',
-        'turn_causal_exact_rendered_mismatch'
-      ]);
-      if (
-        !nonEmptyString(operation.observedUserMessageId) ||
-        !Number.isFinite(operation.observedUserMessageAt) ||
-        !nonEmptyString(operation.observedConversationUrl) ||
-        !nonEmptyString(operation.observedConversationId) ||
-        !observedCommitmentClasses.has(operation.observedCommitmentClass) ||
-        !operation.observedTurnEvidence ||
-        typeof operation.observedTurnEvidence !== 'object' ||
-        Array.isArray(operation.observedTurnEvidence) ||
-        operation.observedTurnEvidence.commitmentClass !== operation.observedCommitmentClass ||
-        operation.observedTurnEvidence.newUserMessageCount !== 1 ||
-        operation.sendActionCount !== 1 ||
-        operation.newUserMessageCount !== 1 ||
-        (operation.observedCommitmentClass.startsWith('turn_causal_exact_') && !operation.causalSendReceipt) ||
-        (operation.userMessageId !== undefined && operation.userMessageId !== operation.observedUserMessageId)
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    } else if (
-      operation.observedUserMessageAt !== undefined ||
-      operation.observedConversationUrl !== undefined ||
-      operation.observedConversationId !== undefined ||
-      operation.observedCommitmentClass !== undefined ||
-      operation.observedTurnEvidence !== undefined
-    ) {
+    if (operation.archive !== null && operation.providerAssistantMessageId === null) {
       throw new Error('review_transport_state_invalid');
     }
-    if (operation.causalSendReceipt !== undefined) {
-      const receipt = operation.causalSendReceipt;
-      if (
-        !receipt || typeof receipt !== 'object' || Array.isArray(receipt) ||
-        receipt.ok !== true || receipt.persisted !== true ||
-        receipt.identityModel !== 'agentify_review_causal_submission_v1' ||
-        receipt.operationId !== operation.operationId ||
-        receipt.sendActionCount !== 1 || receipt.clickCount !== 1 ||
-        receipt.sourceSha256 !== operation.promptSha256 ||
-        !/^[0-9a-f]{64}$/.test(String(receipt.canonicalPromptSha256 || '')) ||
-        !/^[0-9a-f]{64}$/.test(String(receipt.baselineMessageIdsSha256 || '')) ||
-        operation.sendActionCount !== 1
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.submissionIdentity !== undefined) {
-      const identity = operation.submissionIdentity;
-      if (
-        !identity || typeof identity !== 'object' || Array.isArray(identity) ||
-        identity.identityModel !== 'agentify_review_causal_submission_v1' ||
-        identity.sourceSha256 !== operation.promptSha256 ||
-        !/^[0-9a-f]{64}$/.test(String(identity.canonicalPromptSha256 || '')) ||
-        !/^[0-9a-f]{64}$/.test(String(identity.baselineMessageIdsSha256 || '')) ||
-        identity.sendActionCount !== 1 || identity.clickCount !== 1 ||
-        identity.userMessageId !== operation.userMessageId ||
-        identity.conversationUrl !== operation.conversationUrl ||
-        identity.conversationId !== operation.conversationId ||
-        operation.sendCount !== 1 || operation.sendActionCount !== 1 ||
-        !operation.causalSendReceipt
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.renderedDisplay !== undefined) {
-      const display = operation.renderedDisplay;
-      if (
-        !display || typeof display !== 'object' || Array.isArray(display) ||
-        !new Set(['exact', 'lossy_mismatch', 'unreadable']).has(display.fidelity) ||
-        !operation.submissionIdentity
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
-    }
-    if (operation.assistantMessageId !== undefined && !nonEmptyString(operation.assistantMessageId)) {
+    const observedUrl = operation.observedConversationUrl !== null;
+    const observedId = operation.observedConversationId !== null;
+    if (observedUrl !== observedId || (observedUrl && operation.providerUserMessageId === null)) {
       throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'PREPARED' && (!operation.baselineMessageIds || operation.sendCount !== 0 || operation.userMessageId)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'SUBMITTED' && (operation.sendCount !== 1 || !operation.userMessageId)) {
-      throw new Error('review_transport_state_invalid');
-    }
-    if (operation.status === 'COMPLETE') {
-      const responseText = operation.responseText;
-      const legacyResponseSha256 = typeof responseText === 'string'
-        ? crypto.createHash('sha256').update(responseText, 'utf8').digest('hex')
-        : null;
-      const archivedResponse = path.isAbsolute(String(operation.responsePath || '')) &&
-        Number.isInteger(operation.responseBytes) && operation.responseBytes > 0 &&
-        /^[0-9a-f]{64}$/.test(String(operation.responseSha256 || ''));
-      const responseArchiveProjection = operation.responseArchiveProjection || 'exact';
-      const snapshotHashes = Array.isArray(operation.snapshots)
-        ? operation.snapshots.map((snapshot) => snapshot?.textSha256)
-        : [];
-      const responseProjectionValid = responseArchiveProjection === 'exact'
-        ? snapshotHashes.every((hash) => hash === operation.responseSha256) &&
-          (operation.renderedResponseBytes === undefined || operation.renderedResponseBytes === operation.responseBytes)
-        : responseArchiveProjection === 'terminal_lf_v1' &&
-          Number.isInteger(operation.renderedResponseBytes) &&
-          operation.responseBytes === operation.renderedResponseBytes + 1 &&
-          snapshotHashes.length === 2 &&
-          /^[0-9a-f]{64}$/.test(String(snapshotHashes[0] || '')) &&
-          snapshotHashes[0] === snapshotHashes[1] &&
-          snapshotHashes[0] !== operation.responseSha256;
-      const legacyInlineResponse = nonEmptyString(responseText) && operation.responseSha256 === legacyResponseSha256;
-      const snapshots = operation.snapshots;
-      const controls = operation.controls;
-      const validSendActionCount = operation.sendActionCount === 1 || (
-        allowLegacyCompleteMissingSendActionCount && operation.sendActionCount === undefined
-      );
-      if (
-        operation.sendCount !== 1 ||
-        !validSendActionCount ||
-        !operation.userMessageId ||
-        !operation.assistantMessageId ||
-        operation.terminalState !== 'NATURAL_COMPLETION_VERIFIED' ||
-        (!archivedResponse && !legacyInlineResponse) ||
-        !Array.isArray(snapshots) ||
-        snapshots.length !== 2 ||
-        snapshots.some((snapshot) =>
-          !snapshot ||
-          snapshot.assistantMessageId !== operation.assistantMessageId ||
-          !responseProjectionValid ||
-          !Number.isFinite(snapshot.observedAt)
-        ) ||
-        snapshots[1].observedAt - snapshots[0].observedAt < 3_000 ||
-        !controls ||
-        typeof controls !== 'object' ||
-        controls.stop !== false ||
-        controls.continue !== false ||
-        controls.retry !== false ||
-        typeof controls.answerNow !== 'boolean' ||
-        !Array.isArray(operation.clickedControls) ||
-        operation.clickedControls.length !== 0 ||
-        !nonEmptyString(operation.modelEvidence) ||
-        (archivedResponse && operation.renderedDisplay?.fidelity !== 'exact') ||
-        !Number.isFinite(operation.completedAt)
-      ) {
-        throw new Error('review_transport_state_invalid');
-      }
     }
   }
-  if (!allowLegacyCompleteMissingSendActionCount) validateMigrationHistory(value, nonEmptyString);
   return value;
-}
-
-function migrateLegacyReviewTransportState(value) {
-  validateReviewTransportState(value, { allowLegacyCompleteMissingSendActionCount: true });
-  const inferredFields = [];
-  const operations = {};
-  for (const [idempotencyKey, operation] of Object.entries(value.operations)) {
-    const migratedOperation = { ...operation };
-    if (operation.status === 'COMPLETE' && operation.sendActionCount === undefined) {
-      migratedOperation.sendActionCount = 1;
-      inferredFields.push({
-        idempotencyKey,
-        operationId: operation.operationId,
-        field: 'sendActionCount',
-        value: 1,
-        basis: LEGACY_SEND_ACTION_MIGRATION_BASIS
-      });
-    }
-    operations[idempotencyKey] = migratedOperation;
-  }
-  inferredFields.sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey));
-  return validateReviewTransportState({
-    ...value,
-    schemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
-    operations,
-    migrationHistory: [{
-      migrationId: LEGACY_SEND_ACTION_MIGRATION_ID,
-      fromSchemaVersion: LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION,
-      toSchemaVersion: REVIEW_TRANSPORT_SCHEMA_VERSION,
-      inferredFields
-    }]
-  });
-}
-
-function normalizeReviewTransportState(value, { migrateLegacy = false } = {}) {
-  if (migrateLegacy && value?.schemaVersion === LEGACY_REVIEW_TRANSPORT_SCHEMA_VERSION) {
-    return migrateLegacyReviewTransportState(value);
-  }
-  return validateReviewTransportState(value);
 }
 
 export function defaultSettings() {
@@ -379,12 +260,6 @@ export function defaultSettings() {
     chromeProfileMode: 'isolated',
     chromeProfileName: 'Default',
     chromeAttachExisting: false,
-
-    // Governor defaults (intentionally conservative).
-    maxInflightQueries: 6,
-    maxQueriesPerMinute: 12,
-    minTabGapMs: 1200,
-    minGlobalGapMs: 200,
 
     // UX defaults.
     showTabsByDefault: false,
@@ -406,7 +281,6 @@ export function normalizeSettings(input) {
     return Math.max(min, Math.min(max, i));
   };
 
-  const clampMs = (v, { min, max, fallback }) => clampInt(v, { min, max, fallback });
 
   const out = {
     browserBackend: ['electron', 'chrome-cdp'].includes(String(s.browserBackend || '').trim().toLowerCase())
@@ -421,10 +295,6 @@ export function normalizeSettings(input) {
     chromeProfileName:
       typeof s.chromeProfileName === 'string' && s.chromeProfileName.trim() ? s.chromeProfileName.trim() : d.chromeProfileName,
     chromeAttachExisting: typeof s.chromeAttachExisting === 'boolean' ? s.chromeAttachExisting : d.chromeAttachExisting,
-    maxInflightQueries: clampInt(s.maxInflightQueries, { min: 1, max: 12, fallback: d.maxInflightQueries }),
-    maxQueriesPerMinute: clampInt(s.maxQueriesPerMinute, { min: 1, max: 600, fallback: d.maxQueriesPerMinute }),
-    minTabGapMs: clampMs(s.minTabGapMs, { min: 0, max: 60_000, fallback: d.minTabGapMs }),
-    minGlobalGapMs: clampMs(s.minGlobalGapMs, { min: 0, max: 10_000, fallback: d.minGlobalGapMs }),
     showTabsByDefault: !!s.showTabsByDefault,
     allowAuthPopups: typeof s.allowAuthPopups === 'boolean' ? s.allowAuthPopups : d.allowAuthPopups,
     acknowledgedAt: typeof s.acknowledgedAt === 'string' && s.acknowledgedAt.trim() ? s.acknowledgedAt.trim() : null
@@ -472,35 +342,32 @@ export async function writeState(state, stateDir = defaultStateDir()) {
   await atomicWriteFile(statePath(stateDir), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-export async function readReviewTransportStateReadOnly(stateDir = defaultStateDir()) {
+async function readReviewTransportBytes(stateDir) {
   try {
-    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
-    const parsed = JSON.parse(raw);
-    return normalizeReviewTransportState(parsed, { migrateLegacy: true });
+    return await fs.readFile(reviewTransportPath(stateDir));
   } catch (error) {
-    if (error?.code === 'ENOENT') return defaultReviewTransportState();
-    if (String(error?.message || '') === 'review_transport_state_invalid') throw error;
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function parseReviewTransportBytes(rawBytes) {
+  try {
+    return JSON.parse(rawBytes.toString('utf8'));
+  } catch (error) {
     throw new Error('review_transport_state_invalid', { cause: error });
   }
 }
 
 export async function readReviewTransportState(stateDir = defaultStateDir()) {
-  const normalized = await readReviewTransportStateReadOnly(stateDir);
-  try {
-    const raw = await fs.readFile(reviewTransportPath(stateDir), 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed.schemaVersion !== normalized.schemaVersion) {
-      await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
-    }
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-  return normalized;
+  const rawBytes = await readReviewTransportBytes(stateDir);
+  if (!rawBytes) return defaultReviewTransportState();
+  return validateReviewTransportState(parseReviewTransportBytes(rawBytes));
 }
 
 export async function writeReviewTransportState(state, stateDir = defaultStateDir()) {
+  const normalized = validateReviewTransportState(state);
   await ensureStateDir(stateDir);
-  const normalized = normalizeReviewTransportState(state);
   await atomicWriteFile(reviewTransportPath(stateDir), `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   return normalized;
 }

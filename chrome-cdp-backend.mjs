@@ -430,15 +430,28 @@ export class ChromeCdpPageAdapter {
   }
 
   async moveMouse(x, y) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none' }, this.sessionId);
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseMoved', x, y, button: 'none', buttons: 0, pointerType: 'mouse' },
+      this.sessionId
+    );
   }
 
   async mouseDown(x, y, { button = 'left', clickCount = 1 } = {}) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount }, this.sessionId);
+    const buttons = { left: 1, right: 2, middle: 4, back: 8, forward: 16 }[button] || 0;
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mousePressed', x, y, button, buttons, clickCount, pointerType: 'mouse' },
+      this.sessionId
+    );
   }
 
   async mouseUp(x, y, { button = 'left', clickCount = 1 } = {}) {
-    await this.client.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount }, this.sessionId);
+    await this.client.send(
+      'Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x, y, button, buttons: 0, clickCount, pointerType: 'mouse' },
+      this.sessionId
+    );
   }
 
   async setFileInputFiles(files) {

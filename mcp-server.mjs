@@ -135,20 +135,21 @@ registerTool(
   'agentify_review_query',
   {
     description:
-      'Strict receipt-bearing ChatGPT or Gemini review transport. Binds one stable key to one exact provider conversation, records immutable model evidence per operation, submits at most once per idempotency key, and verifies natural completion from exact message identities.',
+      'Strict v4 ChatGPT or Gemini review transport. Persists one minimal immutable receipt, activates one hit-tested native Send at most once, observes provider message identities, and archives exact assistant UTF-8 bytes at responsePath.',
     inputSchema: {
       stableKey: z.string().describe('Persistent stable binding key.'),
       provider: z.enum(['chatgpt', 'gemini']).describe('Exact provider identity.'),
-      model: z.string().describe('Exact visible provider-model label expected in the conversation UI (for example, "GPT-5.6 Pro"); this does not imply a separate reasoning-mode requirement.'),
-      conversationUrl: z.string().describe('Exact registered conversation URL, or the provider root for first binding.'),
+      productModel: z.string().describe('Exact provider product-model label as shown in the open picker. Current ChatGPT target (6 Pro): GPT-6 Astra or its checked label Latest.'),
+      reasoningEffort: z.string().nullable().describe('Exact ChatGPT reasoning-effort label (current target: Pro), or explicit null for Gemini.'),
+      conversationUrl: z.string().describe('Exact registered conversation URL, or provider root for first binding.'),
       conversationId: z.string().describe('Exact conversation identity contained in conversationUrl, or __new__ for first binding.'),
       idempotencyKey: z.string().describe('Immutable operation idempotency key.'),
       prompt: z.string().optional().describe('Exact prompt bytes to submit once. Use either prompt or promptPath.'),
       promptPath: z.string().optional().describe('Local UTF-8 text file whose exact content is submitted once. Use either promptPath or prompt.'),
       promptSha256: z.string().optional().describe('Optional tool-local integrity check. When omitted Agentify computes it internally.'),
-      responsePath: z.string().describe('Absolute local path for the full naturally completed response. COMPLETE is unavailable until this exact file is atomically committed and verified.'),
-      timeoutMs: z.number().optional().describe('Natural-completion wait window, up to 45 minutes. Agentify returns a nonterminal state when generation continues.'),
-      verifyExisting: z.boolean().optional().describe('Observe and re-verify an existing operation without sending again.'),
+      responsePath: z.string().describe('Absolute path for exact immutable assistant UTF-8 response bytes. A non-null archive receipt is published only after this file is atomically committed and verified.'),
+      timeoutMs: z.number().optional().describe('Natural-completion observation window, up to 45 minutes. A sent receipt remains observable when generation continues.'),
+      verifyExisting: z.boolean().optional().describe('Require an existing exact operation. sendAttempted=false retries directly; sendAttempted=true observes only and never sends again.'),
       firstBinding: z.boolean().optional().describe('Bind a clean provider-root conversation to its concrete identity created by the one send.'),
       geminiBootstrap: z.boolean().optional().describe('Gemini-only, non-scientific first-binding bootstrap. Requires firstBinding and bootstrapNonScientific.'),
       geminiBootstrapContinuation: z.boolean().optional().describe('Gemini-only one-time authorized continuation after a committed non-scientific bootstrap; allows one recorded model transition.'),
@@ -159,7 +160,8 @@ registerTool(
   async ({
     stableKey,
     provider,
-    model,
+    productModel,
+    reasoningEffort,
     conversationUrl,
     conversationId,
     idempotencyKey,
@@ -184,7 +186,8 @@ registerTool(
       body: {
         stableKey,
         provider,
-        model,
+        productModel,
+        reasoningEffort,
         conversationUrl,
         conversationId,
         idempotencyKey,
@@ -216,21 +219,23 @@ registerTool(
   'agentify_review_preflight',
   {
     description:
-      'Non-sending strict Gemini model preflight on an already inspected Agentify tab. Verifies the visible selected model and thinking controls without creating a review operation, editing a composer, or sending a provider turn.',
+      'Non-sending strict product-model and reasoning-effort preflight on an already inspected Agentify tab.',
     inputSchema: {
-      expectedModel: z.string().describe('Exact Gemini model/mode required by the later strict review.'),
-      tabId: z.string().describe('Exact existing Gemini tab to inspect; this tool never creates a tab.'),
+      productModel: z.string().describe('Exact provider product model.'),
+      reasoningEffort: z.string().nullable().describe('Exact ChatGPT effort, or explicit null for Gemini.'),
+      tabId: z.string().describe('Exact existing provider tab to inspect; this tool never creates a tab.'),
       timeoutMs: z.number().optional().describe('Bounded preflight timeout, maximum one minute.')
     }
   },
-  async ({ expectedModel, tabId, timeoutMs }) => {
+  async ({ productModel, reasoningEffort, tabId, timeoutMs }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
       path: '/review-preflight',
       body: {
-        expectedModel,
+        productModel,
+        reasoningEffort,
         tabId,
         timeoutMs: timeoutMs ?? 20_000
       }
@@ -244,26 +249,26 @@ registerTool(
 );
 
 // No prompt, stable key, or idempotency key is accepted here. This native
-// primitive can only normalize ChatGPT's visible High/Pro reasoning mode and
+// primitive can only normalize ChatGPT's visible reasoning effort and
 // returns before any composer, ledger, or Send surface.
 registerTool(
-  'agentify_review_reasoning_mode_preflight',
+  'agentify_review_reasoning_effort_preflight',
   {
     description:
-      'Non-sending ChatGPT reasoning-mode preflight on an already inspected tab. A fresh tab may read High; it selects exact Pro only from one unambiguous visible controlled-menu option and returns a zero-send receipt.',
+      'Non-sending ChatGPT reasoning-effort preflight. Uses only the current five-position semantic slider and bounded arrow-key steps; never sends.',
     inputSchema: {
-      expectedMode: z.string().describe('Exact ChatGPT reasoning mode required before a later strict review.'),
+      reasoningEffort: z.string().describe('Exact rendered ChatGPT reasoning-effort label.'),
       tabId: z.string().describe('Exact existing ChatGPT tab to inspect; this tool never creates a tab.'),
       timeoutMs: z.number().optional().describe('Bounded preflight timeout, maximum one minute.')
     }
   },
-  async ({ expectedMode, tabId, timeoutMs }) => {
+  async ({ reasoningEffort, tabId, timeoutMs }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
-      path: '/review-reasoning-mode-preflight',
-      body: { expectedMode, tabId, timeoutMs: timeoutMs ?? 20_000 }
+      path: '/review-reasoning-effort-preflight',
+      body: { reasoningEffort, tabId, timeoutMs: timeoutMs ?? 20_000 }
     });
     const result = data.result || null;
     return {
@@ -273,27 +278,25 @@ registerTool(
   }
 );
 
-// Read-only visible-control observer for the same no-send reasoning-mode
+// Read-only visible-control observer for the same no-send reasoning-effort
 // surface. It has no composer, prompt, ledger, or Send input.
 registerTool(
-  'agentify_review_reasoning_mode_diagnostics',
+  'agentify_review_reasoning_effort_diagnostics',
   {
     description:
-      'Visible ChatGPT reasoning-control diagnostic. scope=page reports only visible interactive role/name/ARIA/controlled-menu relationships; optional openModeSelector opens exactly one visible High/Pro or Model Selector control to inspect its rendered menu, never edits a composer or sends.',
+      'Read-only current ChatGPT reasoning-effort slider diagnostic. It never edits a composer, clicks a product control, or sends.',
     inputSchema: {
       tabId: z.string().describe('Exact existing ChatGPT tab to inspect; this tool never creates a tab.'),
-      scope: z.enum(['composer', 'page']).optional().describe('Visible control scope; page includes header/topbar and composer.'),
-      openModeSelector: z.boolean().optional().describe('When true with scope=page, opens only one unambiguous visible High/Pro or Model Selector control and reports visible menu controls; it never types or sends.'),
       timeoutMs: z.number().optional().describe('Bounded diagnostic timeout, maximum one minute.')
     }
   },
-  async ({ tabId, scope, openModeSelector, timeoutMs }) => {
+  async ({ tabId, timeoutMs }) => {
     const conn = await getConn();
     const data = await requestJson({
       ...conn,
       method: 'POST',
-      path: '/review-reasoning-mode-diagnostics',
-      body: { tabId, scope: scope ?? 'composer', openModeSelector: openModeSelector === true, timeoutMs: timeoutMs ?? 20_000 }
+      path: '/review-reasoning-effort-diagnostics',
+      body: { tabId, timeoutMs: timeoutMs ?? 20_000 }
     });
     const result = data.result || null;
     return {
@@ -376,65 +379,7 @@ registerTool(
   }
 );
 
-// Native local lifecycle control. It has no tab, provider, prompt, or source
-// path input and therefore cannot become a transport or browser-control path.
-registerTool(
-  'agentify_runtime_controller_refresh_status',
-  {
-    description: 'Read the loaded Agentify controller generation and fixed-source digest. This is local runtime metadata only and never opens or changes a tab.',
-    inputSchema: {}
-  },
-  async () => {
-    const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'GET', path: '/runtime-controller-refresh-status' });
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
-  }
-);
 
-registerTool(
-  'agentify_runtime_controller_refresh',
-  {
-    description: 'Locally refresh the fixed Agentify controller/observer modules without restarting Agentify, Chrome, profile, or tabs. Requires the exact currently loaded generation and source digest; refuses while any query or strict operation is active. It cannot send or create a provider operation.',
-    inputSchema: {
-      expectedGeneration: z.number().int().nonnegative(),
-      expectedSourceDigest: z.string().regex(/^[0-9a-f]{64}$/)
-    }
-  },
-  async ({ expectedGeneration, expectedSourceDigest }) => {
-    const conn = await getConn();
-    const data = await requestJson({ ...conn, method: 'POST', path: '/runtime-controller-refresh', body: { expectedGeneration, expectedSourceDigest } });
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], structuredContent: data };
-  }
-);
-
-// This ledger-only operation deliberately has no page or prompt input. It
-// exposes durable strict-operation facts without providing a route to prepare,
-// send, or recover a provider turn.
-registerTool(
-  'agentify_review_observe',
-  {
-    description:
-      'Observe one durable strict-review ledger operation without opening a tab, reading a prompt, editing a composer, or sending a provider turn.',
-    inputSchema: {
-      idempotencyKey: z.string().describe('Exact immutable strict operation key.'),
-      operationId: z.string().optional().describe('Optional exact durable operation id for identity cross-check.')
-    }
-  },
-  async ({ idempotencyKey, operationId }) => {
-    const conn = await getConn();
-    const data = await requestJson({
-      ...conn,
-      method: 'POST',
-      path: '/review-observe',
-      body: { idempotencyKey, operationId }
-    });
-    const result = data.result || null;
-    return {
-      content: [{ type: 'text', text: JSON.stringify(result || {}, null, 2) }],
-      structuredContent: { result }
-    };
-  }
-);
 
 registerTool(
   'agentify_read_page',
@@ -1031,11 +976,17 @@ registerTool(
 
 registerTool(
   'agentify_tab_close',
-  { description: 'Close a tab/session by tabId.', inputSchema: { tabId: z.string().describe('Tab id to close.') } },
+  {
+    description: 'Close an exact non-protected tab/session. A stale or missing browser target is idempotently released from the logical registry.',
+    inputSchema: { tabId: z.string().describe('Tab id to close.') }
+  },
   async ({ tabId }) => {
     const conn = await getConn();
     const data = await requestJson({ ...conn, method: 'POST', path: '/tabs/close', body: { tabId } });
-    return { content: [{ type: 'text', text: 'ok' }], structuredContent: data };
+    return {
+      content: [{ type: 'text', text: data.receipt?.status || 'CLOSED' }],
+      structuredContent: data
+    };
   }
 );
 

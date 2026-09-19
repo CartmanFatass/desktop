@@ -2,1849 +2,216 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
-
-import {
-  archiveReviewResponse,
-  prepareReviewPromptInput,
-  resolveReviewPromptInput,
-  inspectReviewAdmission,
-  observeReviewOperation,
-  runReviewQuery,
-  sanitizeReviewErrorData
-} from '../review-transport.mjs';
+import { archiveReviewResponse, prepareReviewPromptInput, resolveReviewPromptInput, runReviewQuery } from '../review-transport.mjs';
 import { readReviewTransportState, writeReviewTransportState } from '../state.mjs';
-import {
-  REVIEW_CAUSAL_SUBMISSION_MODEL,
-  REVIEW_PLAIN_TEXT_MODEL,
-  reviewPlainTextIdentity
-} from '../review-text-identity.mjs';
+import { ChatGPTController } from '../chatgpt-controller.mjs';
+import { REVIEW_PLAIN_TEXT_MODEL, reviewPlainTextIdentity } from '../review-text-identity.mjs';
 import { REVIEW_COMPOSER_REPLACEMENT_MODEL } from '../review-composer-replacement.mjs';
 
-const sha256 = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
-
-async function fixture() {
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-transport-'));
-  const calls = { review: 0, reviewPrompts: [], modelPreflights: [], observe: 0, observeArgs: [], forbidden: 0, recover: 0, inspect: 0, inspectSubmission: 0, adopt: [], ensure: [], update: [] };
-  let failBeforeSubmittedReceipt = false;
-  let failAfterSendBoundary = false;
-  let postBoundaryFailure = null;
-  let postClickFailure = null;
-  let failAfterSubmittedReceipt = false;
-  let firstBindingSubmittedUrl = 'https://chatgpt.com/c/first-bound';
-  let reviewFailure = null;
-  let sendControlFailure = null;
-  let observedTurnFailure = null;
-  let observeFailure = null;
-  let observeResultOverride = null;
-  let diagnosticResult = null;
-  let submissionDiagnosticResult = null;
-  let renderedDisplayFidelity = 'exact';
-  let returnWaitingAfterSubmission = false;
-  let visibleModelLabel = 'GPT-5.6 Pro';
-  let visibleModelRoute = 'semantic_model_switcher';
-  let fixturePrompt = '';
-  const composerIdentityFields = () => ({
-    composerPromptSha256: sha256(fixturePrompt),
-    composerIdentity: {
-      ok: true,
-      serializerOk: true,
-      serializerMethod: 'contenteditable_structural',
-      serializerError: null,
-      serializerTag: null,
-      serializedLength: fixturePrompt.length,
-      observedLengths: [fixturePrompt.length],
-      expectedLength: fixturePrompt.length,
-      candidateCount: 1,
-      rootTag: 'DIV',
-      elementCount: 1,
-      textNodeCount: 1,
-      otherNodeCount: 0,
-      maxDepth: 1,
-      tagHistogram: { DIV: 1 }
-    }
-  });
-  const exactIdentityFields = () => ({
-    identityMode: 'rendered_exact',
-    composerPromptSha256: sha256(fixturePrompt),
-    newUserMessageCount: 1,
-    renderedIdentityDiagnostic: {
-      serializerOk: true,
-      serializerMethod: 'rendered_user_message_structural',
-      serializerError: null,
-      serializerTag: null,
-      serializedLength: fixturePrompt.length,
-      observedLengths: [fixturePrompt.length],
-      expectedLength: fixturePrompt.length,
-      newUserMessageCount: 1,
-      renderedContentCandidateCount: 4,
-      exactMatchCount: 1,
-      readableCandidateCount: 1,
-      rootTag: 'DIV',
-      elementCount: 1,
-      textNodeCount: 1,
-      otherNodeCount: 0,
-      maxDepth: 1,
-      tagHistogram: { DIV: 1 }
-    }
-  });
-  let exclusiveTail = Promise.resolve();
+// These tests exercise the current v4 product/effort + sendAttempted protocol.
+// The retired v3 diagnostic APIs are intentionally not emulated by the fixture.
+const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+async function fixture(t) {
+  const parent = path.resolve('temp/tests');
+  await fs.mkdir(parent, { recursive: true });
+  const stateDir = await fs.mkdtemp(path.join(parent, 'review-admission-'));
+  t.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const request = { stableKey: 'question', idempotencyKey: 'question', provider: 'chatgpt',
+    productModel: 'GPT-6 Astra', reasoningEffort: 'Pro',
+    conversationUrl: 'https://chatgpt.com/c/fixture', conversationId: 'fixture',
+    prompt: 'exact\r\n中文  prompt', responsePath: path.join(stateDir, 'answer.md'), timeoutMs: 1000 };
+  request.promptSha256 = sha(request.prompt);
+  const calls = { review: 0, clicks: 0, observe: 0, recover: 0, tabs: 0 };
+  const mode = { crash: false, presend: false, waiting: false, skipComposer: false, baseline: ['old-user'], recoveredId: 'new-user', controls: {}, snapshotGap: 3100, resultUser: null };
+  let tail = Promise.resolve();
+  const operation = async () => (await readReviewTransportState(stateDir)).operations[request.idempotencyKey];
+  const identity = (args) => args.firstBinding
+    ? { conversationUrl: 'https://chatgpt.com/c/created', conversationId: 'created' }
+    : { conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId };
   const controller = {
-    async runExclusive(fn) {
-      const previous = exclusiveTail;
-      let release;
-      exclusiveTail = new Promise((resolve) => {
-        release = resolve;
-      });
-      await previous;
-      try {
-        return await fn();
-      } finally {
-        release();
-      }
-    },
+    async runExclusive(fn) { const prev = tail; let release; tail = new Promise(r => { release = r; }); await prev; try { return await fn(); } finally { release(); } },
     async reviewQuery(args) {
-      calls.review += 1;
-      calls.reviewPrompts.push(args.prompt);
-      calls.modelPreflights.push(args.requireModelPreflight === true);
-      const submittedUrl = args.firstBinding ? firstBindingSubmittedUrl : args.expectedUrl;
-      const submittedId = args.firstBinding ? firstBindingSubmittedUrl.split('/').at(-1) : args.expectedConversationId;
-      await args.onPrepared({
-        baselineMessageIds: ['historical-user-1'],
-        preparedAt: 50,
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: visibleModelLabel
-      });
-      await args.onComposerVerified?.({
-        ok: true,
-        textModel: REVIEW_PLAIN_TEXT_MODEL,
-        replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL,
-        composerPreparationMode: 'replaced',
-        composerKind: 'contenteditable',
-        clearMethod: 'already_empty',
-        selectionVerified: true,
-        deleteKeyCount: 0,
-        initialSerializerOk: true,
-        initialSerializedLength: 0,
-        emptyVerified: true,
-        emptySnapshotCount: 2,
-        caretVerified: true,
-        caretMethod: 'contenteditable_collapsed_range',
-        promptInsertCount: 1,
-        sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        identityMode: 'canonical_exact'
-      });
-      if (reviewFailure) throw reviewFailure;
-      if (sendControlFailure) throw sendControlFailure;
-      await args.onSendBoundaryEntered?.({
-        enteredAt: 85,
-        modelEvidence: {
-          expectedModel: args.expectedModel,
-          matchedLabel: visibleModelLabel,
-          routeEvidence: visibleModelRoute,
-          scopedMatchCount: 1
-        }
-      });
-      if (failAfterSendBoundary) throw new Error('simulated_crash_after_send_boundary');
-      if (postBoundaryFailure) throw postBoundaryFailure;
-      const causalSubmissionReceipt = await args.onSendAction({
-        clickCount: 1,
-        sendActionCount: 1,
-        sendActionAt: 90,
-        clickTimeIdentity: {
-          ok: true,
-          recoveredExact: true,
-          textModel: REVIEW_PLAIN_TEXT_MODEL,
-          identityMode: 'canonical_exact',
-          sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-          canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-          observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-          serializedLength: args.prompt.length,
-          expectedLength: args.prompt.length
-        },
-        clickTimeModelEvidence: {
-          expectedModel: args.expectedModel,
-          matchedLabel: visibleModelLabel,
-          routeEvidence: visibleModelRoute,
-          scopedMatchCount: 1
-        }
-      });
-      if (postClickFailure) throw postClickFailure;
-      if (failBeforeSubmittedReceipt) throw new Error('simulated_crash_after_send_intent');
-      const commitmentClass = renderedDisplayFidelity === 'exact'
-        ? 'turn_exact'
-        : renderedDisplayFidelity === 'unreadable'
-          ? 'turn_causal_exact_rendered_unreadable'
-          : 'turn_causal_exact_rendered_mismatch';
-      const observedTurn = observedTurnFailure?.receipt || {
-        observedUserMessageId: 'user-1',
-        observedAt: 95,
-        conversationUrl: submittedUrl,
-        conversationId: submittedId,
-        modelEvidence: visibleModelLabel,
-        commitmentClass,
-        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
-        renderedDisplayFidelity,
-        serializerOk: renderedDisplayFidelity !== 'unreadable',
-        serializerMethod: 'rendered_user_message_structural',
-        serializerError: null,
-        serializerTag: null,
-        serializedLength: args.prompt.length,
-        observedLengths: [args.prompt.length],
-        expectedLength: args.prompt.length,
-        newUserMessageCount: 1,
-        readableCandidateCount: 1,
-        exactMatchCount: renderedDisplayFidelity === 'exact' ? 1 : 0
-      };
-      await args.onUserTurnObserved?.(observedTurn);
-      if (observedTurnFailure) throw observedTurnFailure.error;
-      await args.onSubmitted({
-        userMessageId: 'user-1',
-        submittedAt: 100,
-        conversationUrl: submittedUrl,
-        conversationId: submittedId,
-        modelEvidence: visibleModelLabel,
-        sourcePromptSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-        canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-        submissionIdentityMode: REVIEW_CAUSAL_SUBMISSION_MODEL,
-        causalSubmissionReceipt,
-        renderedDisplayFidelity,
-        renderedDisplayEvidence: observedTurn,
-        renderedIdentityMode: renderedDisplayFidelity === 'exact' ? 'canonical_exact' : null,
-        ...exactIdentityFields()
-      });
-      if (failAfterSubmittedReceipt) throw new Error('simulated_crash_after_submitted_receipt');
-      if (returnWaitingAfterSubmission) {
-        return {
-          status: 'SENT_WAITING',
-          userMessageId: 'user-1',
-          conversationUrl: submittedUrl,
-          conversationId: submittedId,
-          modelEvidence: 'GPT-5.6 Pro'
-        };
+      calls.review++;
+      assert.equal(args.requireTargetPreflight, true);
+      assert.equal(args.prompt, request.prompt);
+      await args.onPrepared({ baselineMessageIds: mode.baseline });
+      if (!mode.skipComposer) {
+        const canonical = reviewPlainTextIdentity(args.prompt).canonicalSha256;
+        await args.onComposerVerified({ ok: true, textModel: REVIEW_PLAIN_TEXT_MODEL,
+          replacementModel: REVIEW_COMPOSER_REPLACEMENT_MODEL, sourceSha256: sha(args.prompt),
+          canonicalPromptSha256: canonical, observedCanonicalSha256: canonical });
       }
-      return {
-        userMessageId: 'user-1',
-        assistantMessageId: 'assistant-1',
-        text: 'SMOKE_OK',
-        snapshots: [
-          { observedAt: 1000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
-          { observedAt: 4100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
-        ],
-        controls: { stop: false, continue: false, retry: false, answerNow: false },
-        conversationUrl: submittedUrl,
-        conversationId: submittedId,
-        modelEvidence: 'GPT-5.6 Pro'
-      };
+      if (mode.presend) throw new Error('preflight_failed');
+      await args.onSendAttempted();
+      const persisted = await readReviewTransportState(stateDir);
+      const op = Object.values(persisted.operations).find(o => o.sendAttempted);
+      assert.deepEqual(op.baselineMessageIds, mode.baseline); // before a click
+      if (mode.crash) throw new Error('crash_between_intent_and_observation');
+      calls.clicks++;
+      await args.onUserTurnObserved({ userMessageId: 'new-user', ...identity(args) });
+      return { userMessageId: 'new-user', ...identity(args) };
+    },
+    async observeReviewUserTurn(args) {
+      calls.recover++;
+      assert.deepEqual(args.baselineMessageIds, mode.baseline);
+      return { userMessageId: mode.recoveredId, ...identity(args) };
     },
     async observeReviewResponse(args) {
-      calls.observe += 1;
-      calls.observeArgs.push(args);
-      if (observeFailure) throw observeFailure;
-      if (observeResultOverride) return await observeResultOverride(args);
-      const recoveredUrl = args.expectedConversationId?.startsWith('WEB:')
-        ? 'https://chatgpt.com/c/canonical-bound'
-        : args.expectedUrl;
-      const recoveredId = args.expectedConversationId?.startsWith('WEB:')
-        ? 'canonical-bound'
-        : args.expectedConversationId;
-      return {
-        userMessageId: args.userMessageId,
-        assistantMessageId: 'assistant-1',
-        text: 'SMOKE_OK',
-        snapshots: [
-          { observedAt: 5000, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') },
-          { observedAt: 8100, assistantMessageId: 'assistant-1', textSha256: sha256('SMOKE_OK') }
-        ],
-        controls: { stop: false, continue: false, retry: false, answerNow: false },
-        conversationUrl: recoveredUrl,
-        conversationId: recoveredId,
-        modelEvidence: 'GPT-5.6 Pro'
-      };
-    },
-    async recoverReviewSubmission(args) {
-      calls.recover += 1;
-      assert.deepEqual(args.baselineMessageIds, ['historical-user-1']);
-      assert.equal(args.causalSubmissionReceipt?.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
-      await args.onRecovered({
-        userMessageId: 'user-1',
-        submittedAt: 100,
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro',
-        renderedDisplayFidelity: 'exact',
-        ...exactIdentityFields()
-      });
-      return {
-        status: 'SENT_WAITING',
-        userMessageId: 'user-1',
-        conversationUrl: args.expectedUrl,
-        conversationId: args.expectedConversationId,
-        modelEvidence: 'GPT-5.6 Pro'
-      };
-    },
-    async inspectReviewComposerIdentity() {
-      calls.inspect += 1;
-      return diagnosticResult;
-    },
-    async inspectReviewSubmissionIdentity() {
-      calls.inspectSubmission += 1;
-      return submissionDiagnosticResult;
+      calls.observe++;
+      if (mode.waiting) return { status: 'SENT_WAITING' };
+      const text = '完整回答\r\nexact bytes\n';
+      return { text, userMessageId: mode.resultUser || args.userMessageId, assistantMessageId: 'assistant',
+        conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId,
+        snapshots: [1000, 1000 + mode.snapshotGap].map(observedAt => ({ observedAt, assistantMessageId: 'assistant', textSha256: sha(text) })),
+        controls: mode.controls };
     }
   };
-  const tabs = {
-    async adoptTab(args) {
-      calls.adopt.push(args);
-      return args.id;
-    },
-    async ensureTab(args) {
-      calls.ensure.push(args);
-      return 'tab-1';
-    },
-    getControllerById() {
-      return controller;
-    },
-    updateTabUrl(tabId, url) {
-      calls.update.push({ tabId, url });
-    }
-  };
-  const prompt = 'Return exactly SMOKE_OK.';
-  fixturePrompt = prompt;
-  const request = {
-    stableKey: 'hmasd-agentify-transport-smoke',
-    provider: 'chatgpt',
-    model: 'GPT-5.6 Pro',
-    conversationUrl: 'https://chatgpt.com/c/conversation-1',
-    conversationId: 'conversation-1',
-    idempotencyKey: 'hmasd-agentify-transport-smoke',
-    prompt,
-    promptSha256: sha256(prompt),
-    responsePath: path.join(stateDir, 'response.md'),
-    timeoutMs: 240_000
-  };
-  return {
-    stateDir,
-    calls,
-    tabs,
-    request,
-    setFailBeforeSubmittedReceipt(value) {
-      failBeforeSubmittedReceipt = !!value;
-    },
-    setFailAfterSendBoundary(value) {
-      failAfterSendBoundary = !!value;
-    },
-    setPostBoundaryFailure(error) {
-      postBoundaryFailure = error;
-    },
-    setPostClickFailure(error) {
-      postClickFailure = error;
-    },
-    setFailAfterSubmittedReceipt(value) {
-      failAfterSubmittedReceipt = !!value;
-    },
-    setFirstBindingSubmittedUrl(value) {
-      firstBindingSubmittedUrl = value;
-    },
-    setReviewFailure(error, diagnostic) {
-      reviewFailure = error;
-      diagnosticResult = diagnostic;
-    },
-    setSendControlFailure(error) {
-      sendControlFailure = error;
-    },
-    setObservedTurnFailure(error, receipt) {
-      observedTurnFailure = { error, receipt };
-    },
-    setObserveFailure(error) {
-      observeFailure = error;
-    },
-    setObserveResultOverride(fn) {
-      observeResultOverride = fn;
-    },
-    armForbiddenControls() {
-      for (const method of ['reviewQuery', 'send', 'input', 'click', 'Continue', 'Retry', 'Stop', 'answerNow', 'inspectReviewComposerIdentity']) {
-        controller[method] = async () => {
-          calls.forbidden += 1;
-          throw new Error(`forbidden_control_called:${method}`);
-        };
-      }
-    },
-    setSubmissionDiagnostic(diagnostic) {
-      submissionDiagnosticResult = diagnostic;
-    },
-    setRenderedDisplayFidelity(value) {
-      renderedDisplayFidelity = value;
-    },
-    setReturnWaitingAfterSubmission(value) {
-      returnWaitingAfterSubmission = !!value;
-    },
-    setVisibleModelLabel(value) {
-      visibleModelLabel = String(value);
-    },
-    setVisibleModelRoute(value) {
-      visibleModelRoute = String(value);
-    }
-  };
+  const tabs = { async ensureTab() { calls.tabs++; return 'tab'; }, async adoptTab() {}, getWindowById() { return { async show() {} }; }, getControllerById() { return controller; }, updateTabUrl() {} };
+  return { stateDir, request, calls, mode, operation, controller, tabs,
+    run: (overrides = {}) => runReviewQuery({ stateDir, tabs, request: { ...request, ...overrides } }) };
 }
 
-test('review response archive: atomically commits and verifies the exact full text', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-response-'));
-  const responsePath = path.join(tempDir, 'nested', 'response.md');
-  const text = 'Full response\nwith Unicode: 科研\n';
-  try {
-    const archived = await archiveReviewResponse({ responsePath, text });
-    assert.equal(archived.responsePath, responsePath);
-    assert.equal(archived.responseSha256, sha256(text));
-    assert.equal(archived.responseBytes, Buffer.byteLength(text, 'utf8'));
-    assert.equal(await fs.readFile(responsePath, 'utf8'), text);
-    assert.equal((await fs.readdir(path.dirname(responsePath))).some((name) => name.includes('.tmp-')), false);
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  }
+test('one exact send persists a baseline and immutable archive; duplicate is read-only', async t => {
+  const f = await fixture(t); const first = await f.run(); const second = await f.run();
+  assert.deepEqual(second, first); assert.equal(f.calls.clicks, 1);
+  assert.equal(first.sendAttempted, true); assert.equal(first.providerUserMessageId, 'new-user');
+  assert.equal(first.archive.sha256, sha(await fs.readFile(f.request.responsePath, 'utf8')));
 });
-
-test('review response archive: preserves one durable terminal LF projection without rewriting', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-response-lf-'));
-  const responsePath = path.join(tempDir, 'response.md');
-  const renderedText = 'Full rendered response\nwith Unicode: 科研';
-  const durableText = `${renderedText}\n`;
-  try {
-    await fs.writeFile(responsePath, durableText, 'utf8');
-    await assert.rejects(
-      archiveReviewResponse({ responsePath, text: renderedText }),
-      /review_response_path_conflict/
-    );
-    const archived = await archiveReviewResponse({
-      responsePath,
-      text: renderedText,
-      allowTerminalLfProjection: true
-    });
-    assert.equal(archived.responsePath, responsePath);
-    assert.equal(archived.responseSha256, sha256(durableText));
-    assert.equal(archived.responseBytes, Buffer.byteLength(durableText, 'utf8'));
-    assert.equal(archived.responseArchiveProjection, 'terminal_lf_v1');
-    assert.equal(await fs.readFile(responsePath, 'utf8'), durableText);
-    for (const invalidExisting of [`${renderedText}\r\n`, `${renderedText}\n\n`, `prefix\n${renderedText}`]) {
-      await fs.writeFile(responsePath, invalidExisting, 'utf8');
-      await assert.rejects(
-        archiveReviewResponse({ responsePath, text: renderedText, allowTerminalLfProjection: true }),
-        /review_response_path_conflict/
-      );
-    }
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  }
+test('same-key concurrent callers send once', async t => {
+  const f = await fixture(t); await Promise.all([f.run(), f.run()]); assert.equal(f.calls.clicks, 1);
 });
-
-test('review response archive conflict records the current archive-stage predicate', async () => {
-  const f = await fixture();
-  try {
-    await fs.writeFile(f.request.responsePath, 'SMOKE_OK\n', 'utf8');
-    const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-    assert.equal(receipt.status, 'SUBMITTED');
-    assert.equal(receipt.terminalState, 'SENT_UNREADABLE');
-    assert.equal(receipt.error, 'review_response_path_conflict');
-    assert.equal(receipt.failureStage, 'response_archive');
-    assert.equal(receipt.errorData?.predicate, 'review_response_path_conflict');
-    assert.equal(receipt.errorData?.failureStage, 'response_archive');
-
-    const recovered = await runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, verifyExisting: true }
-    });
-    assert.equal(recovered.status, 'COMPLETE');
-    assert.equal(recovered.terminalState, 'NATURAL_COMPLETION_VERIFIED');
-    assert.equal('error' in recovered, false);
-    assert.equal('errorData' in recovered, false);
-    assert.equal('failureStage' in recovered, false);
-    assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK\n');
-    assert.equal(f.calls.review, 1);
-    assert.equal(f.calls.observe, 1);
-  } finally {
-    await fs.rm(f.stateDir, { recursive: true, force: true });
-  }
+test('same conversation/prompt cannot be resent by changing keys, including concurrent intake', async t => {
+  const f = await fixture(t);
+  const results = await Promise.allSettled([f.run(), f.run({ stableKey: 'replacement', idempotencyKey: 'replacement' })]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.match(String(results.find(r => r.status === 'rejected').reason), /review_duplicate_submission/);
+  assert.equal(f.calls.clicks, 1);
 });
-
-test('review prompt input: reads exact UTF-8 promptPath once from relative or absolute paths', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-prompt-'));
-  const relativePath = 'review-prompt.txt';
-  const absolutePath = path.join(tempDir, relativePath);
-  const exactPrompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
-  await fs.writeFile(absolutePath, exactPrompt, 'utf8');
-  try {
-    const relativeReads = [];
-    const readFile = async (...args) => {
-      relativeReads.push(args);
-      return await fs.readFile(...args);
-    };
-    assert.equal(
-      await resolveReviewPromptInput({ promptPath: relativePath }, { cwd: tempDir, readFile }),
-      exactPrompt
-    );
-    assert.deepEqual(relativeReads, [[absolutePath, 'utf8']]);
-
-    const absoluteReads = [];
-    assert.equal(
-      await resolveReviewPromptInput({ promptPath: absolutePath }, {
-        cwd: path.dirname(tempDir),
-        readFile: async (...args) => {
-          absoluteReads.push(args);
-          return await fs.readFile(...args);
-        }
-      }),
-      exactPrompt
-    );
-    assert.deepEqual(absoluteReads, [[absolutePath, 'utf8']]);
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  }
+test('pre-send failure remains repairable using the same operation', async t => {
+  const f = await fixture(t); f.mode.presend = true; await assert.rejects(f.run(), /preflight_failed/);
+  assert.equal((await f.operation()).sendAttempted, false);
+  f.mode.presend = false; await f.run(); assert.equal(f.calls.clicks, 1);
 });
-
-test('review prompt input: requires exactly one inline prompt or nonblank promptPath', async () => {
-  await assert.rejects(resolveReviewPromptInput({}), /exactly_one_of_prompt_or_promptPath_required/);
-  await assert.rejects(
-    resolveReviewPromptInput({ prompt: 'inline', promptPath: 'review-prompt.txt' }),
-    /exactly_one_of_prompt_or_promptPath_required/
-  );
-  await assert.rejects(
-    resolveReviewPromptInput({ promptPath: '   ' }),
-    /exactly_one_of_prompt_or_promptPath_required/
-  );
-  let reads = 0;
-  const inlinePrompt = 'inline\r\n\u3053\u3093\u306b\u3061\u306f';
-  assert.equal(
-    await resolveReviewPromptInput({ prompt: inlinePrompt }, { readFile: async () => { reads += 1; } }),
-    inlinePrompt
-  );
-  assert.equal(reads, 0);
+test('missing composer verification cannot cross the send boundary', async t => {
+  const f = await fixture(t); f.mode.skipComposer = true;
+  await assert.rejects(f.run(), /review_operation_state_invalid/);
+  assert.equal((await f.operation()).sendAttempted, false); assert.equal(f.calls.clicks, 0);
 });
-
-test('review prompt preparation: invalid hashes fail before connection after one exact file read', async () => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentify-review-prompt-hash-'));
-  const promptPath = path.join(tempDir, 'review-prompt.txt');
-  const exactPrompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
-  await fs.writeFile(promptPath, exactPrompt, 'utf8');
-  try {
-    for (const [promptSha256, expectedError] of [
-      ['A'.repeat(64), /review_prompt_sha256_invalid/],
-      ['0'.repeat(64), /review_prompt_sha256_mismatch/]
-    ]) {
-      const reads = [];
-      await assert.rejects(
-        prepareReviewPromptInput(
-          { promptPath: 'review-prompt.txt', promptSha256 },
-          {
-            cwd: tempDir,
-            readFile: async (...args) => {
-              reads.push(args);
-              return await fs.readFile(...args);
-            }
-          }
-        ),
-        expectedError
-      );
-      assert.deepEqual(reads, [[promptPath, 'utf8']]);
-    }
-  } finally {
-    await fs.rm(tempDir, { recursive: true, force: true });
-  }
+test('restart after intent preserves the baseline and never sends again', async t => {
+  const f = await fixture(t); f.mode.crash = true; await assert.rejects(f.run(), /crash_between/);
+  assert.deepEqual((await f.operation()).baselineMessageIds, ['old-user']);
+  f.mode.crash = false; await f.run({ verifyExisting: true });
+  assert.equal(f.calls.review, 1); assert.equal(f.calls.clicks, 0); assert.equal(f.calls.recover, 1);
 });
-
-test('review transport: adopts an exact existing tab before the normal send lifecycle', async () => {
-  const f = await fixture();
-  const request = { ...f.request, existingTabId: 'tab-existing' };
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  assert.equal(receipt.status, 'COMPLETE');
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal('deadlineAt' in operation, false);
-  assert.deepEqual(f.calls.adopt, [{
-    id: 'tab-existing',
-    key: request.stableKey,
-    name: request.stableKey,
-    url: request.conversationUrl,
-    vendorId: request.provider,
-    vendorName: 'ChatGPT'
-  }]);
-  assert.equal(f.calls.review, 1);
+test('intent without any new matching turn remains unknown without resending', async t => {
+  const f = await fixture(t); f.mode.crash = true; await assert.rejects(f.run());
+  f.mode.recoveredId = null; const receipt = await f.run({ verifyExisting: true });
+  assert.equal(receipt.sendAttempted, true); assert.equal(receipt.providerUserMessageId, null);
+  assert.equal(receipt.archive, null); assert.equal(f.calls.review, 1);
 });
-
-test('review transport: mismatch diagnostics retain only non-content structural metadata', () => {
-  assert.deepEqual(sanitizeReviewErrorData({
-    ok: false,
-    serializerOk: false,
-    serializerMethod: 'contenteditable_structural',
-    serializerError: 'review_composer_element_unsupported',
-    serializerTag: 'PRE',
-    serializedLength: 0,
-    observedLengths: [2889, 2743],
-    expectedLength: 2810,
-    rootTag: 'DIV',
-    elementCount: 21,
-    textNodeCount: 12,
-    otherNodeCount: 0,
-    maxDepth: 4,
-    tagHistogram: { DIV: 2, PRE: 8, 'bad tag': 99 },
-    prompt: 'must-not-persist',
-    text: 'must-not-persist',
-    arbitrary: { nested: 'must-not-persist' }
-  }), {
-    ok: false,
-    serializerOk: false,
-    serializerMethod: 'contenteditable_structural',
-    serializerError: 'review_composer_element_unsupported',
-    serializerTag: 'PRE',
-    rootTag: 'DIV',
-    serializedLength: 0,
-    expectedLength: 2810,
-    elementCount: 21,
-    textNodeCount: 12,
-    otherNodeCount: 0,
-    maxDepth: 4,
-    observedLengths: [2889, 2743],
-    tagHistogram: { DIV: 2, PRE: 8 }
-  });
+test('a historical ID cannot be adopted even if a controller returns it', async t => {
+  const f = await fixture(t); f.mode.crash = true; await assert.rejects(f.run());
+  f.mode.recoveredId = 'old-user'; await assert.rejects(f.run({ verifyExisting: true }), /review_operation_state_invalid/);
+  assert.equal((await f.operation()).providerUserMessageId, null);
 });
-
-test('review transport: composer mismatch persists observe-only sanitized diagnostics', async () => {
-  const f = await fixture();
-  const error = new Error('review_composer_identity_mismatch');
-  error.data = { serializerOk: false, serializerTag: 'PRE', prompt: 'must-not-persist' };
-  f.setReviewFailure(error, {
-    ok: false,
-    serializerOk: false,
-    serializerMethod: 'contenteditable_structural',
-    serializerError: 'review_composer_element_unsupported',
-    serializerTag: 'PRE',
-    serializedLength: 0,
-    observedLengths: [2889, 2743],
-    expectedLength: 2810,
-    rootTag: 'DIV',
-    elementCount: 40,
-    textNodeCount: 24,
-    otherNodeCount: 0,
-    maxDepth: 4,
-    tagHistogram: { CODE: 8, DIV: 2, PRE: 8 },
-    prompt: 'must-not-persist'
-  });
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_composer_identity_mismatch/
-  );
+for (const baseline of [undefined, null]) test(`legacy unpaired receipt with ${baseline} baseline fails closed`, async t => {
+  const f = await fixture(t); f.mode.crash = true; await assert.rejects(f.run());
   const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.failureStage, 'before_send_click');
-  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(operation.errorData.serializerTag, 'PRE');
-  assert.deepEqual(operation.errorData.tagHistogram, { CODE: 8, DIV: 2, PRE: 8 });
-  assert.equal(JSON.stringify(operation.errorData).includes('must-not-persist'), false);
-  assert.equal(f.calls.inspect, 1);
-});
-
-test('review transport: blocked operation permits one metadata-only submission diagnosis', async () => {
-  const f = await fixture();
-  const error = new Error('review_user_message_identity_unreadable');
-  f.setReviewFailure(error, null);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_identity_unreadable/
-  );
-  f.setSubmissionDiagnostic({
-    ok: false,
-    serializerOk: false,
-    serializerMethod: 'rendered_user_message_structural',
-    serializerError: 'review_composer_element_unsupported',
-    serializerTag: 'PRE',
-    serializedLength: 0,
-    observedLengths: [],
-    expectedLength: f.request.prompt.length,
-    candidateCount: 1,
-    rootTag: 'DIV',
-    elementCount: 9,
-    textNodeCount: 4,
-    otherNodeCount: 0,
-    maxDepth: 3,
-    tagHistogram: { CODE: 4, DIV: 1, PRE: 4 },
-    prompt: 'must-not-persist'
-  });
-  const diagnosed = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, diagnoseExisting: true }
-  });
-  assert.equal(diagnosed.status, 'BLOCKED');
-  assert.equal(diagnosed.sendCount, 0);
-  assert.equal(diagnosed.diagnosticOnly, true);
-  assert.equal(diagnosed.errorData.serializerTag, 'PRE');
-  assert.deepEqual(diagnosed.errorData.tagHistogram, { CODE: 4, DIV: 1, PRE: 4 });
-  assert.equal(JSON.stringify(diagnosed.errorData).includes('must-not-persist'), false);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.inspectSubmission, 1);
-});
-
-test('review transport: legacy zero-send blocked operation is not reusable without pre-click evidence', async () => {
-  const f = await fixture();
-  const error = new Error('review_composer_identity_mismatch');
-  f.setReviewFailure(error, { serializerOk: false, serializerTag: 'PRE' });
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_composer_identity_mismatch/
-  );
-  const legacy = await readReviewTransportState(f.stateDir);
-  delete legacy.operations[f.request.idempotencyKey].sendActionCount;
-  delete legacy.operations[f.request.idempotencyKey].failureStage;
-  await writeReviewTransportState(legacy, f.stateDir);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_operation_closed_create_fresh/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: deterministic send-control rejection remains an eligible pre-click failure', async () => {
-  const f = await fixture();
-  const error = new Error('review_send_control_ambiguous');
-  error.data = { ok: false, clickCount: 0, noClickProven: true };
-  f.setSendControlFailure(error);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_send_control_ambiguous/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.failureStage, 'before_send_click');
-  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(operation.errorData.noClickProven, true);
-});
-
-test('review transport: ledger-only observation exposes the durable zero-commit fact and mechanical view locator', async () => {
-  const f = await fixture();
-  const error = new Error('chrome_cdp_disconnected');
-  error.data = { failureStage: 'before_send_click', newUserMessageCount: 0, sendActionCount: 0 };
-  f.setReviewFailure(error, null);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /chrome_cdp_disconnected/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  const observed = await observeReviewOperation({
-    stateDir: f.stateDir,
-    idempotencyKey: f.request.idempotencyKey,
-    operationId: operation.operationId
-  });
-  assert.equal(observed.observationKind, 'ledger_only');
-  assert.equal(observed.zeroCommitPreClick, true);
-  assert.equal(observed.sendCount, 0);
-  assert.equal(observed.sendActionCount, 0);
-  assert.equal(observed.hasUserMessageId, false);
-  assert.equal(observed.tabId, 'tab-1');
-  assert.equal(observed.observedConversationId, null);
-  assert.equal(f.calls.review, 1);
-  await assert.rejects(
-    observeReviewOperation({ stateDir: f.stateDir, idempotencyKey: f.request.idempotencyKey, operationId: 'wrong-operation' }),
-    /review_operation_identity_mismatch/
-  );
-});
-
-test('review transport: one unreadable visible user turn is durably anchored before terminal failure', async () => {
-  const f = await fixture();
-  const receipt = {
-    observedUserMessageId: 'observed-unreadable-user',
-    observedAt: 101,
-    conversationUrl: f.request.conversationUrl,
-    conversationId: f.request.conversationId,
-    modelEvidence: 'GPT-5.6 Pro',
-    commitmentClass: 'turn_unreadable',
-    serializerOk: false,
-    serializerMethod: 'rendered_user_message_structural',
-    serializerError: 'review_composer_element_unsupported',
-    serializerTag: 'PRE',
-    expectedLength: f.request.prompt.length,
-    newUserMessageCount: 1,
-    readableCandidateCount: 0,
-    exactMatchCount: 0,
-    renderedContentCandidateCount: 4,
-    rootTag: 'PRE',
-    elementCount: 2,
-    textNodeCount: 1,
-    otherNodeCount: 0,
-    maxDepth: 2,
-    tagHistogram: { CODE: 1, PRE: 1 }
-  };
-  const error = new Error('review_user_message_identity_unreadable');
-  error.data = receipt;
-  f.setObservedTurnFailure(error, receipt);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_identity_unreadable/
-  );
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(operation.status, 'OBSERVING');
-  assert.equal(operation.terminalState, 'SENT_UNREADABLE');
-  assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.userMessageId, undefined);
-  assert.equal(operation.observedUserMessageId, 'observed-unreadable-user');
-  assert.equal(operation.observedCommitmentClass, 'turn_unreadable');
-  assert.equal(operation.errorData.commitmentClass, 'turn_unreadable');
-  assert.equal(operation.errorData.newUserMessageCount, 1);
-  assert.equal(operation.errorData.serializerTag, 'PRE');
-  assert.deepEqual(operation.errorData.tagHistogram, { CODE: 1, PRE: 1 });
-});
-
-test('review transport: readable content mismatch persists the observed anchor and safe fingerprint', async () => {
-  const f = await fixture();
-  const receipt = {
-    observedUserMessageId: 'observed-mismatch-user',
-    observedAt: 102,
-    conversationUrl: f.request.conversationUrl,
-    conversationId: f.request.conversationId,
-    modelEvidence: 'GPT-5.6 Pro',
-    commitmentClass: 'turn_content_mismatch',
-    serializerOk: true,
-    serializerMethod: 'rendered_user_message_structural',
-    serializerError: 'review_user_message_content_mismatch',
-    serializedLength: 15,
-    observedLengths: [15],
-    expectedLength: f.request.prompt.length,
-    newUserMessageCount: 1,
-    readableCandidateCount: 1,
-    exactMatchCount: 0,
-    textModel: REVIEW_PLAIN_TEXT_MODEL,
-    identityMode: 'mismatch',
-    mismatchClass: 'code_point_length_mismatch',
-    observedRawSha256: sha256('Pasted_text.txt'),
-    observedCanonicalSha256: sha256('Pasted_text.txt')
-  };
-  const error = new Error('review_user_message_content_mismatch');
-  error.data = receipt;
-  f.setObservedTurnFailure(error, receipt);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_content_mismatch/
-  );
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(operation.observedUserMessageId, 'observed-mismatch-user');
-  assert.equal(operation.observedCommitmentClass, 'turn_content_mismatch');
-  assert.equal(operation.errorData.serializedLength, 15);
-  assert.equal(operation.errorData.mismatchClass, 'code_point_length_mismatch');
-  assert.equal(operation.errorData.observedCanonicalSha256, sha256('Pasted_text.txt'));
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_operation_closed_create_fresh/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: click with no observed turn remains distinct and has no fabricated anchor', async () => {
-  const f = await fixture();
-  const error = new Error('review_user_message_not_observed_after_click');
-  error.data = {
-    commitmentClass: 'click_no_turn',
-    newUserMessageCount: 0,
-    expectedLength: f.request.prompt.length
-  };
-  f.setPostClickFailure(error);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_not_observed_after_click/
-  );
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(operation.observedUserMessageId, undefined);
-  assert.equal(operation.errorData.commitmentClass, 'click_no_turn');
-  assert.equal(operation.errorData.newUserMessageCount, 0);
-  assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.terminalState, 'COMMITMENT_UNKNOWN');
-});
-
-test('review transport: crash after entering the send-capable boundary is commitment unknown, never proven zero-send', async () => {
-  const f = await fixture();
-  f.setFailAfterSendBoundary(true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /simulated_crash_after_send_boundary/
-  );
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.ok(Number.isFinite(operation.sendBoundaryEnteredAt));
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.terminalState, 'COMMITMENT_UNKNOWN');
-  const observed = await observeReviewOperation({
-    stateDir: f.stateDir,
-    idempotencyKey: f.request.idempotencyKey,
-    operationId: operation.operationId
-  });
-  assert.equal(observed.zeroCommitPreClick, false);
-});
-
-test('review transport: durable no-click proof resolves an entered boundary and releases the exact conversation prompt', async () => {
-  const f = await fixture();
-  const error = new Error('review_model_mismatch_at_send');
-  error.data = { noClickProven: true };
-  f.setPostBoundaryFailure(error);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_model_mismatch_at_send/
-  );
-  const blocked = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.ok(Number.isFinite(blocked.sendBoundaryEnteredAt));
-  assert.equal(blocked.boundaryResolution, 'no_click_proven');
-  assert.equal(blocked.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(blocked.sendActionCount, 0);
-
-  const replayed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(replayed.operationId, blocked.operationId);
-  assert.equal(replayed.status, 'BLOCKED');
-  assert.equal(replayed.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(replayed.boundaryResolution, 'no_click_proven');
-  assert.equal(replayed.errorData.noClickProven, true);
-  assert.equal(f.calls.review, 1);
-
-  f.setPostBoundaryFailure(null);
-  const replacement = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: {
-      ...f.request,
-      idempotencyKey: `${f.request.idempotencyKey}-after-zero-send`,
-      responsePath: path.join(f.stateDir, 'replacement-response.md')
-    }
-  });
-  assert.equal(replacement.status, 'COMPLETE');
-  assert.equal(f.calls.review, 2);
-});
-
-test('review transport: one send persists a complete receipt and duplicate returns it', async () => {
-  const f = await fixture();
-  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(first.status, 'COMPLETE');
-  assert.equal(first.sendCount, 1);
-  assert.equal(first.promptSha256, sha256(f.request.prompt));
-  assert.equal(first.responseSha256, sha256('SMOKE_OK'));
-  assert.equal(first.userMessageId, 'user-1');
-  assert.equal(first.observedUserMessageId, 'user-1');
-  assert.equal(first.observedCommitmentClass, 'turn_exact');
-  assert.equal(first.assistantMessageId, 'assistant-1');
-  assert.equal(first.sendActionCount, 1);
-  assert.equal(first.promptTextModel, REVIEW_PLAIN_TEXT_MODEL);
-  assert.equal(first.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
-  assert.equal(first.composerIdentity.verified, true);
-  assert.equal(first.composerIdentity.sourceSha256, f.request.promptSha256);
-  assert.equal(first.renderedIdentity.canonicalPromptSha256, reviewPlainTextIdentity(f.request.prompt).canonicalSha256);
-  assert.equal(first.clickTimeIdentity.recoveredExact, true);
-  assert.equal(first.clickTimeIdentity.sourceSha256, f.request.promptSha256);
-  assert.deepEqual(first.causalSendReceipt.modelSelection, {
-    expectedModel: 'GPT-5.6 Pro',
-    matchedLabel: 'GPT-5.6 Pro',
-    routeEvidence: 'semantic_model_switcher',
-    scopedMatchCount: 1
-  });
-  assert.equal(first.modelEvidence, 'GPT-5.6 Pro');
-  assert.deepEqual(f.calls.modelPreflights, [true]);
-  assert.equal('submissionIdentityMode' in first, false);
-  assert.equal('composerPromptSha256' in first, false);
-  assert.equal(f.calls.review, 1);
-
-  const duplicate = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(duplicate.status, 'COMPLETE');
-  assert.equal(duplicate.operationId, first.operationId);
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: visible Pro is canonical send evidence for requested GPT-5.6 Pro', async () => {
-  const f = await fixture();
-  f.setVisibleModelLabel('Pro');
-  f.setVisibleModelRoute('composer_model_control');
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(receipt.status, 'COMPLETE');
-  assert.equal(receipt.model, 'GPT-5.6 Pro');
-  assert.equal(receipt.modelEvidence, 'Pro');
-  assert.deepEqual(receipt.causalSendReceipt.modelSelection, {
-    expectedModel: 'GPT-5.6 Pro',
-    matchedLabel: 'Pro',
-    routeEvidence: 'composer_model_control',
-    scopedMatchCount: 1
-  });
-});
-
-test('review transport: a reasoning Pro route cannot satisfy the GPT-5.6 Pro product request', async () => {
-  const f = await fixture();
-  f.setVisibleModelLabel('Pro');
-  f.setVisibleModelRoute('composer_reasoning_control');
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_send_model_receipt_invalid/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const receipt = state.operations[f.request.idempotencyKey];
-  assert.equal(receipt.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(receipt.sendActionCount, 0);
-  assert.equal(receipt.error, 'review_send_model_receipt_invalid');
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: first ChatGPT binding captures the created conversation after one strict send', async () => {
-  const f = await fixture();
-  f.setVisibleModelLabel('Pro');
-  const request = {
-    ...f.request,
-    stableKey: 'first-binding-key',
-    idempotencyKey: 'first-binding-op',
-    conversationUrl: 'https://chatgpt.com/',
-    conversationId: '__new__',
-    firstBinding: true
-  };
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  assert.equal(receipt.conversationUrl, 'https://chatgpt.com/c/first-bound');
-  assert.equal(receipt.conversationId, 'first-bound');
-  assert.deepEqual(f.calls.update, [{ tabId: 'tab-1', url: 'https://chatgpt.com/c/first-bound' }]);
-  const state = await readReviewTransportState(f.stateDir);
-  assert.equal(state.bindings['first-binding-key'].conversationId, 'first-bound');
-  assert.equal(state.bindings['first-binding-key'].model, 'GPT-5.6 Pro');
-  assert.equal(state.operations['first-binding-op'].modelEvidence, 'Pro');
-  assert.equal(state.operations['first-binding-op'].conversationId, 'first-bound');
-});
-
-test('review transport: a submitted provisional first binding adopts the canonical identity without another send', async () => {
-  const f = await fixture();
-  const request = {
-    ...f.request,
-    stableKey: 'first-binding-recovery-key',
-    idempotencyKey: 'first-binding-recovery-op',
-    conversationUrl: 'https://chatgpt.com/',
-    conversationId: '__new__',
-    firstBinding: true
-  };
-  f.setFirstBindingSubmittedUrl('https://chatgpt.com/c/WEB:temporary-bound');
-  f.setFailAfterSubmittedReceipt(true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }),
-    /simulated_crash_after_submitted_receipt/
-  );
-  const blocked = await readReviewTransportState(f.stateDir);
-  assert.equal(blocked.operations[request.idempotencyKey].sendCount, 1);
-  assert.equal(blocked.operations[request.idempotencyKey].userMessageId, 'user-1');
-  assert.equal(blocked.operations[request.idempotencyKey].conversationId, 'WEB:temporary-bound');
-
-  f.setFailAfterSubmittedReceipt(false);
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  assert.equal(receipt.status, 'COMPLETE');
-  assert.equal(receipt.sendCount, 1);
-  assert.equal(receipt.conversationUrl, 'https://chatgpt.com/c/canonical-bound');
-  assert.equal(receipt.conversationId, 'canonical-bound');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-  assert.deepEqual(f.calls.update, [
-    { tabId: 'tab-1', url: 'https://chatgpt.com/c/WEB:temporary-bound' },
-    { tabId: 'tab-1', url: 'https://chatgpt.com/c/canonical-bound' }
-  ]);
-});
-
-test('review transport: Gemini uses the same strict receipt lifecycle with provider-specific identity', async () => {
-  const f = await fixture();
-  const request = {
-    ...f.request,
-    stableKey: 'gemini-review-key',
-    idempotencyKey: 'gemini-review-op',
-    provider: 'gemini',
-    model: 'Gemini 2.5 Pro',
-    conversationUrl: 'https://gemini.google.com/app/gemini-conversation',
-    conversationId: 'gemini-conversation'
-  };
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  assert.equal(receipt.provider, 'gemini');
-  assert.equal(receipt.conversationId, 'gemini-conversation');
-  assert.equal(f.calls.ensure[0].vendorName, 'Gemini');
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: a stale waiting observer cannot regress a completed operation', async () => {
-  const f = await fixture();
-  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(completed.status, 'COMPLETE');
-  f.setObserveResultOverride(async (args) => ({
-    status: 'SENT_WAITING',
-    userMessageId: args.userMessageId,
-    conversationUrl: args.expectedUrl,
-    conversationId: args.expectedConversationId,
-    modelEvidence: args.submittedModelEvidence
-  }));
-  const observed = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(observed.status, 'COMPLETE');
-  const persisted = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(persisted.status, 'COMPLETE');
-  assert.equal(persisted.terminalState, 'NATURAL_COMPLETION_VERIFIED');
-});
-
-test('review transport: send phase returns SENT_WAITING and a later observe completes without another send', async () => {
-  const f = await fixture();
-  f.setReturnWaitingAfterSubmission(true);
-
-  const submitted = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(submitted.status, 'SUBMITTED');
-  assert.equal(submitted.terminalState, 'SENT_WAITING');
-  assert.equal(submitted.sendCount, 1);
-  assert.equal(submitted.sendActionCount, 1);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 0);
-
-  f.setReturnWaitingAfterSubmission(false);
-  const completed = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(completed.status, 'COMPLETE');
-  assert.equal(completed.terminalState, 'NATURAL_COMPLETION_VERIFIED');
-  assert.equal(completed.responsePath, f.request.responsePath);
-  assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-});
-
-test('review transport: verifyExisting certifies one durable terminal LF without another send', async () => {
-  const f = await fixture();
-  try {
-    f.setReturnWaitingAfterSubmission(true);
-    const submitted = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-    assert.equal(submitted.terminalState, 'SENT_WAITING');
-    await fs.writeFile(f.request.responsePath, 'SMOKE_OK\n', 'utf8');
-
-    f.setReturnWaitingAfterSubmission(false);
-    const completed = await runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, verifyExisting: true }
-    });
-    assert.equal(completed.status, 'COMPLETE');
-    assert.equal(completed.terminalState, 'NATURAL_COMPLETION_VERIFIED');
-    assert.equal(completed.responseArchiveProjection, 'terminal_lf_v1');
-    assert.equal(completed.responseSha256, sha256('SMOKE_OK\n'));
-    assert.equal(completed.snapshots[0].textSha256, sha256('SMOKE_OK'));
-    assert.equal(completed.snapshots[1].textSha256, sha256('SMOKE_OK'));
-    assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK\n');
-    assert.equal(f.calls.review, 1);
-    assert.equal(f.calls.observe, 1);
-  } finally {
-    await fs.rm(f.stateDir, { recursive: true, force: true });
-  }
-});
-
-test('review transport: lossy provider-visible input is isolated and cannot become COMPLETE', async () => {
-  const f = await fixture();
-  f.setRenderedDisplayFidelity('lossy_mismatch');
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_content_mismatch/
-  );
-  const operation = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.terminalState, 'SENT_INPUT_MISMATCH');
-  assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.sendCount, 0);
-  await assert.rejects(fs.access(f.request.responsePath));
-});
-
-test('review transport: composer replacement receipt is mandatory before strict submission', async () => {
-  const f = await fixture();
-  const originalReviewQuery = f.tabs.getControllerById().reviewQuery;
-  f.tabs.getControllerById().reviewQuery = async (args) => {
-    await args.onPrepared({
-      baselineMessageIds: ['historical-user-1'], preparedAt: 50,
-      conversationUrl: args.expectedUrl,
-      conversationId: args.expectedConversationId,
-      modelEvidence: 'GPT-5.6 Pro'
-    });
-    await args.onComposerVerified({
-      ok: true,
-      textModel: REVIEW_PLAIN_TEXT_MODEL,
-      sourceSha256: reviewPlainTextIdentity(args.prompt).sourceSha256,
-      canonicalPromptSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-      observedCanonicalSha256: reviewPlainTextIdentity(args.prompt).canonicalSha256,
-      identityMode: 'canonical_exact'
-    });
-    return await originalReviewQuery(args);
-  };
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_composer_identity_receipt_invalid/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.failureStage, 'before_send_click');
-});
-
-test('review transport: an empty continuation baseline fails before composer write without a send', async () => {
-  const f = await fixture();
-  let composerVerified = 0;
-  let sendAction = 0;
-  f.tabs.getControllerById().reviewQuery = async (args) => {
-    await args.onPrepared({
-      baselineMessageIds: [],
-      preparedAt: 50,
-      conversationUrl: args.expectedUrl,
-      conversationId: args.expectedConversationId,
-      modelEvidence: 'GPT-5.6 Pro'
-    });
-    composerVerified += 1;
-    await args.onComposerVerified({});
-    sendAction += 1;
-    await args.onSendAction({});
-  };
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_continuation_baseline_empty/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  assert.equal(composerVerified, 0);
-  assert.equal(sendAction, 0);
-  assert.equal(operation.status, 'BLOCKED');
-  assert.equal(operation.terminalState, 'ZERO_SEND_FAILED');
-  assert.equal(operation.failureStage, 'before_composer_write');
-  assert.equal(operation.sendActionCount, 0);
-  assert.equal(operation.sendCount, 0);
-  assert.equal(operation.userMessageId, undefined);
-  assert.equal(operation.errorData.noClickProven, true);
-  assert.equal(operation.errorData.baselineMessageCount, 0);
-  const observed = await observeReviewOperation({ stateDir: f.stateDir, idempotencyKey: f.request.idempotencyKey });
-  assert.equal(observed.zeroCommitPreClick, true);
-  assert.equal(observed.failureStage, 'before_composer_write');
-});
-
-test('review transport: admission distinguishes a fresh send from exact existing observation', async () => {
-  const f = await fixture();
-  const fresh = await inspectReviewAdmission({ stateDir: f.stateDir, request: f.request });
-  assert.equal(fresh.requiresSendCapacity, true);
-  assert.equal(fresh.exactExisting, false);
-
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  const existing = await inspectReviewAdmission({ stateDir: f.stateDir, request: f.request });
-  assert.equal(existing.requiresSendCapacity, false);
-  assert.equal(existing.exactExisting, true);
-  assert.equal(existing.observationOnly, true);
-
-  const verifying = await inspectReviewAdmission({
-    stateDir: f.stateDir,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(verifying.requiresSendCapacity, false);
-
-  await assert.rejects(
-    inspectReviewAdmission({
-      stateDir: f.stateDir,
-      request: { ...f.request, prompt: 'conflict', promptSha256: sha256('conflict') }
-    }),
-    /review_idempotency_conflict/
-  );
-});
-
-test('review transport: first Gemini binding captures the created app identity after one strict send', async () => {
-  const f = await fixture();
-  f.setFirstBindingSubmittedUrl('https://gemini.google.com/app/created-gemini-conversation');
-  const request = {
-    ...f.request,
-    stableKey: 'gemini-first-binding-key',
-    idempotencyKey: 'gemini-first-binding-op',
-    provider: 'gemini',
-    model: 'Pro',
-    conversationUrl: 'https://gemini.google.com/app',
-    conversationId: '__new__',
-    firstBinding: true,
-    existingTabId: 'gemini-clean-tab'
-  };
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  assert.equal(receipt.provider, 'gemini');
-  assert.equal(receipt.conversationUrl, 'https://gemini.google.com/app/created-gemini-conversation');
-  assert.equal(receipt.conversationId, 'created-gemini-conversation');
-  assert.equal(receipt.sendCount, 1);
-  assert.equal(f.calls.review, 1);
-  assert.deepEqual(f.calls.adopt, [{
-    id: 'gemini-clean-tab',
-    key: request.stableKey,
-    name: request.stableKey,
-    url: request.conversationUrl,
-    vendorId: 'gemini',
-    vendorName: 'Gemini'
-  }]);
-});
-
-test('review transport: an opt-in non-scientific Gemini bootstrap permits exactly one model-specific continuation', async () => {
-  const f = await fixture();
-  const url = 'https://gemini.google.com/app/bootstrap-bound';
-  f.setFirstBindingSubmittedUrl(url);
-  const bootstrap = {
-    ...f.request,
-    stableKey: 'gemini-bootstrap-key', idempotencyKey: 'gemini-bootstrap-op', provider: 'gemini',
-    model: 'Gemini 3.1 Pro', conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__',
-    firstBinding: true, geminiBootstrap: true, bootstrapNonScientific: true
-  };
-  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: bootstrap });
-  assert.equal(first.sendCount, 1);
-  const prompt = 'actual model-specific turn';
-  const continuation = {
-    ...bootstrap,
-    idempotencyKey: 'gemini-bootstrap-pro-op', prompt, promptSha256: sha256(prompt),
-    model: 'Gemini 3.1 Pro extended', conversationUrl: url, conversationId: 'bootstrap-bound',
-    firstBinding: false, geminiBootstrap: false, geminiBootstrapContinuation: true, bootstrapNonScientific: false
-  };
-  const second = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: continuation });
-  const state = await readReviewTransportState(f.stateDir);
-  assert.equal(second.model, 'Gemini 3.1 Pro extended');
-  assert.equal(second.sendCount, 1);
-  assert.equal(state.operations['gemini-bootstrap-op'].geminiBootstrap, true);
-  assert.equal(state.operations['gemini-bootstrap-pro-op'].geminiBootstrapContinuation, true);
-  assert.equal(state.bindings['gemini-bootstrap-key'].model, 'Gemini 3.1 Pro extended');
-  assert.equal(state.bindings['gemini-bootstrap-key'].geminiBootstrap.continuationConsumed, true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: { ...continuation, idempotencyKey: 'gemini-bootstrap-third-op', prompt: 'third', promptSha256: sha256('third') } }),
-    /review_binding_mismatch/
-  );
-  assert.equal(f.calls.review, 2);
-});
-
-test('review transport: dynamic Gemini bootstrap persists only the observed selected-model receipt', async () => {
-  const f = await fixture();
-  f.setFirstBindingSubmittedUrl('https://gemini.google.com/app/dynamic-bootstrap');
-  const request = {
-    ...f.request,
-    stableKey: 'gemini-dynamic-bootstrap-key', idempotencyKey: 'gemini-dynamic-bootstrap-op', provider: 'gemini',
-    model: '__selected__', conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__',
-    firstBinding: true, geminiBootstrap: true, bootstrapNonScientific: true
-  };
-  const receipt = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request });
-  const state = await readReviewTransportState(f.stateDir);
-  assert.equal(receipt.model, 'GPT-5.6 Pro');
-  assert.equal(state.operations[request.idempotencyKey].model, 'GPT-5.6 Pro');
-  assert.equal(state.bindings[request.stableKey].model, 'GPT-5.6 Pro');
-  assert.equal(state.bindings[request.stableKey].geminiBootstrap.bootstrapModel, 'GPT-5.6 Pro');
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: model changes stay rejected without the one-time Gemini bootstrap authorization', async () => {
-  const f = await fixture();
-  const first = { ...f.request, provider: 'gemini', model: 'Gemini 3.1 Pro', conversationUrl: 'https://gemini.google.com/app/locked', conversationId: 'locked' };
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: first });
-  const prompt = 'different model';
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: { ...first, idempotencyKey: 'locked-second', model: 'Gemini 3.1 Pro extended', prompt, promptSha256: sha256(prompt) } }),
-    /review_binding_mismatch/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: conflicting idempotency payload is rejected without another send', async () => {
-  const f = await fixture();
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  const prompt = 'different';
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, prompt, promptSha256: sha256(prompt) }
-    }),
-    /review_idempotency_conflict/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: exact CRLF and non-ASCII prompt content is hash-bound before send', async () => {
-  const f = await fixture();
-  const prompt = 'Review this exactly:\r\ncaf\u00e9 \u2014 \u3053\u3093\u306b\u3061\u306f\r\n';
-  const receipt = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: {
-      ...f.request,
-      idempotencyKey: 'exact-crlf-nonascii',
-      prompt,
-      promptSha256: sha256(prompt)
-    }
-  });
-  assert.equal(receipt.promptSha256, sha256(prompt));
-  assert.deepEqual(f.calls.reviewPrompts, [prompt]);
-});
-
-test('review transport: malformed or mismatched prompt hash fails before state, tab, or send', async () => {
-  const f = await fixture();
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, promptSha256: 'A'.repeat(64) }
-    }),
-    /review_prompt_sha256_invalid/
-  );
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, promptSha256: '0'.repeat(64) }
-    }),
-    /review_prompt_sha256_mismatch/
-  );
-  assert.deepEqual(await fs.readdir(f.stateDir), []);
-  assert.equal(f.calls.review, 0);
-  assert.deepEqual(f.calls.adopt, []);
-  assert.deepEqual(f.calls.ensure, []);
-});
-
-test('review transport: restart verification is observe-only and bound to the same operation', async () => {
-  const f = await fixture();
-  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  const verified = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(verified.operationId, first.operationId);
-  assert.equal(verified.responseSha256, first.responseSha256);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-});
-
-test('review transport: missing verifyExisting is rejected before state, tab, or controller access', async () => {
-  const f = await fixture();
-  f.armForbiddenControls();
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, verifyExisting: true, existingTabId: 'tab-existing' }
-    }),
-    /review_observation_unavailable/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  assert.deepEqual(state.operations, {});
-  assert.deepEqual(state.bindings, {});
-  assert.deepEqual(f.calls.adopt, []);
-  assert.deepEqual(f.calls.ensure, []);
-  assert.equal(f.calls.observe, 0);
-  assert.equal(f.calls.review, 0);
-  assert.equal(f.calls.forbidden, 0);
-});
-
-test('review transport: verifyExisting observes a persisted submission in a fresh wait window', async () => {
-  const f = await fixture();
-  f.setFailAfterSubmittedReceipt(true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /simulated_crash_after_submitted_receipt/
-  );
-  f.setFailAfterSubmittedReceipt(false);
-  const verified = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(verified.status, 'COMPLETE');
-  assert.equal(verified.sendCount, 1);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-  assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
-});
-
-test('review transport: bounded failed verification preserves its single submitted operation', async () => {
-  const f = await fixture();
-  f.setFailAfterSubmittedReceipt(true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /simulated_crash_after_submitted_receipt/
-  );
-  f.setObserveFailure(new Error('timeout_waiting_for_response'));
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, verifyExisting: true }
-    }),
-    /timeout_waiting_for_response/
-  );
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  assert.deepEqual(Object.keys(state.operations), [f.request.idempotencyKey]);
-  assert.equal(operation.sendCount, 1);
-  assert.equal(operation.sendActionCount, 1);
-  assert.equal(operation.status, 'SUBMITTED');
-  assert.equal(operation.terminalState, 'SENT_WAITING');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-  assert.equal(f.calls.observeArgs[0].timeoutMs, f.request.timeoutMs);
-});
-
-test('review transport: first-bound operations accept only an exact-conversation verify-existing request', async () => {
-  const f = await fixture();
-  const firstBinding = {
-    ...f.request,
-    stableKey: 'first-bound-observation-key',
-    idempotencyKey: 'first-bound-observation-op',
-    conversationUrl: 'https://chatgpt.com/',
-    conversationId: '__new__',
-    firstBinding: true
-  };
-  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: firstBinding });
-  const verified = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: {
-      ...f.request,
-      stableKey: firstBinding.stableKey,
-      idempotencyKey: firstBinding.idempotencyKey,
-      conversationUrl: first.conversationUrl,
-      conversationId: first.conversationId,
-      verifyExisting: true
-    }
-  });
-  assert.equal(verified.operationId, first.operationId);
-  assert.equal(verified.sendCount, 1);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
-});
-
-test('review transport: verifyExisting may causally rebind one submitted-unverified operation without another send', async () => {
-  const f = await fixture();
-  const ambiguous = new Error('review_user_message_identity_ambiguous');
-  ambiguous.data = { newUserMessageCount: 2 };
-  f.setPostClickFailure(ambiguous);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_user_message_identity_ambiguous/
-  );
-  const blocked = (await readReviewTransportState(f.stateDir)).operations[f.request.idempotencyKey];
-  assert.equal(blocked.sendActionCount, 1);
-  assert.equal(blocked.sendCount, 0);
-  assert.equal(blocked.userMessageId, undefined);
-  assert.equal(blocked.terminalState, 'COMMITMENT_UNKNOWN');
-  assert.equal(blocked.causalSendReceipt.identityModel, REVIEW_CAUSAL_SUBMISSION_MODEL);
-
-  f.setPostClickFailure(null);
-  const recovered = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: { ...f.request, verifyExisting: true }
-  });
-  assert.equal(recovered.status, 'COMPLETE');
-  assert.equal(recovered.sendActionCount, 1);
-  assert.equal(recovered.sendCount, 1);
-  assert.equal(recovered.userMessageId, 'user-1');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 1);
-  assert.equal(f.calls.observe, 1);
-});
-
-test('review transport: verifyExisting recovers one first-bound SENT_UNREADABLE turn from its exact observed conversation without another send', async () => {
-  const f = await fixture();
-  const concreteUrl = 'https://chatgpt.com/c/recovered-first-bound';
-  const initial = {
-    ...f.request,
-    conversationUrl: 'https://chatgpt.com/',
-    conversationId: '__new__',
-    firstBinding: true
-  };
-  f.setFirstBindingSubmittedUrl(concreteUrl);
-  f.setRenderedDisplayFidelity('unreadable');
-
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: initial }),
-    /review_user_message_identity_unreadable/
-  );
-  const blocked = (await readReviewTransportState(f.stateDir)).operations[initial.idempotencyKey];
-  assert.equal(blocked.status, 'OBSERVING');
-  assert.equal(blocked.terminalState, 'SENT_UNREADABLE');
-  assert.equal(blocked.sendActionCount, 1);
-  assert.equal(blocked.sendCount, 0);
-  assert.equal(blocked.userMessageId, undefined);
-  assert.equal(blocked.observedUserMessageId, 'user-1');
-  assert.equal(blocked.observedConversationUrl, concreteUrl);
-  assert.equal(blocked.observedConversationId, 'recovered-first-bound');
-
-  const recovered = await runReviewQuery({
-    stateDir: f.stateDir,
-    tabs: f.tabs,
-    request: {
-      ...initial,
-      conversationUrl: concreteUrl,
-      conversationId: 'recovered-first-bound',
-      firstBinding: false,
-      verifyExisting: true,
-      existingTabId: 'reopened-tab',
-      responsePath: undefined
-    }
-  });
-
-  assert.equal(recovered.status, 'COMPLETE');
-  assert.equal(recovered.terminalState, 'NATURAL_COMPLETION_VERIFIED');
-  assert.equal(recovered.sendActionCount, 1);
-  assert.equal(recovered.sendCount, 1);
-  assert.equal(recovered.userMessageId, 'user-1');
-  assert.equal(recovered.conversationUrl, concreteUrl);
-  assert.equal(recovered.conversationId, 'recovered-first-bound');
-  assert.equal(recovered.responsePath, initial.responsePath);
-  assert.equal(await fs.readFile(initial.responsePath, 'utf8'), 'SMOKE_OK');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 1);
-  assert.equal(f.calls.observe, 1);
-  assert.equal(f.calls.ensure.at(-1).url, concreteUrl);
-
-  const state = await readReviewTransportState(f.stateDir);
-  assert.equal(state.bindings[initial.stableKey].conversationUrl, concreteUrl);
-  assert.equal(state.bindings[initial.stableKey].conversationId, 'recovered-first-bound');
-});
-
-test('review transport: first-bound SENT_UNREADABLE observation blocks a new key from reinjecting the same prompt into its observed conversation', async () => {
-  const f = await fixture();
-  const concreteUrl = 'https://chatgpt.com/c/observed-first-bound';
-  const initial = {
-    ...f.request,
-    conversationUrl: 'https://chatgpt.com/',
-    conversationId: '__new__',
-    firstBinding: true
-  };
-  f.setFirstBindingSubmittedUrl(concreteUrl);
-  f.setRenderedDisplayFidelity('unreadable');
-
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: initial }),
-    /review_user_message_identity_unreadable/
-  );
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: {
-        ...f.request,
-        conversationUrl: concreteUrl,
-        conversationId: 'observed-first-bound',
-        idempotencyKey: 'forbidden-second-operation'
-      }
-    }),
-    /review_conversation_request_nonrepeatable/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: observer completion cannot promote a ledger without one persisted send action', async () => {
-  const f = await fixture();
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  const state = await readReviewTransportState(f.stateDir);
-  const operation = state.operations[f.request.idempotencyKey];
-  operation.status = 'SUBMITTED';
-  operation.terminalState = null;
-  operation.sendActionCount = 0;
-  delete operation.causalSendReceipt;
-  delete operation.submissionIdentity;
-  delete operation.renderedDisplay;
-  delete operation.observedUserMessageId;
-  delete operation.observedUserMessageAt;
-  delete operation.observedConversationUrl;
-  delete operation.observedConversationId;
-  delete operation.observedCommitmentClass;
-  delete operation.observedTurnEvidence;
-  delete operation.newUserMessageCount;
+  if (baseline === undefined) delete state.operations.question.baselineMessageIds;
+  else state.operations.question.baselineMessageIds = baseline;
   await writeReviewTransportState(state, f.stateDir);
-
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, verifyExisting: true }
-    }),
-    /review_send_receipt_invalid/
-  );
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 1);
+  await assert.rejects(f.run({ verifyExisting: true }), /review_submission_baseline_unavailable/);
+  assert.equal(f.calls.recover, 0); assert.equal(f.calls.review, 1);
+});
+test('legacy already-paired receipt remains observable without a baseline', async t => {
+  const f = await fixture(t); f.mode.waiting = true; await f.run();
+  const state = await readReviewTransportState(f.stateDir); delete state.operations.question.baselineMessageIds;
+  await writeReviewTransportState(state, f.stateDir); f.mode.waiting = false;
+  assert.ok((await f.run({ verifyExisting: true })).archive); assert.equal(f.calls.review, 1);
+});
+for (const baseline of [['duplicate', 'duplicate'], [23], 'not-array']) test(`invalid persisted baseline rejected: ${JSON.stringify(baseline)}`, async t => {
+  const f = await fixture(t); f.mode.waiting = true; await f.run();
+  const state = await readReviewTransportState(f.stateDir); state.operations.question.baselineMessageIds = baseline;
+  await assert.rejects(writeReviewTransportState(state, f.stateDir), /state_invalid/);
+});
+test('fresh verifyExisting cannot create a send', async t => {
+  const f = await fixture(t); await assert.rejects(f.run({ verifyExisting: true }), /review_observation_unavailable/);
+  assert.equal(f.calls.tabs, 0); assert.equal(f.calls.review, 0);
+});
+test('waiting receipts resume observation without another send', async t => {
+  const f = await fixture(t); f.mode.waiting = true; assert.equal((await f.run()).archive, null);
+  f.mode.waiting = false; assert.ok((await f.run({ verifyExisting: true })).archive); assert.equal(f.calls.clicks, 1);
+});
+test('first binding records the actual created conversation', async t => {
+  const f = await fixture(t); const result = await f.run({ conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true });
+  assert.equal(result.observedConversationId, 'created'); assert.ok(result.archive);
+});
+test('Gemini uses explicit product and null effort through the same durable boundary', async t => {
+  const f = await fixture(t); const result = await f.run({ provider: 'gemini', productModel: 'Gemini 3.1 Pro', reasoningEffort: null, conversationUrl: 'https://gemini.google.com/app/fixture', conversationId: 'fixture' });
+  assert.ok(result.archive); assert.equal(f.calls.clicks, 1);
+});
+test('existing-tab adoption uses the exact assigned key and identity', async t => {
+  const f = await fixture(t); const adopted = [];
+  f.tabs.adoptTab = async args => adopted.push(args);
+  await f.run({ existingTabId: 'assigned-tab' });
+  assert.equal(adopted.length, 1);
+  assert.equal(adopted[0].id, 'assigned-tab');
+  assert.equal(adopted[0].key, f.request.stableKey);
+  assert.equal(adopted[0].url, f.request.conversationUrl);
+});
+test('stable key cannot be rebound to another conversation before tab adoption', async t => {
+  const f = await fixture(t); await f.run(); const before = f.calls.tabs;
+  await assert.rejects(f.run({ idempotencyKey: 'other', conversationUrl: 'https://chatgpt.com/c/other', conversationId: 'other' }), /review_binding_mismatch/);
+  assert.equal(f.calls.tabs, before); assert.equal(f.calls.clicks, 1);
+});
+test('first-bound submitted prompt cannot be repeated under a new key at its observed URL', async t => {
+  const f = await fixture(t);
+  await f.run({ conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true });
+  await assert.rejects(f.run({ stableKey: 'new-key', idempotencyKey: 'new-key', conversationUrl: 'https://chatgpt.com/c/created', conversationId: 'created' }), /review_duplicate_submission/);
+  assert.equal(f.calls.clicks, 1);
+});
+for (const changes of [{ responsePath: path.resolve('different.md') }, { prompt: 'changed', promptSha256: sha('changed') }, { productModel: 'Latest' }]) test(`same-key immutable inputs cannot change: ${Object.keys(changes)}`, async t => {
+  const f = await fixture(t); await f.run(); await assert.rejects(f.run(changes), /review_idempotency_conflict/); assert.equal(f.calls.clicks, 1);
+});
+for (const changes of [{ promptSha256: '0'.repeat(64) }, { timeoutMs: 2700001 }, { productModel: 'GPT-5.6 Sol' }, { reasoningEffort: 'High' }, { model: 'retired-field' }]) test(`invalid input rejected before tab resolution: ${Object.keys(changes)}`, async t => {
+  const f = await fixture(t); await assert.rejects(f.run(changes)); assert.equal(f.calls.tabs, 0); assert.equal(f.calls.review, 0);
+});
+for (const control of ['stop', 'continue', 'retry']) test(`active ${control} prevents completion and can only be observed later`, async t => {
+  const f = await fixture(t); f.mode.controls = { [control]: true }; await assert.rejects(f.run(), /review_completion_controls_active/);
+  f.mode.controls = {}; await f.run(); assert.equal(f.calls.clicks, 1);
+});
+test('unstable snapshots and wrong user pairing cannot archive an answer', async t => {
+  const f = await fixture(t); f.mode.snapshotGap = 10; await assert.rejects(f.run(), /review_completion_unstable/);
+  f.mode.snapshotGap = 3100; f.mode.resultUser = 'wrong-user'; await assert.rejects(f.run(), /review_user_message_identity_mismatch/);
+  assert.equal((await f.operation()).archive, null); assert.equal(f.calls.clicks, 1);
+});
+test('exact response archive preserves conflicts, including a terminal newline difference', async t => {
+  const f = await fixture(t); await fs.writeFile(f.request.responsePath, 'answer\n');
+  await assert.rejects(archiveReviewResponse({ responsePath: f.request.responsePath, text: 'answer' }), /review_response_path_conflict/);
+  assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'answer\n');
+  assert.equal((await archiveReviewResponse({ responsePath: f.request.responsePath, text: 'answer\n' })).projection, 'exact');
+});
+test('prompt input preserves UTF-8 and rejects conflicting input/hash before send', async t => {
+  const f = await fixture(t); const promptPath = path.join(f.stateDir, 'prompt.txt'); await fs.writeFile(promptPath, f.request.prompt);
+  assert.equal(await resolveReviewPromptInput({ promptPath }), f.request.prompt);
+  assert.equal(await prepareReviewPromptInput({ promptPath, promptSha256: f.request.promptSha256 }), f.request.prompt);
+  await assert.rejects(resolveReviewPromptInput({ promptPath, prompt: 'also inline' }));
+  await assert.rejects(prepareReviewPromptInput({ promptPath, promptSha256: '0'.repeat(64) }));
 });
 
-test('review transport: repeated verifyExisting has no send or control capability', async () => {
-  const f = await fixture();
-  const first = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  f.armForbiddenControls();
-  const verified = { ...f.request, verifyExisting: true };
-  const [once, twice] = await Promise.all([
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: verified }),
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: verified })
-  ]);
-  assert.equal(once.operationId, first.operationId);
-  assert.equal(twice.operationId, first.operationId);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.observe, 2);
-  assert.equal(f.calls.forbidden, 0);
+function pageController(messages) {
+  return new ChatGPTController({ selectors: {}, page: { async getUrl() { return 'https://chatgpt.com/c/fixture'; }, async evaluate() { return { messages, modelEvidence: 'GPT-6 Astra', modelEvidenceCandidates: ['GPT-6 Astra'], controlText: [], selectorStop: false, sendVisible: true }; } } });
+}
+const observerArgs = { prompt: 'same text', expectedUrl: 'https://chatgpt.com/c/fixture', expectedConversationId: 'fixture', productModel: 'GPT-6 Astra', reasoningEffort: 'Pro', timeoutMs: 1000 };
+const turn = id => ({ id, role: 'user', text: 'same text', textIdentityReadable: true });
+test('real controller refuses missing baseline and excludes old identical text', async () => {
+  const controller = pageController([turn('old')]);
+  await assert.rejects(controller.observeReviewUserTurn(observerArgs), /review_submission_baseline_unavailable/);
+  assert.equal((await controller.observeReviewUserTurn({ ...observerArgs, baselineMessageIds: ['old'] })).userMessageId, null);
 });
-
-test('review transport: stable-key mismatch and prompt hash mismatch fail without another send', async () => {
-  const f = await fixture();
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: {
-        ...f.request,
-        idempotencyKey: 'other-op',
-        conversationUrl: 'https://chatgpt.com/c/conversation-2',
-        conversationId: 'conversation-2'
-      }
-    }),
-    /review_binding_mismatch/
-  );
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, idempotencyKey: 'hash-mismatch', promptSha256: '0'.repeat(64) }
-    }),
-    /review_prompt_sha256_mismatch/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: binding mismatch cannot adopt or re-key a tab', async () => {
-  const f = await fixture();
-  await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: {
-        ...f.request,
-        idempotencyKey: 'different-operation',
-        conversationUrl: 'https://chatgpt.com/c/conversation-2',
-        conversationId: 'conversation-2',
-        existingTabId: 'tab-existing'
-      }
-    }),
-    /review_binding_mismatch/
-  );
-  assert.deepEqual(f.calls.adopt, []);
-});
-
-test('review transport: timeout above 45 minutes is rejected before tab or send', async () => {
-  const f = await fixture();
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, timeoutMs: 45 * 60_000 + 1 }
-    }),
-    /review_timeout_out_of_range/
-  );
-  assert.equal(f.calls.review, 0);
-  assert.equal(f.calls.ensure.length, 0);
-});
-
-test('review transport: commitment unknown blocks a fresh operation from reinjecting the same prompt into the same conversation', async () => {
-  const f = await fixture();
-  f.setFailBeforeSubmittedReceipt(true);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /simulated_crash_after_send_intent/
-  );
-  const uncertain = await readReviewTransportState(f.stateDir);
-  assert.equal(uncertain.operations[f.request.idempotencyKey].status, 'OBSERVING');
-  assert.equal(uncertain.operations[f.request.idempotencyKey].terminalState, 'COMMITMENT_UNKNOWN');
-  assert.equal(uncertain.operations[f.request.idempotencyKey].sendActionCount, 1);
-  assert.equal(uncertain.operations[f.request.idempotencyKey].sendCount, 0);
-  assert.equal(uncertain.operations[f.request.idempotencyKey].failureStage, 'send_occurred_or_uncertain');
-  f.setFailBeforeSubmittedReceipt(false);
-  await assert.rejects(
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    /review_operation_closed_create_fresh/
-  );
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, idempotencyKey: 'fresh-recovery' }
-    }),
-    /review_conversation_request_nonrepeatable/
-  );
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 0);
-});
-
-test('review transport: completed prompt cannot be reinjected into the same concrete conversation under a new operation', async () => {
-  const f = await fixture();
-  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(completed.status, 'COMPLETE');
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, idempotencyKey: 'second-operation-after-complete' }
-    }),
-    /review_conversation_request_nonrepeatable/
-  );
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: concurrent different operations for the same concrete conversation and prompt admit one sender', async () => {
-  const f = await fixture();
-  const competing = { ...f.request, idempotencyKey: 'competing-operation' };
-  const settled = await Promise.allSettled([
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: competing })
-  ]);
-  assert.equal(settled.filter((entry) => entry.status === 'fulfilled').length, 1);
-  const rejected = settled.find((entry) => entry.status === 'rejected');
-  assert.match(String(rejected?.reason?.message || rejected?.reason), /review_conversation_request_nonrepeatable/);
-  assert.equal(f.calls.review, 1);
-});
-
-test('review transport: responsePath is immutable operation input for every ordinary duplicate', async () => {
-  const f = await fixture();
-  const completed = await runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request });
-  assert.equal(completed.responsePath, f.request.responsePath);
-  await assert.rejects(
-    runReviewQuery({
-      stateDir: f.stateDir,
-      tabs: f.tabs,
-      request: { ...f.request, responsePath: path.join(f.stateDir, 'redirected-response.md') }
-    }),
-    /review_idempotency_conflict/
-  );
-  assert.equal(await fs.readFile(f.request.responsePath, 'utf8'), 'SMOKE_OK');
-  await assert.rejects(fs.access(path.join(f.stateDir, 'redirected-response.md')));
-});
-
-test('review transport: concurrent identical calls re-read terminal state and send once', async () => {
-  const f = await fixture();
-  const [first, second] = await Promise.all([
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request }),
-    runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request: f.request })
-  ]);
-  assert.equal(first.operationId, second.operationId);
-  assert.ok(['SUBMITTED', 'COMPLETE'].includes(first.status));
-  assert.ok(['SUBMITTED', 'COMPLETE'].includes(second.status));
-  const persisted = await readReviewTransportState(f.stateDir);
-  assert.equal(persisted.operations[f.request.idempotencyKey].status, 'COMPLETE');
-  assert.equal(persisted.operations[f.request.idempotencyKey].terminalState, 'NATURAL_COMPLETION_VERIFIED');
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 0);
-});
-
-test('review transport: a failed operation cannot itself send again', async () => {
-  const f = await fixture();
-  f.setFailBeforeSubmittedReceipt(true);
-  const request = { ...f.request, idempotencyKey: 'deadline-test', timeoutMs: 1_000 };
-  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /simulated_crash_after_send_intent/);
-  f.setFailBeforeSubmittedReceipt(false);
-  await assert.rejects(runReviewQuery({ stateDir: f.stateDir, tabs: f.tabs, request }), /review_operation_closed_create_fresh/);
-  assert.equal(f.calls.review, 1);
-  assert.equal(f.calls.recover, 0);
+test('real controller admits only one new matching turn', async () => {
+  const controller = pageController([turn('old'), turn('new')]);
+  assert.equal((await controller.observeReviewUserTurn({ ...observerArgs, baselineMessageIds: ['old'] })).userMessageId, 'new');
+  await assert.rejects(controller.observeReviewUserTurn({ ...observerArgs, baselineMessageIds: [] }), /review_user_message_identity_ambiguous/);
 });
