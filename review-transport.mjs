@@ -260,7 +260,52 @@ function operationConversation(operation) {
   };
 }
 function sameTarget(left, right) { return left?.provider === right.provider && left.productModel === right.productModel && left.reasoningEffort === right.reasoningEffort; }
-function sameBinding(binding, request) { return binding?.stableKey === request.stableKey && sameTarget(binding, request) && binding.conversationUrl === request.conversationUrl && binding.conversationId === request.conversationId; }
+function sameBindingIdentity(binding, request) {
+  return binding?.stableKey === request.stableKey &&
+    binding.provider === request.provider &&
+    binding.conversationUrl === request.conversationUrl &&
+    binding.conversationId === request.conversationId;
+}
+function bindingTransitionInProgress(binding) {
+  const bootstrap = binding?.geminiBootstrap;
+  return bootstrap?.continuationConsumed === true &&
+    binding.productModel !== bootstrap.continuationProductModel;
+}
+function authorizedBinding(binding, request) {
+  if (!sameBindingIdentity(binding, request)) return false;
+  if (request.geminiBootstrapContinuation === true) {
+    const bootstrap = binding.geminiBootstrap;
+    return request.provider === 'gemini' &&
+      request.reasoningEffort === null &&
+      bootstrap?.nonScientific === true &&
+      bootstrap.continuationConsumed === false &&
+      binding.productModel !== request.productModel;
+  }
+  if (bindingTransitionInProgress(binding)) return false;
+  return sameTarget(binding, request);
+}
+function authorizedOperationBinding(binding, request, operation) {
+  if (request.firstBinding) return !binding;
+  if (!sameBindingIdentity(binding, request)) return false;
+  if (request.geminiBootstrapContinuation) {
+    const bootstrap = binding.geminiBootstrap;
+    return bootstrap?.nonScientific === true &&
+      bootstrap.continuationConsumed === true &&
+      bootstrap.continuationOperationId === operation.operationId &&
+      bootstrap.continuationProductModel === request.productModel;
+  }
+  return authorizedBinding(binding, request);
+}
+function validateObservedConversation(request, conversationUrl, conversationId) {
+  const identity = conversationIdentityFromUrl(conversationUrl);
+  if (identity.provider !== request.provider || identity.conversationId !== conversationId) {
+    fail('review_conversation_identity_mismatch');
+  }
+  if (!request.firstBinding &&
+      (conversationUrl !== request.conversationUrl || conversationId !== request.conversationId)) {
+    fail('review_conversation_identity_mismatch');
+  }
+}
 function publicReceipt(operation) { return { ...operation }; }
 
 
@@ -348,7 +393,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
     if (request.firstBinding) {
       if (binding) fail('review_binding_mismatch');
     } else if (binding) {
-      if (!sameBinding(binding, request)) fail('review_binding_mismatch');
+      if (!authorizedBinding(binding, request)) fail('review_binding_mismatch');
     } else {
       state.bindings[request.stableKey] = {
         stableKey: request.stableKey,
@@ -374,6 +419,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
       conversationId: request.conversationId,
       promptSha256: request.promptSha256,
       responsePath: request.responsePath,
+      preparedProductModel: null,
       sendAttempted: false,
       sendAttemptedAt: null,
       baselineMessageIds: null,
@@ -387,6 +433,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
       updatedAt: now
     };
     state.operations[request.idempotencyKey] = operation;
+    if (request.geminiBootstrapContinuation) {
+      binding.geminiBootstrap = {
+        ...binding.geminiBootstrap,
+        continuationConsumed: true,
+        continuationOperationId: operation.operationId,
+        continuationProductModel: request.productModel
+      };
+      binding.updatedAt = now;
+    }
     return { operation: { ...operation }, binding: null };
   });
   if (intake.operation.archive) return publicReceipt(intake.operation);
@@ -439,6 +494,22 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
     if (!baselineMessageIds || new Set(baselineMessageIds).size !== baselineMessageIds.length) {
       fail('review_submission_baseline_invalid');
     }
+    if (request.geminiBootstrap) {
+      const preparedProductModel = requiredText(
+        prepared?.productModelEvidence?.matchedLabel,
+        'productModelEvidence.matchedLabel',
+        { max: 128 }
+      );
+      if (preparedProductModel === '__selected__') fail('review_target_evidence_missing');
+      await mutateState(stateDir, async (state) => {
+        const operation = state.operations[request.idempotencyKey];
+        if (!operation || operation.operationId !== intake.operation.operationId || operation.sendAttempted) {
+          fail('review_operation_state_invalid');
+        }
+        operation.preparedProductModel = preparedProductModel;
+        operation.updatedAt = Date.now();
+      });
+    }
     // Persist before the send-capable boundary. A new invocation cannot recover
     // this information from the current page without admitting historical turns.
     await mutateState(stateDir, async (state) => {
@@ -464,12 +535,15 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
   const onSendAttempted = async () => {
     await mutateState(stateDir, async (state) => {
       const operation = state.operations[request.idempotencyKey];
+      const binding = state.bindings[request.stableKey];
       if (
         !operation ||
         operation.operationId !== intake.operation.operationId ||
         operation.sendAttempted ||
         !composerVerified ||
-        !Array.isArray(operation.baselineMessageIds)
+        !Array.isArray(operation.baselineMessageIds) ||
+        (request.geminiBootstrap && !operation.preparedProductModel) ||
+        !authorizedOperationBinding(binding, request, operation)
       ) fail('review_operation_state_invalid');
       const now = Date.now();
       // Recheck under the state lock: two different keys may have passed intake
@@ -495,6 +569,7 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
     );
     const observedConversationUrl = requiredText(observed?.conversationUrl, 'conversationUrl', { max: 2048 });
     const observedConversationId = requiredText(observed?.conversationId, 'conversationId', { max: 256 });
+    validateObservedConversation(request, observedConversationUrl, observedConversationId);
     await mutateState(stateDir, async (state) => {
       const operation = state.operations[request.idempotencyKey];
       if (
@@ -513,16 +588,33 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
       });
       if (request.firstBinding) {
         const now = Date.now();
+        const boundProductModel = request.geminiBootstrap ? operation.preparedProductModel : request.productModel;
+        if (!boundProductModel) fail('review_target_evidence_missing');
         state.bindings[request.stableKey] = {
           stableKey: request.stableKey,
           provider: request.provider,
-          productModel: request.productModel,
+          productModel: boundProductModel,
           reasoningEffort: request.reasoningEffort,
           conversationUrl: observedConversationUrl,
           conversationId: observedConversationId,
           createdAt: now,
           updatedAt: now
         };
+        if (request.geminiBootstrap) {
+          state.bindings[request.stableKey].geminiBootstrap = {
+            nonScientific: true,
+            bootstrapOperationId: operation.operationId,
+            bootstrapProductModel: boundProductModel,
+            continuationConsumed: false
+          };
+        }
+      } else if (request.geminiBootstrapContinuation) {
+        const binding = state.bindings[request.stableKey];
+        if (binding?.geminiBootstrap?.continuationOperationId !== operation.operationId) {
+          fail('review_binding_mismatch');
+        }
+        binding.productModel = request.productModel;
+        binding.updatedAt = Date.now();
       }
     });
     if (request.firstBinding) tabs.updateTabUrl(tabId, observedConversationUrl);
@@ -533,6 +625,10 @@ export async function runReviewQuery({ stateDir, tabs, request: rawRequest, onTa
     const execution = await runExclusive(async () => {
       let current = (await readStateLocked(stateDir)).operations[request.idempotencyKey];
       if (!current.sendAttempted) {
+        const currentState = await readStateLocked(stateDir);
+        if (!authorizedOperationBinding(currentState.bindings[request.stableKey], request, current)) {
+          fail('review_binding_mismatch');
+        }
         const submitted = await controller.reviewQuery({
           prompt: request.prompt,
           expectedUrl: request.conversationUrl,

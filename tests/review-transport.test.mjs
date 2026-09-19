@@ -23,19 +23,24 @@ async function fixture(t) {
     prompt: 'exact\r\n中文  prompt', responsePath: path.join(stateDir, 'answer.md'), timeoutMs: 1000 };
   request.promptSha256 = sha(request.prompt);
   const calls = { review: 0, clicks: 0, observe: 0, recover: 0, tabs: 0 };
-  const mode = { crash: false, presend: false, waiting: false, skipComposer: false, baseline: ['old-user'], recoveredId: 'new-user', controls: {}, snapshotGap: 3100, resultUser: null };
+  const mode = { crash: false, presend: false, waiting: false, skipComposer: false, baseline: ['old-user'], recoveredId: 'new-user', controls: {}, snapshotGap: 3100, resultUser: null, identityOverride: null, preparedProductModel: null };
   let tail = Promise.resolve();
   const operation = async () => (await readReviewTransportState(stateDir)).operations[request.idempotencyKey];
-  const identity = (args) => args.firstBinding
-    ? { conversationUrl: 'https://chatgpt.com/c/created', conversationId: 'created' }
-    : { conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId };
+  const identity = (args) => {
+    if (mode.identityOverride) return mode.identityOverride;
+    if (!args.firstBinding) return { conversationUrl: args.expectedUrl, conversationId: args.expectedConversationId };
+    return new URL(args.expectedUrl).hostname === 'gemini.google.com'
+      ? { conversationUrl: 'https://gemini.google.com/app/created', conversationId: 'created' }
+      : { conversationUrl: 'https://chatgpt.com/c/created', conversationId: 'created' };
+  };
   const controller = {
     async runExclusive(fn) { const prev = tail; let release; tail = new Promise(r => { release = r; }); await prev; try { return await fn(); } finally { release(); } },
     async reviewQuery(args) {
       calls.review++;
       assert.equal(args.requireTargetPreflight, true);
-      assert.equal(args.prompt, request.prompt);
-      await args.onPrepared({ baselineMessageIds: mode.baseline });
+      assert.equal(typeof args.prompt, 'string');
+      await args.onPrepared({ baselineMessageIds: mode.baseline,
+        productModelEvidence: { matchedLabel: mode.preparedProductModel || args.productModel } });
       if (!mode.skipComposer) {
         const canonical = reviewPlainTextIdentity(args.prompt).canonicalSha256;
         await args.onComposerVerified({ ok: true, textModel: REVIEW_PLAIN_TEXT_MODEL,
@@ -147,9 +152,115 @@ test('first binding records the actual created conversation', async t => {
   const f = await fixture(t); const result = await f.run({ conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true });
   assert.equal(result.observedConversationId, 'created'); assert.ok(result.archive);
 });
+test('first binding rejects a user turn observed on the wrong provider before binding it', async t => {
+  const f = await fixture(t);
+  f.mode.identityOverride = { conversationUrl: 'https://gemini.google.com/app/wrong', conversationId: 'wrong' };
+  await assert.rejects(
+    f.run({ conversationUrl: 'https://chatgpt.com/', conversationId: '__new__', firstBinding: true }),
+    /review_conversation_identity_mismatch/
+  );
+  const state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings[f.request.stableKey], undefined);
+  assert.equal(state.operations[f.request.idempotencyKey].providerUserMessageId, null);
+});
 test('Gemini uses explicit product and null effort through the same durable boundary', async t => {
   const f = await fixture(t); const result = await f.run({ provider: 'gemini', productModel: 'Gemini 3.1 Pro', reasoningEffort: null, conversationUrl: 'https://gemini.google.com/app/fixture', conversationId: 'fixture' });
   assert.ok(result.archive); assert.equal(f.calls.clicks, 1);
+});
+test('Gemini bootstrap records the selected model and permits one reserved continuation transition', async t => {
+  const f = await fixture(t);
+  f.mode.preparedProductModel = 'Gemini 2.5 Flash';
+  await f.run({ provider: 'gemini', productModel: '__selected__', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__', firstBinding: true,
+    geminiBootstrap: true, bootstrapNonScientific: true });
+  let state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings.question.productModel, 'Gemini 2.5 Flash');
+  assert.deepEqual(state.bindings.question.geminiBootstrap, {
+    nonScientific: true,
+    bootstrapOperationId: state.operations.question.operationId,
+    bootstrapProductModel: 'Gemini 2.5 Flash',
+    continuationConsumed: false
+  });
+
+  const continuation = { provider: 'gemini', productModel: 'Gemini 3.1 Pro', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app/created', conversationId: 'created',
+    idempotencyKey: 'question-continuation', prompt: 'continuation prompt', promptSha256: sha('continuation prompt'),
+    responsePath: path.join(f.stateDir, 'continuation.md'), geminiBootstrapContinuation: true };
+  await f.run(continuation);
+  state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings.question.productModel, 'Gemini 3.1 Pro');
+  assert.equal(state.bindings.question.geminiBootstrap.continuationConsumed, true);
+  assert.equal(state.bindings.question.geminiBootstrap.continuationOperationId, state.operations['question-continuation'].operationId);
+  assert.equal(state.bindings.question.geminiBootstrap.continuationProductModel, 'Gemini 3.1 Pro');
+
+  await assert.rejects(f.run({ ...continuation, idempotencyKey: 'question-continuation-2',
+    prompt: 'second continuation', promptSha256: sha('second continuation'),
+    responsePath: path.join(f.stateDir, 'continuation-2.md') }), /review_binding_mismatch/);
+});
+test('Gemini bootstrap recovery retains the selected model across a post-intent crash', async t => {
+  const f = await fixture(t);
+  f.mode.preparedProductModel = 'Gemini 2.5 Flash';
+  f.mode.crash = true;
+  const bootstrap = { provider: 'gemini', productModel: '__selected__', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__', firstBinding: true,
+    geminiBootstrap: true, bootstrapNonScientific: true };
+  await assert.rejects(f.run(bootstrap), /crash_between_intent_and_observation/);
+  let state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.operations.question.preparedProductModel, 'Gemini 2.5 Flash');
+  assert.equal(state.bindings.question, undefined);
+  f.mode.crash = false;
+  await f.run({ ...bootstrap, verifyExisting: true });
+  state = await readReviewTransportState(f.stateDir);
+  assert.equal(state.bindings.question.productModel, 'Gemini 2.5 Flash');
+  assert.equal(f.calls.clicks, 0);
+  assert.equal(f.calls.review, 1);
+});
+test('concurrent Gemini bootstrap continuations reserve exactly one transition', async t => {
+  const f = await fixture(t);
+  f.mode.preparedProductModel = 'Gemini 2.5 Flash';
+  await f.run({ provider: 'gemini', productModel: '__selected__', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__', firstBinding: true,
+    geminiBootstrap: true, bootstrapNonScientific: true });
+  const continuation = (suffix) => ({ provider: 'gemini', productModel: 'Gemini 3.1 Pro', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app/created', conversationId: 'created',
+    idempotencyKey: `continuation-${suffix}`, prompt: `continuation ${suffix}`,
+    promptSha256: sha(`continuation ${suffix}`), responsePath: path.join(f.stateDir, `continuation-${suffix}.md`),
+    geminiBootstrapContinuation: true });
+  const results = await Promise.allSettled([f.run(continuation('a')), f.run(continuation('b'))]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.match(String(results.find((result) => result.status === 'rejected').reason), /review_binding_mismatch/);
+  const state = await readReviewTransportState(f.stateDir);
+  const continuationOperationIds = Object.entries(state.operations)
+    .filter(([key]) => key !== 'question')
+    .map(([, operation]) => operation.operationId);
+  assert.equal(continuationOperationIds.length, 1);
+  assert.ok(continuationOperationIds.includes(state.bindings.question.geminiBootstrap.continuationOperationId));
+  assert.equal(state.bindings.question.geminiBootstrap.continuationConsumed, true);
+  assert.equal(f.calls.clicks, 2); // bootstrap plus exactly one continuation
+});
+test('a stale unsent Gemini operation cannot cross a completed model transition', async t => {
+  const f = await fixture(t);
+  f.mode.preparedProductModel = 'Gemini 2.5 Flash';
+  await f.run({ provider: 'gemini', productModel: '__selected__', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app', conversationId: '__new__', firstBinding: true,
+    geminiBootstrap: true, bootstrapNonScientific: true });
+  const stale = { provider: 'gemini', productModel: 'Gemini 2.5 Flash', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app/created', conversationId: 'created',
+    idempotencyKey: 'stale-flash', prompt: 'stale flash prompt', promptSha256: sha('stale flash prompt'),
+    responsePath: path.join(f.stateDir, 'stale-flash.md') };
+  f.mode.presend = true;
+  await assert.rejects(f.run(stale), /preflight_failed/);
+  f.mode.presend = false;
+  await f.run({ provider: 'gemini', productModel: 'Gemini 3.1 Pro', reasoningEffort: null,
+    conversationUrl: 'https://gemini.google.com/app/created', conversationId: 'created',
+    idempotencyKey: 'transition-pro', prompt: 'transition pro prompt', promptSha256: sha('transition pro prompt'),
+    responsePath: path.join(f.stateDir, 'transition-pro.md'), geminiBootstrapContinuation: true });
+  const reviewsBeforeRetry = f.calls.review;
+  const clicksBeforeRetry = f.calls.clicks;
+  await assert.rejects(f.run(stale), /review_binding_mismatch/);
+  assert.equal(f.calls.review, reviewsBeforeRetry);
+  assert.equal(f.calls.clicks, clicksBeforeRetry);
 });
 test('existing-tab adoption uses the exact assigned key and identity', async t => {
   const f = await fixture(t); const adopted = [];
@@ -200,8 +311,8 @@ test('prompt input preserves UTF-8 and rejects conflicting input/hash before sen
   await assert.rejects(prepareReviewPromptInput({ promptPath, promptSha256: '0'.repeat(64) }));
 });
 
-function pageController(messages) {
-  return new ChatGPTController({ selectors: {}, page: { async getUrl() { return 'https://chatgpt.com/c/fixture'; }, async evaluate() { return { messages, modelEvidence: 'GPT-6 Astra', modelEvidenceCandidates: ['GPT-6 Astra'], controlText: [], selectorStop: false, sendVisible: true }; } } });
+function pageController(messages, url = 'https://chatgpt.com/c/fixture') {
+  return new ChatGPTController({ selectors: {}, page: { async getUrl() { return url; }, async evaluate() { return { messages, modelEvidence: 'GPT-6 Astra', modelEvidenceCandidates: ['GPT-6 Astra'], controlText: [], selectorStop: false, sendVisible: true }; } } });
 }
 const observerArgs = { prompt: 'same text', expectedUrl: 'https://chatgpt.com/c/fixture', expectedConversationId: 'fixture', productModel: 'GPT-6 Astra', reasoningEffort: 'Pro', timeoutMs: 1000 };
 const turn = id => ({ id, role: 'user', text: 'same text', textIdentityReadable: true });
@@ -214,4 +325,10 @@ test('real controller admits only one new matching turn', async () => {
   const controller = pageController([turn('old'), turn('new')]);
   assert.equal((await controller.observeReviewUserTurn({ ...observerArgs, baselineMessageIds: ['old'] })).userMessageId, 'new');
   await assert.rejects(controller.observeReviewUserTurn({ ...observerArgs, baselineMessageIds: [] }), /review_user_message_identity_ambiguous/);
+});
+test('real controller first-binding recovery rejects a wrong provider snapshot', async () => {
+  const controller = pageController([turn('new')], 'https://gemini.google.com/app/wrong');
+  await assert.rejects(controller.observeReviewUserTurn({ ...observerArgs,
+    expectedUrl: 'https://chatgpt.com/', expectedConversationId: '__new__', firstBinding: true,
+    baselineMessageIds: [], timeoutMs: 10 }), /review_conversation_identity_mismatch/);
 });

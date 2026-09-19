@@ -3543,24 +3543,29 @@ export class ChatGPTController {
     }
     const deadline = Date.now() + Number(timeoutMs || 0);
     let snapshot;
+    let identityMatched = false;
     while (Date.now() < deadline) {
       this.#throwIfStopRequested();
       snapshot = await this.#reviewSnapshot('');
       if (firstBinding) {
         const atRoot = snapshot.url === expectedUrl && !snapshot.conversationId;
         const boundConversation = snapshot.conversationId && new URL(snapshot.url).hostname === new URL(expectedUrl).hostname;
-        if (atRoot || boundConversation) break;
+        if (atRoot || boundConversation) {
+          identityMatched = true;
+          break;
+        }
       } else {
         this.#assertReviewIdentity(snapshot, {
           expectedUrl,
           expectedConversationId,
           expectedModel: ''
         });
+        identityMatched = true;
         break;
       }
       await sleep(250);
     }
-    if (!snapshot) throw new Error('review_conversation_identity_mismatch');
+    if (!snapshot || !identityMatched) throw new Error('review_conversation_identity_mismatch');
     const baseline = new Set(baselineMessageIds);
     const candidates = (snapshot.messages || [])
       .filter((message) =>

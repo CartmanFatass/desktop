@@ -123,6 +123,7 @@ const V4_OPERATION_FIELDS = new Set([
   'conversationId',
   'promptSha256',
   'responsePath',
+  'preparedProductModel',
   'sendAttempted',
   'sendAttemptedAt',
   'baselineMessageIds',
@@ -195,6 +196,14 @@ function validateReviewTransportState(value) {
         !nonEmptyString(bootstrap.bootstrapProductModel) ||
         typeof bootstrap.continuationConsumed !== 'boolean'
       ) throw new Error('review_transport_state_invalid');
+      const hasContinuationOperation = bootstrap.continuationOperationId !== undefined;
+      const hasContinuationProduct = bootstrap.continuationProductModel !== undefined;
+      if (
+        hasContinuationOperation !== hasContinuationProduct ||
+        (bootstrap.continuationConsumed &&
+          (!nonEmptyString(bootstrap.continuationOperationId) || !nonEmptyString(bootstrap.continuationProductModel))) ||
+        (!bootstrap.continuationConsumed && (hasContinuationOperation || hasContinuationProduct))
+      ) throw new Error('review_transport_state_invalid');
     }
   }
 
@@ -212,6 +221,7 @@ function validateReviewTransportState(value) {
       !nonEmptyString(operation.conversationId) ||
       !absolutePath(operation.responsePath) ||
       !SHA256.test(String(operation.promptSha256 || '')) ||
+      (operation.preparedProductModel != null && !nonEmptyString(operation.preparedProductModel)) ||
       typeof operation.sendAttempted !== 'boolean' ||
       (operation.sendAttemptedAt !== null && !epochMilliseconds(operation.sendAttemptedAt)) ||
       (operation.providerUserMessageId !== null && !nonEmptyString(operation.providerUserMessageId)) ||
